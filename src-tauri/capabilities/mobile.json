@@ -1,0 +1,25 @@
+{
+  "identifier": "mobile",
+  "description": "Mobile-specific capabilities for S4Drive (Android/iOS)",
+  "windows": [],
+  "platforms": ["android", "iOS"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "notification:default",
+    "share:default",
+    "fs:default",
+    "fs:allow-read",
+    "fs:allow-write",
+    "fs:allow-exists",
+    "fs:allow-mkdir",
+    "fs:allow-remove",
+    "fs:allow-rename",
+    "fs:allow-stat",
+    "fs:scope-app-data",
+    "fs:scope-app-cache",
+    "fs:scope-temp"
+  ]
+}

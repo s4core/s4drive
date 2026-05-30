@@ -18,6 +18,7 @@ pub mod desktop;
 pub mod diagnostics;
 pub mod error;
 pub mod metadata;
+pub mod mobile;
 pub mod optimization;
 pub mod s3;
 pub mod sync;
