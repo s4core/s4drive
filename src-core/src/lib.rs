@@ -17,6 +17,7 @@ pub mod db;
 pub mod diagnostics;
 pub mod error;
 pub mod metadata;
+pub mod optimization;
 pub mod s3;
 pub mod sync;
 pub mod transfer;

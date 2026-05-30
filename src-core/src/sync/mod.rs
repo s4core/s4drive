@@ -176,8 +176,11 @@ impl SyncEngine {
         let activity = self.activity.clone().expect("configured");
         let sync_folder = self.sync_folder.clone();
         let max_retries = self.max_retries;
+        let base_interval = Duration::from_secs(30);
+        let max_interval = Duration::from_secs(300);
 
         let handle = tokio::spawn(async move {
+            let mut consecutive_idle = 0u32;
             tracing::info!("Sync loop started");
             set_state(&state, SyncState::Idle);
 
@@ -234,22 +237,51 @@ impl SyncEngine {
                                 result.files_downloaded,
                                 result.conflicts_detected,
                             );
+                            consecutive_idle = 0;
+                            if let Ok(mut iv) = interval.lock() {
+                                *iv = base_interval;
+                            }
+                        } else {
+                            consecutive_idle += 1;
                         }
                     }
                     Err(e) => {
                         tracing::error!("Sync cycle error: {}", e);
                         set_state(&state, SyncState::Error(format!("sync error: {}", e)));
+                        consecutive_idle += 1;
                     }
                 }
 
-                let poll_ms = interval
-                    .lock()
-                    .map(|i| i.as_millis() as u64)
-                    .unwrap_or(30_000);
+                let current_interval = {
+                    if consecutive_idle >= 3 {
+                        // Adaptive backoff: double each idle cycle, cap at max_interval
+                        let factor = 1u32
+                            .saturating_sub(consecutive_idle.saturating_sub(3))
+                            .min(10);
+                        let backoff = base_interval
+                            .checked_mul(factor)
+                            .unwrap_or(base_interval)
+                            .min(max_interval);
+                        if let Ok(mut iv) = interval.lock() {
+                            *iv = backoff;
+                        }
+                        tracing::debug!(
+                            "Idle backoff: consecutive={}, interval={}s",
+                            consecutive_idle,
+                            backoff.as_secs()
+                        );
+                        backoff.as_millis() as u64
+                    } else {
+                        interval
+                            .lock()
+                            .map(|i| i.as_millis() as u64)
+                            .unwrap_or(30_000)
+                    }
+                };
 
                 if running.load(Ordering::Relaxed) {
                     set_state(&state, SyncState::Idle);
-                    let steps = (poll_ms / 500).max(1);
+                    let steps = (current_interval / 500).max(1);
                     for _ in 0..steps {
                         if !running.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
                             break;

@@ -101,6 +101,16 @@ impl LocalDatabase {
             .map_err(|e| CoreError::Database(e.to_string()))?;
         }
 
+        if version < 3 {
+            conn.execute_batch(include_str!("../migrations/v003_indexes.sql"))
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (3, datetime('now'))",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
+
         Ok(())
     }
 
