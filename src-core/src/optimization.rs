@@ -53,26 +53,29 @@ impl RateLimiter {
         }
     }
 
-    /// Try to consume `bytes` tokens. Returns the delay needed (if any).
+    /// Try to consume `bytes` tokens. Blocks until enough tokens are available.
     /// If rate is 0 (unlimited), returns immediately.
+    /// Handles arbitrary `bytes` values — consumes in burst-sized chunks internally
+    /// to avoid deadlock when `bytes` exceeds the burst cap.
     pub async fn consume(&self, bytes: u64) {
         let rate = self.rate.load(Ordering::Relaxed);
         if rate == 0 {
             return; // unlimited
         }
 
-        loop {
+        let mut remaining = bytes;
+        while remaining > 0 {
             self.refill();
             let available = self.tokens.load(Ordering::Relaxed);
-            if available >= bytes {
-                self.tokens.fetch_sub(bytes, Ordering::Relaxed);
-                return;
+            let take = available.min(remaining);
+            if take > 0 {
+                self.tokens.fetch_sub(take, Ordering::Relaxed);
+                remaining -= take;
             }
-            // Need to wait for more tokens
-            let deficit = bytes - available;
-            let wait_ms = (deficit as f64 / rate as f64 * 1000.0).ceil() as u64;
-            tokio::time::sleep(std::time::Duration::from_millis(wait_ms.min(100))).await;
-            self.refill();
+            if remaining > 0 {
+                let wait_ms = (remaining as f64 / rate as f64 * 1000.0).ceil() as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms.min(100))).await;
+            }
         }
     }
 

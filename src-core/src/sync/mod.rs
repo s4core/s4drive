@@ -255,9 +255,8 @@ impl SyncEngine {
                 let current_interval = {
                     if consecutive_idle >= 3 {
                         // Adaptive backoff: double each idle cycle, cap at max_interval
-                        let factor = 1u32
-                            .saturating_sub(consecutive_idle.saturating_sub(3))
-                            .min(10);
+                        let shift = consecutive_idle.saturating_sub(3).min(10);
+                        let factor = 1u32 << shift; // 1, 2, 4, 8, 16...
                         let backoff = base_interval
                             .checked_mul(factor)
                             .unwrap_or(base_interval)
