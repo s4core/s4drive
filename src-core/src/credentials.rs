@@ -3,26 +3,110 @@ use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Credential store backed by the OS keychain (via `keyring` crate).
+// ─── Credential Backend Trait ─────────────────────────────────────────
+
+/// Pluggable backend for credential storage.
 ///
-/// Each credential is stored with a service prefix to avoid collisions
-/// with other applications using the same keychain.
-pub struct CredentialStore {
-    service_prefix: String,
+/// Two implementations:
+/// - `KeychainBackend` — OS keychain (production)
+/// - `InMemoryBackend` — HashMap (tests, CI, headless)
+#[doc(hidden)]
+pub trait CredentialBackend: std::fmt::Debug {
+    fn store(&self, service: &str, username: &str, payload: &str) -> CoreResult<()>;
+    fn get(&self, service: &str, username: &str) -> CoreResult<String>;
+    fn delete(&self, service: &str, username: &str) -> CoreResult<()>;
 }
 
-/// A stored credential for an S3 endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredCredential {
-    pub endpoint: String,
-    pub access_key_id: String,
-    /// The plaintext secret key (never stored to disk unencrypted).
-    pub secret_key: String,
-    pub region: String,
-    pub bucket: String,
+// ─── OS Keychain Backend (production) ────────────────────────────────
+
+/// Backed by OS keychain via `keyring` crate.
+#[derive(Debug)]
+pub struct KeychainBackend;
+
+impl CredentialBackend for KeychainBackend {
+    fn store(&self, service: &str, username: &str, payload: &str) -> CoreResult<()> {
+        let entry = Entry::new(service, username)
+            .map_err(|e| CoreError::Auth(format!("keychain entry creation failed: {}", e)))?;
+        entry
+            .set_password(payload)
+            .map_err(|e| CoreError::Auth(format!("keychain set failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn get(&self, service: &str, username: &str) -> CoreResult<String> {
+        let entry = Entry::new(service, username)
+            .map_err(|e| CoreError::Auth(format!("keychain entry creation failed: {}", e)))?;
+        entry.get_password().map_err(|e| {
+            if matches!(e, keyring::Error::NoEntry) {
+                CoreError::NotFound(format!(
+                    "no credential found for {} @ {}",
+                    username, service
+                ))
+            } else {
+                CoreError::Auth(format!("keychain get failed: {}", e))
+            }
+        })
+    }
+
+    fn delete(&self, service: &str, username: &str) -> CoreResult<()> {
+        let entry = Entry::new(service, username)
+            .map_err(|e| CoreError::Auth(format!("keychain entry creation failed: {}", e)))?;
+        entry
+            .delete_credential()
+            .map_err(|e| CoreError::Auth(format!("keychain delete failed: {}", e)))?;
+        Ok(())
+    }
 }
 
-/// An encrypted credential payload stored in the keychain.
+// ─── In-Memory Backend (testing) ──────────────────────────────────────
+
+/// Thread-local in-memory credential store for testing.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryBackend {
+    storage: std::sync::Arc<std::sync::Mutex<HashMap<(String, String), String>>>,
+}
+
+impl CredentialBackend for InMemoryBackend {
+    fn store(&self, service: &str, username: &str, payload: &str) -> CoreResult<()> {
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        storage.insert(
+            (service.to_string(), username.to_string()),
+            payload.to_string(),
+        );
+        Ok(())
+    }
+
+    fn get(&self, service: &str, username: &str) -> CoreResult<String> {
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        storage
+            .get(&(service.to_string(), username.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                CoreError::NotFound(format!(
+                    "no credential found for {} @ {}",
+                    username, service
+                ))
+            })
+    }
+
+    fn delete(&self, service: &str, username: &str) -> CoreResult<()> {
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        storage.remove(&(service.to_string(), username.to_string()));
+        Ok(())
+    }
+}
+
+// ─── An encrypted credential payload stored in the keychain. ──────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CredentialPayload {
     version: u32,
@@ -32,16 +116,44 @@ struct CredentialPayload {
     metadata: HashMap<String, String>,
 }
 
+// ─── Credential Store ─────────────────────────────────────────────────
+
+/// Credential store backed by a pluggable backend.
+///
+/// Production: `CredentialStore::new()` uses OS keychain.
+/// Testing: `CredentialStore::new_test()` uses in-memory HashMap.
+pub struct CredentialStore {
+    service_prefix: String,
+    backend: Box<dyn CredentialBackend>,
+}
+
+impl std::fmt::Debug for CredentialStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialStore")
+            .field("service_prefix", &self.service_prefix)
+            .finish()
+    }
+}
+
 impl CredentialStore {
-    /// Create a new credential store with the given service prefix.
+    /// Create a credential store backed by the OS keychain.
     pub fn new(service_prefix: &str) -> Self {
         Self {
             service_prefix: format!("s4drive/{}", service_prefix),
+            backend: Box::new(KeychainBackend),
         }
     }
 
-    /// Store a credential in the keychain.
-    /// The secret key is stored encrypted by the OS keychain.
+    /// Create a credential store backed by in-memory HashMap (for testing).
+    /// Credentials are NOT persisted — lost when the store is dropped.
+    pub fn new_test(service_prefix: &str) -> Self {
+        Self {
+            service_prefix: format!("s4drive-test/{}", service_prefix),
+            backend: Box::new(InMemoryBackend::default()),
+        }
+    }
+
+    /// Store a credential.
     pub fn store(
         &self,
         endpoint: &str,
@@ -51,8 +163,6 @@ impl CredentialStore {
         bucket: &str,
     ) -> CoreResult<()> {
         let username = self.keychain_username(endpoint, access_key_id);
-        let entry = Entry::new(&self.service_prefix, &username)
-            .map_err(|e| CoreError::Auth(format!("keychain entry creation failed: {}", e)))?;
 
         let payload = CredentialPayload {
             version: 1,
@@ -65,29 +175,13 @@ impl CredentialStore {
         let json = serde_json::to_string(&payload)
             .map_err(|e| CoreError::Auth(format!("credential serialization failed: {}", e)))?;
 
-        entry
-            .set_password(&json)
-            .map_err(|e| CoreError::Auth(format!("keychain set failed: {}", e)))?;
-
-        Ok(())
+        self.backend.store(&self.service_prefix, &username, &json)
     }
 
-    /// Retrieve a credential from the keychain.
+    /// Retrieve a credential.
     pub fn get(&self, endpoint: &str, access_key_id: &str) -> CoreResult<StoredCredential> {
         let username = self.keychain_username(endpoint, access_key_id);
-        let entry = Entry::new(&self.service_prefix, &username)
-            .map_err(|e| CoreError::Auth(format!("keychain entry creation failed: {}", e)))?;
-
-        let json = entry.get_password().map_err(|e| {
-            if matches!(e, keyring::Error::NoEntry) {
-                CoreError::NotFound(format!(
-                    "no credential found for {} @ {}",
-                    access_key_id, endpoint
-                ))
-            } else {
-                CoreError::Auth(format!("keychain get failed: {}", e))
-            }
-        })?;
+        let json = self.backend.get(&self.service_prefix, &username)?;
 
         let payload: CredentialPayload = serde_json::from_str(&json)
             .map_err(|e| CoreError::Auth(format!("credential deserialization failed: {}", e)))?;
@@ -101,38 +195,35 @@ impl CredentialStore {
         })
     }
 
-    /// Delete a credential from the keychain.
+    /// Delete a credential.
     pub fn delete(&self, endpoint: &str, access_key_id: &str) -> CoreResult<()> {
         let username = self.keychain_username(endpoint, access_key_id);
-        let entry = Entry::new(&self.service_prefix, &username)
-            .map_err(|e| CoreError::Auth(format!("keychain entry creation failed: {}", e)))?;
-
-        entry
-            .delete_credential()
-            .map_err(|e| CoreError::Auth(format!("keychain delete failed: {}", e)))?;
-
-        Ok(())
+        self.backend.delete(&self.service_prefix, &username)
     }
 
-    /// Check if a credential exists in the keychain.
+    /// Check if a credential exists.
     pub fn exists(&self, endpoint: &str, access_key_id: &str) -> bool {
         self.get(endpoint, access_key_id).is_ok()
     }
 
-    /// Generate a unique keychain username from endpoint + access key.
     fn keychain_username(&self, endpoint: &str, access_key_id: &str) -> String {
         format!("{}:{}", endpoint, access_key_id)
     }
 }
 
-/// Temporary credential holder (in-memory, for testing / config-driven setup).
-///
-/// Falls back to plaintext if keychain is not available (e.g. headless CI).
-#[derive(Debug, Clone, Default)]
-pub struct TempCredentials {
+// ─── Stored Credential ────────────────────────────────────────────────
+
+/// A stored credential for an S3 endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredCredential {
+    pub endpoint: String,
     pub access_key_id: String,
     pub secret_key: String,
+    pub region: String,
+    pub bucket: String,
 }
+
+// ─── Resolution ──────────────────────────────────────────────────────
 
 /// Utility: resolve credentials from config, trying keychain first.
 ///
@@ -166,100 +257,94 @@ pub fn resolve_secret(
 mod tests {
     use super::*;
 
-    /// Test that keychain username generation is deterministic and unique.
+    fn test_store() -> CredentialStore {
+        CredentialStore::new_test("unit")
+    }
+
     #[test]
     fn test_keychain_username() {
-        let store = CredentialStore::new("test");
+        let store = test_store();
         let username = store.keychain_username("http://localhost:9000", "minioadmin");
         assert_eq!(username, "http://localhost:9000:minioadmin");
     }
 
-    /// Test that service prefix is consistent.
-    #[test]
-    fn test_service_prefix() {
-        let store = CredentialStore::new("default");
-        // We can't test keychain I/O in unit tests without a backend,
-        // but we can verify the prefix structure.
-        let _ = store;
-    }
-
-    /// Test resolve_secret with no keychain (should fail gracefully).
-    /// Test resolve_secret with no keychain (should fall back to config).
     #[test]
     fn test_resolve_secret_no_keychain() {
-        let store = CredentialStore::new("test-unit");
+        let store = test_store();
         let result = resolve_secret(&store, "endpoint", "key", Some("config-secret"));
         assert_eq!(result.unwrap(), "config-secret");
     }
 
-    /// Test resolve_secret with empty config fallback.
     #[test]
     fn test_resolve_secret_empty_fallback() {
-        let store = CredentialStore::new("test-unit");
+        let store = test_store();
         let result = resolve_secret(&store, "endpoint", "key", Some(""));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_resolve_secret_no_fallback() {
-        let store = CredentialStore::new("test-unit");
+        let store = test_store();
         let result = resolve_secret(&store, "endpoint", "key", None);
         assert!(result.is_err());
     }
 
-    /// Test store → get round-trip (uses a unique service per test run).
-    /// NOTE: Requires a running OS keychain backend (fails in headless CI).
-    #[ignore = "requires OS keychain backend"]
     #[test]
     fn test_store_and_get_credential() {
-        let store = CredentialStore::new(&format!("s4drive-test-{}", std::process::id()));
+        let store = test_store();
         let endpoint = "http://localhost:9000";
         let ak = "test-access-key";
         let sk = "test-secret-key";
         let region = "us-east-1";
         let bucket = "test-bucket";
 
-        // Store
         store.store(endpoint, ak, sk, region, bucket).unwrap();
 
-        // Get
         let cred = store.get(endpoint, ak).unwrap();
         assert_eq!(cred.endpoint, endpoint);
         assert_eq!(cred.access_key_id, ak);
         assert_eq!(cred.secret_key, sk);
         assert_eq!(cred.region, region);
         assert_eq!(cred.bucket, bucket);
-
-        // Cleanup
-        store.delete(endpoint, ak).unwrap();
-
-        // Verify deleted
-        assert!(!store.exists(endpoint, ak));
     }
 
-    /// Test exists() returns false for missing credentials.
+    #[test]
+    fn test_delete_credential() {
+        let store = test_store();
+        store
+            .store("http://ep", "ak1", "sk1", "us-east-1", "b1")
+            .unwrap();
+        assert!(store.exists("http://ep", "ak1"));
+        store.delete("http://ep", "ak1").unwrap();
+        assert!(!store.exists("http://ep", "ak1"));
+    }
+
     #[test]
     fn test_exists_missing() {
-        let store = CredentialStore::new("test-exists");
+        let store = test_store();
         assert!(!store.exists("http://missing", "no-key"));
     }
 
-    /// Test overwrite (store twice with same key).
-    /// NOTE: Requires a running OS keychain backend (fails in headless CI).
-    #[ignore = "requires OS keychain backend"]
     #[test]
     fn test_overwrite_credential() {
-        let store = CredentialStore::new(&format!("s4drive-overwrite-{}", std::process::id()));
-        let ep = "http://example.com";
-        let ak = "user1";
+        let store = test_store();
+        store.store("http://ep", "u1", "v1", "r1", "b1").unwrap();
+        store.store("http://ep", "u1", "v2", "r2", "b2").unwrap();
 
-        store.store(ep, ak, "v1", "us-east-1", "b1").unwrap();
-        store.store(ep, ak, "v2", "eu-west-1", "b2").unwrap();
-
-        let cred = store.get(ep, ak).unwrap();
+        let cred = store.get("http://ep", "u1").unwrap();
         assert_eq!(cred.secret_key, "v2");
-        assert_eq!(cred.region, "eu-west-1");
+        assert_eq!(cred.region, "r2");
+    }
 
-        store.delete(ep, ak).unwrap();
+    #[test]
+    fn test_multiple_credentials() {
+        let store = test_store();
+        store.store("http://a", "ak1", "sk1", "r1", "b1").unwrap();
+        store.store("http://b", "ak2", "sk2", "r2", "b2").unwrap();
+
+        let c1 = store.get("http://a", "ak1").unwrap();
+        let c2 = store.get("http://b", "ak2").unwrap();
+        assert_eq!(c1.secret_key, "sk1");
+        assert_eq!(c2.secret_key, "sk2");
     }
 }
