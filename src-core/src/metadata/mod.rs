@@ -1,3 +1,5 @@
+pub mod graph;
+pub mod serializer;
 /// S4 Metadata Protocol types
 ///
 /// Defines the core data structures for the S4Drive metadata protocol:
@@ -9,8 +11,5 @@
 /// - BucketDescriptor (protocol versioning)
 /// - Tombstone (deletion tracking)
 /// - Lease/Lock (file locking)
-
 pub mod types;
-pub mod graph;
-pub mod serializer;
 pub mod validator;

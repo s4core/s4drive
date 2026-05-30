@@ -16,7 +16,10 @@ pub fn classify_error_code(code: &str, http_status: u16) -> ClassifiedError {
         "PreconditionFailed" => ("Conditional write failed (ETag mismatch)".into(), true),
         "NoSuchKey" => ("Object not found in bucket".into(), false),
         "NoSuchBucket" => ("Bucket does not exist".into(), false),
-        "AccessDenied" => ("Access denied: check credentials and bucket permissions".into(), false),
+        "AccessDenied" => (
+            "Access denied: check credentials and bucket permissions".into(),
+            false,
+        ),
         "InvalidAccessKeyId" => ("Invalid access key".into(), false),
         "SignatureDoesNotMatch" => ("Secret key does not match".into(), false),
         "BucketAlreadyExists" => ("Bucket name already taken".into(), false),
@@ -34,7 +37,10 @@ pub fn classify_error_code(code: &str, http_status: u16) -> ClassifiedError {
         "MalformedXML" => ("Malformed request".into(), false),
         _ => {
             if http_status >= 500 {
-                (format!("Server error (HTTP {}): {}", http_status, code), true)
+                (
+                    format!("Server error (HTTP {}): {}", http_status, code),
+                    true,
+                )
             } else if http_status == 429 {
                 ("Rate limited".into(), true)
             } else {

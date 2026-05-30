@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod core;
+pub mod credentials;
 pub mod db;
 pub mod diagnostics;
 pub mod error;

@@ -1,7 +1,5 @@
 use crate::error::{CoreError, CoreResult};
-use crate::metadata::types::{
-    BucketDescriptor, Device, FileEntry, Operation, Revision, Tombstone,
-};
+use crate::metadata::types::{BucketDescriptor, Device, FileEntry, Operation, Revision, Tombstone};
 
 /// S4 Metadata Protocol serializer/deserializer.
 /// Handles all `.s4drive/` JSON serialization.

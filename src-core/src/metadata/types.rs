@@ -254,6 +254,7 @@ pub struct LockState {
 }
 
 impl Default for LockState {
+    #[allow(clippy::derivable_impls)]
     fn default() -> Self {
         Self {
             locked: false,
@@ -265,6 +266,7 @@ impl Default for LockState {
 }
 
 impl Default for FileAttributes {
+    #[allow(clippy::derivable_impls)]
     fn default() -> Self {
         Self {
             favorite: false,

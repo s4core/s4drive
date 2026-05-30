@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 /// Diagnostics and health monitoring for S4Drive Core.
+#[derive(Default)]
 pub struct Diagnostics {
     events: VecDeque<DiagnosticEvent>,
 }

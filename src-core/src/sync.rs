@@ -1,34 +1,89 @@
 use crate::error::CoreResult;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// The sync engine orchestrates two-way synchronization.
 pub struct SyncEngine {
-    running: bool,
+    running: Arc<AtomicBool>,
     polling_interval: u64,
+    /// Handle to the sync loop task.
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Default for SyncEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SyncEngine {
     pub fn new() -> Self {
         Self {
-            running: false,
+            running: Arc::new(AtomicBool::new(false)),
             polling_interval: 30,
+            task_handle: None,
         }
     }
 
     pub fn is_running(&self) -> bool {
-        self.running
+        self.running.load(Ordering::Relaxed)
     }
 
     /// Start the sync loop.
     /// Spawns a tokio task for the main sync cycle.
     pub async fn start(&mut self) -> CoreResult<()> {
-        self.running = true;
-        tracing::info!("Sync engine started (poll interval: {}s)", self.polling_interval);
+        if self.is_running() {
+            return Ok(());
+        }
+
+        self.running.store(true, Ordering::Relaxed);
+        let running = self.running.clone();
+        let interval = self.polling_interval;
+
+        self.task_handle = Some(tokio::spawn(async move {
+            tracing::info!("Sync loop started (interval: {}s)", interval);
+            let mut cycle_count: u64 = 0;
+
+            while running.load(Ordering::Relaxed) {
+                cycle_count += 1;
+                tracing::debug!("Sync cycle #{}", cycle_count);
+
+                // In Phase 2, this is a skeleton. Real sync logic
+                // will be implemented in Phase 4.
+                //
+                // Future sync cycle steps:
+                // 1. Detect local changes (from file watcher)
+                // 2. Scan remote for new/changed objects
+                // 3. Compute diff (what to upload/download)
+                // 4. Apply transfers
+                // 5. Update local index
+
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+
+            tracing::info!("Sync loop stopped");
+        }));
+
+        tracing::info!(
+            "Sync engine started (poll interval: {}s)",
+            self.polling_interval
+        );
         Ok(())
     }
 
     /// Stop the sync loop gracefully.
     pub async fn stop(&mut self) -> CoreResult<()> {
-        self.running = false;
+        self.running.store(false, Ordering::Relaxed);
+
+        // Wait for the task to finish
+        if let Some(handle) = self.task_handle.take() {
+            match tokio::time::timeout(Duration::from_secs(10), handle).await {
+                Ok(_) => tracing::info!("Sync loop task stopped cleanly"),
+                Err(_) => tracing::warn!("Sync loop task did not stop within timeout"),
+            }
+        }
+
         tracing::info!("Sync engine stopped");
         Ok(())
     }
@@ -36,7 +91,19 @@ impl SyncEngine {
     /// Trigger an immediate sync cycle.
     pub async fn sync_now(&self) -> CoreResult<()> {
         tracing::info!("Manual sync triggered");
+        // In Phase 4, this will:
+        // 1. Scan local changes
+        // 2. Scan remote changes
+        // 3. Compute and apply diffs
         Ok(())
+    }
+
+    /// Update polling interval (takes effect on next cycle).
+    pub fn set_polling_interval(&mut self, seconds: u64) {
+        if seconds >= 1 {
+            self.polling_interval = seconds;
+            tracing::info!("Sync polling interval set to {}s", seconds);
+        }
     }
 }
 
@@ -72,4 +139,50 @@ pub struct SyncResult {
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
     pub errors: Vec<String>,
+}
+
+impl SyncResult {
+    /// Create an empty sync result.
+    pub fn empty() -> Self {
+        Self {
+            files_uploaded: 0,
+            files_downloaded: 0,
+            conflicts_detected: 0,
+            bytes_uploaded: 0,
+            bytes_downloaded: 0,
+            errors: Vec::new(),
+        }
+    }
+
+    /// Check if the sync cycle had any activity.
+    pub fn has_activity(&self) -> bool {
+        self.files_uploaded > 0 || self.files_downloaded > 0 || self.conflicts_detected > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sync_result_empty() {
+        let r = SyncResult::empty();
+        assert!(!r.has_activity());
+    }
+
+    #[test]
+    fn test_sync_result_has_activity() {
+        let r = SyncResult {
+            files_uploaded: 1,
+            ..SyncResult::empty()
+        };
+        assert!(r.has_activity());
+    }
+
+    #[test]
+    fn test_set_polling_interval() {
+        let mut engine = SyncEngine::new();
+        engine.set_polling_interval(10);
+        assert!(!engine.is_running());
+    }
 }

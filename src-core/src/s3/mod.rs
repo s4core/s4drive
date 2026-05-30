@@ -5,7 +5,6 @@
 /// - Multipart upload with resume
 /// - Compatibility detection
 /// - Error classification
-
 pub mod client;
 pub mod compatibility;
 pub mod error;

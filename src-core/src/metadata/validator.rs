@@ -29,8 +29,7 @@ impl Validator {
         }
         // Check for reserved Windows names
         let reserved = [
-            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
-            "LPT1", "LPT2", "LPT3",
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "LPT1", "LPT2", "LPT3",
         ];
         let stem = entry
             .name
@@ -71,7 +70,12 @@ impl Validator {
         existing
             .iter()
             .find(|e| e.to_lowercase() == lower && **e != name)
-            .map(|e| format!("'{}' conflicts with '{}' on case-insensitive file systems", name, e))
+            .map(|e| {
+                format!(
+                    "'{}' conflicts with '{}' on case-insensitive file systems",
+                    name, e
+                )
+            })
     }
 }
 

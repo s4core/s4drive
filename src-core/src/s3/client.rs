@@ -31,9 +31,7 @@ impl S3Adapter {
         let access_key = &config.s3.access_key_id;
         let secret = config.s3.encrypted_secret_key.as_deref().unwrap_or("");
 
-        let creds = aws_sdk_s3::config::Credentials::new(
-            access_key, secret, None, None, "s4drive",
-        );
+        let creds = aws_sdk_s3::config::Credentials::new(access_key, secret, None, None, "s4drive");
 
         let s3_config = aws_sdk_s3::config::Builder::new()
             .endpoint_url(&endpoint)
@@ -79,7 +77,11 @@ impl S3Adapter {
             .await
             .map_err(|e| classify_s3_error(e, key))?;
 
-        Ok(resp.e_tag().unwrap_or_default().trim_matches('"').to_string())
+        Ok(resp
+            .e_tag()
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string())
     }
 
     /// PUT with conditional If-None-Match.
@@ -99,11 +101,11 @@ impl S3Adapter {
             Ok(_) => Ok(true),
             Err(err) => {
                 let service_err = err.into_service_error();
-                if service_err.meta().code() == Some("PreconditionFailed")
-                {
+                if service_err.meta().code() == Some("PreconditionFailed") {
                     Ok(false)
                 } else {
-                    Err(CoreError::S3(format!("if-none-match failed ({}): {}",
+                    Err(CoreError::S3(format!(
+                        "if-none-match failed ({}): {}",
                         service_err.meta().code().unwrap_or("?"),
                         service_err.meta().message().unwrap_or("?"),
                     )))
@@ -114,7 +116,12 @@ impl S3Adapter {
 
     /// PUT with conditional If-Match (CAS).
     /// Returns Ok(true) if updated, Ok(false) if precondition failed (412).
-    pub async fn put_if_match(&self, key: &str, body: Vec<u8>, expected_etag: &str) -> CoreResult<bool> {
+    pub async fn put_if_match(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        expected_etag: &str,
+    ) -> CoreResult<bool> {
         let result = self
             .client
             .put_object()
@@ -129,11 +136,11 @@ impl S3Adapter {
             Ok(_) => Ok(true),
             Err(err) => {
                 let service_err = err.into_service_error();
-                if service_err.meta().code() == Some("PreconditionFailed")
-                {
+                if service_err.meta().code() == Some("PreconditionFailed") {
                     Ok(false)
                 } else {
-                    Err(CoreError::S3(format!("if-match failed ({}): {}",
+                    Err(CoreError::S3(format!(
+                        "if-match failed ({}): {}",
                         service_err.meta().code().unwrap_or("?"),
                         service_err.meta().message().unwrap_or("?"),
                     )))
@@ -203,7 +210,11 @@ impl S3Adapter {
         Ok(ObjectMeta {
             key: key.to_string(),
             size,
-            etag: resp.e_tag().unwrap_or_default().trim_matches('"').to_string(),
+            etag: resp
+                .e_tag()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
             last_modified: resp
                 .last_modified()
                 .map(|d| d.to_string())
@@ -241,10 +252,7 @@ impl S3Adapter {
                 req = req.continuation_token(token);
             }
 
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| classify_s3_error(e, prefix))?;
+            let resp = req.send().await.map_err(|e| classify_s3_error(e, prefix))?;
 
             for obj in resp.contents().iter() {
                 if let Some(key) = obj.key() {
@@ -253,9 +261,7 @@ impl S3Adapter {
             }
 
             if resp.is_truncated() == Some(true) {
-                continuation_token = resp
-                    .next_continuation_token()
-                    .map(|s| s.to_string());
+                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
             } else {
                 break;
             }
@@ -266,13 +272,7 @@ impl S3Adapter {
 
     /// Check if a bucket exists and is accessible.
     pub async fn check_bucket_access(&self) -> CoreResult<bool> {
-        match self
-            .client
-            .head_bucket()
-            .bucket(&self.bucket)
-            .send()
-            .await
-        {
+        match self.client.head_bucket().bucket(&self.bucket).send().await {
             Ok(_) => Ok(true),
             Err(err) => {
                 let service_err = err.into_service_error();
@@ -287,7 +287,7 @@ impl S3Adapter {
     /// Upload a file using multipart upload with 5 MB parts.
     pub async fn multipart_upload(&self, key: &str, data: Vec<u8>) -> CoreResult<String> {
         let part_size: usize = 5 * 1024 * 1024;
-        let total_parts = (data.len() + part_size - 1) / part_size;
+        let total_parts = data.len().div_ceil(part_size);
 
         // Initiate
         let upload = self
@@ -302,7 +302,8 @@ impl S3Adapter {
         let upload_id = upload.upload_id().unwrap_or_default().to_string();
 
         // Upload parts
-        let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::with_capacity(total_parts);
+        let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> =
+            Vec::with_capacity(total_parts);
 
         for i in 0..total_parts {
             let start = i * part_size;
@@ -346,7 +347,11 @@ impl S3Adapter {
             .await
             .map_err(|e| classify_s3_error(e, key))?;
 
-        Ok(result.e_tag().unwrap_or_default().trim_matches('"').to_string())
+        Ok(result
+            .e_tag()
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string())
     }
 
     /// Abort a multipart upload (cleanup).
@@ -370,10 +375,7 @@ impl S3Adapter {
 }
 
 /// Classify S3 errors into CoreError variants.
-pub(crate) fn classify_s3_error(
-    e: impl std::fmt::Display,
-    context: &str,
-) -> CoreError {
+pub(crate) fn classify_s3_error(e: impl std::fmt::Display, context: &str) -> CoreError {
     let msg = format!("s3 error ({}): {}", context, e);
     let msg_lower = msg.to_lowercase();
 
@@ -381,7 +383,10 @@ pub(crate) fn classify_s3_error(
         CoreError::S3(format!("412 PreconditionFailed: {}", context))
     } else if msg_lower.contains("404") || msg_lower.contains("not found") {
         CoreError::NotFound(format!("not found: {}", context))
-    } else if msg_lower.contains("403") || msg_lower.contains("forbidden") || msg_lower.contains("accessdenied") {
+    } else if msg_lower.contains("403")
+        || msg_lower.contains("forbidden")
+        || msg_lower.contains("accessdenied")
+    {
         CoreError::Auth(format!("access denied: {}", context))
     } else if msg_lower.contains("409") || msg_lower.contains("conflict") {
         CoreError::Conflict(format!("conflict: {}", context))

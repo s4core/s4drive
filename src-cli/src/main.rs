@@ -60,13 +60,7 @@ async fn main() {
     }
 }
 
-async fn run_check(
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
-) {
+async fn run_check(endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, region: &str) {
     println!();
     println!("╔══════════════════════════════════════════════╗");
     println!("║   S4Drive — S3 Compatibility Checker        ║");
@@ -101,7 +95,10 @@ async fn run_check(
     println!("  Checking bucket access...");
     match adapter.check_bucket_access().await {
         Ok(true) => println!("  ✓ Bucket '{}' is accessible", bucket),
-        Ok(false) => println!("  ✗ Bucket '{}' exists but returned unexpected status", bucket),
+        Ok(false) => println!(
+            "  ✗ Bucket '{}' exists but returned unexpected status",
+            bucket
+        ),
         Err(e) => {
             println!("  ✗ {}", e);
             return;
@@ -120,9 +117,17 @@ async fn run_check(
     // Summary
     println!("╔══════════════════════════════════════════════╗");
     if report.level >= 2 {
-        println!("║   ✅ Level {}: {}                         ", report.level, level_badge(report.level));
+        println!(
+            "║   ✅ Level {}: {}                         ",
+            report.level,
+            level_badge(report.level)
+        );
     } else {
-        println!("║   ❌ Level {}: {}                         ", report.level, level_badge(report.level));
+        println!(
+            "║   ❌ Level {}: {}                         ",
+            report.level,
+            level_badge(report.level)
+        );
     }
     println!("╚══════════════════════════════════════════════╝");
     println!();
