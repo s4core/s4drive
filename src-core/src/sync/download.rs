@@ -5,9 +5,9 @@ use crate::s3::S3Adapter;
 use std::path::Path;
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct DownloadEngine {
     s3: S3Adapter,
+    #[allow(dead_code)]
     sync_folder: String,
 }
 

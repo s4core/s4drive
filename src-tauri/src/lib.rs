@@ -121,7 +121,11 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let _tray = TrayIconBuilder::new()
-        .icon(app.default_window_icon().cloned().unwrap())
+        .icon(
+            app.default_window_icon()
+                .cloned()
+                .expect("app icon bundled"),
+        )
         .menu(&menu)
         .tooltip("S4Drive")
         .on_menu_event(move |app, event| {
@@ -145,7 +149,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 "pause" => {
                     let state = app.state::<AppState>();
-                    let mut paused = state.sync_paused.lock().unwrap();
+                    let mut paused = state.sync_paused.lock().expect("sync_paused lock");
                     *paused = !*paused;
                     let msg = if *paused {
                         "Sync Paused"
