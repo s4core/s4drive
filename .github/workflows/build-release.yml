@@ -1,0 +1,358 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, develop]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub Release (tag required)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUST_BACKTRACE: 1
+  TAURI_CLI_VERSION: "2"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ─── Lint & Test ─────────────────────────────────────────────
+  lint-test:
+    name: Lint & Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Tauri system deps (Linux)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all -- -D warnings
+
+      - name: Run tests
+        run: cargo test -p s4drive-core --lib
+
+  # ─── Linux build ─────────────────────────────────────────────
+  build-linux:
+    name: Linux (deb + rpm + AppImage)
+    runs-on: ubuntu-latest
+    needs: [lint-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Tauri system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            libfuse2 rpm
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^${{ env.TAURI_CLI_VERSION }}"
+
+      - name: Build bundles (deb, rpm, AppImage)
+        run: |
+          cd src-tauri
+          cargo tauri build --bundles deb,rpm,appimage --ci
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4drive-linux
+          path: src-tauri/target/release/bundle/
+          retention-days: 14
+          compression-level: 0
+
+  # ─── Windows build ───────────────────────────────────────────
+  build-windows:
+    name: Windows (exe + msi)
+    runs-on: windows-latest
+    needs: [lint-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install WiX Toolset (for MSI)
+        run: |
+          dotnet tool install --global wix
+          echo "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+        shell: pwsh
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^${{ env.TAURI_CLI_VERSION }}"
+
+      - name: Build MSI installer
+        run: |
+          cd src-tauri
+          cargo tauri build --bundles msi --ci
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4drive-windows
+          path: src-tauri/target/release/bundle/
+          retention-days: 14
+          compression-level: 0
+
+  # ─── macOS build ─────────────────────────────────────────────
+  build-macos:
+    name: macOS (universal dmg)
+    runs-on: macos-latest
+    needs: [lint-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^${{ env.TAURI_CLI_VERSION }}"
+
+      - name: Build for x86_64
+        run: |
+          cd src-tauri
+          cargo tauri build --target x86_64-apple-darwin --bundles dmg --ci
+        env:
+          CARGO_BUILD_TARGET: x86_64-apple-darwin
+
+      - name: Build for arm64
+        run: |
+          cd src-tauri
+          cargo tauri build --target aarch64-apple-darwin --bundles dmg --ci
+        env:
+          CARGO_BUILD_TARGET: aarch64-apple-darwin
+
+      - name: Create universal binary with lipo
+        run: |
+          X86="src-tauri/target/x86_64-apple-darwin/release/s4drive"
+          ARM="src-tauri/target/aarch64-apple-darwin/release/s4drive"
+          UNIVERSAL="src-tauri/target/release/s4drive-universal"
+          mkdir -p src-tauri/target/release
+          lipo -create -output "$UNIVERSAL" "$X86" "$ARM"
+          lipo -info "$UNIVERSAL"
+
+      - name: Build universal .app bundle
+        run: |
+          APP="src-tauri/target/release/S4Drive.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp src-tauri/target/release/s4drive-universal "$APP/Contents/MacOS/s4drive"
+          cp src-tauri/icons/icon.svg "$APP/Contents/Resources/"
+          cp src-tauri/icons/128x128.png "$APP/Contents/Resources/"
+          # Write Info.plist without heredoc to avoid YAML parser confusion
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0">' \
+            '<dict>' \
+            '<key>CFBundleExecutable</key><string>s4drive</string>' \
+            '<key>CFBundleIdentifier</key><string>com.s4drive.app</string>' \
+            '<key>CFBundleName</key><string>S4Drive</string>' \
+            '<key>CFBundleVersion</key><string>0.1.0</string>' \
+            '<key>CFBundleShortVersionString</key><string>0.1.0</string>' \
+            '<key>CFBundlePackageType</key><string>APPL</string>' \
+            '<key>LSMinimumSystemVersion</key><string>10.15</string>' \
+            '<key>NSHighResolutionCapable</key><true/>' \
+            '</dict>' \
+            '</plist>' \
+            > "$APP/Contents/Info.plist"
+
+      - name: Create universal DMG
+        run: |
+          DMG="src-tauri/target/release/S4Drive-0.1.0-universal.dmg"
+          APP="src-tauri/target/release/S4Drive.app"
+          hdiutil create -volname "S4Drive" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          ls -lh "$DMG"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4drive-macos
+          path: src-tauri/target/release/*.dmg
+          retention-days: 14
+          compression-level: 0
+
+  # ─── CLI binary ──────────────────────────────────────────────
+  build-cli:
+    name: CLI (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            suffix: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            suffix: ".exe"
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            suffix: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            suffix: ""
+    runs-on: ${{ matrix.os }}
+    needs: [lint-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-core -> target, src-cli -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
+
+      - name: Build CLI binary
+        run: cargo build --package s4drive-cli --target ${{ matrix.target }} --release
+
+      - name: Upload CLI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4drive-cli-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/s4drive-cli${{ matrix.suffix }}
+          retention-days: 14
+
+  # ─── GitHub Release ──────────────────────────────────────────
+  release:
+    name: Create Release
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true') && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux
+      - build-windows
+      - build-macos
+      - build-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV" ]; then
+            LOG=$(git log "$PREV..HEAD" --oneline --no-decorate 2>/dev/null)
+          else
+            LOG=$(git log --oneline --max-count=30 --no-decorate 2>/dev/null)
+          fi
+          cat > release-notes.md << 'EOF'
+          # S4Drive vVERSION
+          ## What's Changed
+          EOF
+          echo "$LOG" | sed 's/^/ - /' >> release-notes.md
+
+      - name: Organize release assets
+        run: |
+          mkdir -p release-assets/
+          V=${{ steps.notes.outputs.version }}
+          # Linux
+          find artifacts/s4drive-linux -type f 2>/dev/null | while read f; do
+            case "${f##*.}" in
+              deb)     cp "$f" "release-assets/S4Drive-${V}-linux-x86_64.deb" ;;
+              rpm)     cp "$f" "release-assets/S4Drive-${V}-linux-x86_64.rpm" ;;
+              AppImage) cp "$f" "release-assets/S4Drive-${V}-linux-x86_64.AppImage" ;;
+            esac
+          done
+          # Windows
+          find artifacts/s4drive-windows -type f -name "*.msi" 2>/dev/null | while read f; do
+            cp "$f" "release-assets/S4Drive-${V}-windows-x86_64.msi"
+          done
+          # macOS
+          find artifacts/s4drive-macos -type f -name "*.dmg" 2>/dev/null | while read f; do
+            cp "$f" "release-assets/S4Drive-${V}-macos-universal.dmg"
+          done
+          # CLI
+          find artifacts/ -name "s4drive-cli-*" -type f 2>/dev/null | while read f; do
+            n=$(basename "$f")
+            cp "$f" "release-assets/${n}"
+          done
+          ls -lh release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: S4Drive v${{ steps.notes.outputs.version }}
+          body_path: release-notes.md
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          files: release-assets/*
+          fail_on_unmatched_files: false
