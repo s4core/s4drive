@@ -209,6 +209,43 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) {
     }
 }
 
+/// Send a typed sync notification with appropriate icon/urgency.
+pub fn send_sync_notification(app: &AppHandle, kind: &str, body: &str) {
+    let title = match kind {
+        "sync_complete" => "☁ S4Drive Sync Complete",
+        "sync_started" => "☁ S4Drive Syncing",
+        "conflict" => "⚠ S4Drive Conflict Detected",
+        "error" => "✗ S4Drive Sync Error",
+        "paused" => "⏸ S4Drive Sync Paused",
+        "resumed" => "▶ S4Drive Sync Resumed",
+        _ => "S4Drive",
+    };
+    // For conflicts and errors, include action hint
+    let full_body = if kind == "conflict" {
+        format!("{} — Click to resolve", body)
+    } else if kind == "error" {
+        format!("{} – Open diagnostics", body)
+    } else {
+        body.to_string()
+    };
+    send_notification(app, title, &full_body);
+}
+
+/// Update the tray tooltip to show current sync status.
+pub fn update_tray_status(tray: &tauri::tray::TrayIcon, state: &str, conflicts: u32) {
+    let tooltip = if conflicts > 0 {
+        format!(
+            "S4Drive — {} ({} conflict{})",
+            state,
+            conflicts,
+            if conflicts == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("S4Drive — {}", state)
+    };
+    let _ = tray.set_tooltip(Some(&tooltip));
+}
+
 // ─── IPC Commands ───────────────────────────────────────────────
 
 #[tauri::command]

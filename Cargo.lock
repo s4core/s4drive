@@ -4269,6 +4269,8 @@ name = "s4drive-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dirs",
+ "rusqlite",
  "s4drive-core",
  "serde",
  "serde_json",

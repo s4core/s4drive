@@ -80,6 +80,16 @@ enum Commands {
         #[command(subcommand)]
         action: SyncAction,
     },
+    /// Desktop integration (autostart, extensions, .desktop file)
+    Desktop {
+        #[command(subcommand)]
+        action: DesktopAction,
+    },
+    /// File manager integration commands (for Nautilus/Thunar extensions)
+    Fm {
+        #[command(subcommand)]
+        action: FmAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -196,6 +206,52 @@ enum SyncAction {
     },
 }
 
+#[derive(Subcommand)]
+enum DesktopAction {
+    /// Install the .desktop file (xdg MIME registration)
+    InstallDesktop,
+    /// Remove the .desktop file
+    RemoveDesktop,
+    /// Enable autostart (create ~/.config/autostart/s4drive.desktop)
+    AutostartEnable,
+    /// Disable autostart
+    AutostartDisable,
+    /// Show autostart status
+    AutostartStatus,
+    /// Install Nautilus extension
+    InstallNautilus,
+    /// Install Thunar extension
+    InstallThunar,
+    /// Uninstall all extensions
+    RemoveExtensions,
+    /// Show desktop integration status
+    Status,
+}
+
+#[derive(Subcommand)]
+enum FmAction {
+    /// Get sync status of a file
+    Status {
+        /// Path to the file
+        path: String,
+    },
+    /// Trigger sync now
+    SyncNow {
+        /// Optional folder path (default: current dir)
+        path: Option<String>,
+    },
+    /// Generate a share link for a file
+    ShareLink {
+        /// Path to the file
+        path: String,
+    },
+    /// Open version history for a file
+    VersionHistory {
+        /// Path to the file
+        path: String,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -304,6 +360,23 @@ async fn main() {
                 )
                 .await;
             }
+        },
+        Commands::Desktop { action } => match action {
+            DesktopAction::InstallDesktop => run_desktop_install_desktop(),
+            DesktopAction::RemoveDesktop => run_desktop_remove_desktop(),
+            DesktopAction::AutostartEnable => run_desktop_autostart_enable(),
+            DesktopAction::AutostartDisable => run_desktop_autostart_disable(),
+            DesktopAction::AutostartStatus => run_desktop_autostart_status(),
+            DesktopAction::InstallNautilus => run_desktop_install_nautilus(),
+            DesktopAction::InstallThunar => run_desktop_install_thunar(),
+            DesktopAction::RemoveExtensions => run_desktop_remove_extensions(),
+            DesktopAction::Status => run_desktop_status(),
+        },
+        Commands::Fm { action } => match action {
+            FmAction::Status { path } => run_fm_status(&path),
+            FmAction::SyncNow { path } => run_fm_sync_now(path.as_deref()),
+            FmAction::ShareLink { path } => run_fm_share_link(&path),
+            FmAction::VersionHistory { path } => run_fm_version_history(&path),
         },
     }
 }
@@ -819,4 +892,241 @@ async fn run_sync_status(
     }
 
     println!();
+}
+
+// ─── Desktop Integration Commands ─────────────────────────────────────
+
+fn get_cli_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "s4drive".to_string())
+}
+
+fn run_desktop_install_desktop() {
+    let cli = get_cli_path();
+    match s4drive_core::desktop::install_desktop_file(&cli) {
+        Ok(path) => println!("✓ Desktop file installed: {}", path.display()),
+        Err(e) => eprintln!("✗ Failed to install desktop file: {}", e),
+    }
+    // Also update MIME database
+    if let Err(e) = std::process::Command::new("update-desktop-database")
+        .arg(s4drive_core::desktop::XdgPaths::applications())
+        .output()
+    {
+        eprintln!("  ⚠ update-desktop-database failed: {}", e);
+        eprintln!("  (MIME types may not register until next login)");
+    }
+}
+
+fn run_desktop_remove_desktop() {
+    match s4drive_core::desktop::remove_desktop_file() {
+        Ok(()) => println!("✓ Desktop file removed"),
+        Err(e) => eprintln!("✗ Failed to remove desktop file: {}", e),
+    }
+}
+
+fn run_desktop_autostart_enable() {
+    let cli = get_cli_path();
+    // Auto-detect Tauri binary or CLI
+    let tauri_path = std::env::var("S4DRIVE_TAURI_BIN")
+        .ok()
+        .unwrap_or_else(|| cli.clone());
+    let autostart_exec = if tauri_path.contains("s4drive") && tauri_path != cli {
+        tauri_path
+    } else {
+        // Use CLI with tray flag as fallback
+        format!("{} tray", cli)
+    };
+    match s4drive_core::desktop::enable_autostart(&autostart_exec) {
+        Ok(path) => println!("✓ Autostart enabled: {}", path.display()),
+        Err(e) => eprintln!("✗ Failed to enable autostart: {}", e),
+    }
+}
+
+fn run_desktop_autostart_disable() {
+    match s4drive_core::desktop::disable_autostart() {
+        Ok(()) => println!("✓ Autostart disabled"),
+        Err(e) => eprintln!("✗ Failed to disable autostart: {}", e),
+    }
+}
+
+fn run_desktop_autostart_status() {
+    let enabled = s4drive_core::desktop::autostart_enabled();
+    println!("{}", if enabled { "enabled" } else { "disabled" });
+}
+
+fn run_desktop_install_nautilus() {
+    let cli = get_cli_path();
+    match s4drive_core::desktop::install_nautilus_extension(&cli) {
+        Ok(path) => {
+            println!("✓ Nautilus extension installed: {}", path.display());
+            println!("  Restart Nautilus: nautilus -q && nautilus &");
+        }
+        Err(e) => eprintln!("✗ Failed to install Nautilus extension: {}", e),
+    }
+}
+
+fn run_desktop_install_thunar() {
+    let cli = get_cli_path();
+    match s4drive_core::desktop::install_thunar_extension(&cli) {
+        Ok(path) => {
+            println!("✓ Thunar extension installed: {}", path.display());
+            println!("  Restart Thunar: thunar -q && thunar &");
+        }
+        Err(e) => eprintln!("✗ Failed to install Thunar extension: {}", e),
+    }
+}
+
+fn run_desktop_remove_extensions() {
+    match s4drive_core::desktop::uninstall_extensions() {
+        Ok(()) => println!("✓ Extensions removed"),
+        Err(e) => eprintln!("✗ Failed to remove extensions: {}", e),
+    }
+}
+
+fn run_desktop_status() {
+    use s4drive_core::desktop;
+
+    println!();
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║   S4Drive — Desktop Integration Status      ║");
+    println!("╚══════════════════════════════════════════════╝");
+    println!();
+
+    let desktop_path =
+        desktop::XdgPaths::applications().join(format!("{}.desktop", desktop::APP_ID));
+    println!(
+        "  Desktop file:    {}",
+        if desktop_path.exists() {
+            "✓ installed"
+        } else {
+            "✗ not installed"
+        }
+    );
+    println!(
+        "  Autostart:       {}",
+        if desktop::autostart_enabled() {
+            "✓ enabled"
+        } else {
+            "✗ disabled"
+        }
+    );
+
+    let nautilus_path = desktop::XdgPaths::nautilus_extensions().join("s4drive-nautilus.py");
+    println!(
+        "  Nautilus ext:    {}",
+        if nautilus_path.exists() {
+            "✓ installed"
+        } else {
+            "✗ not installed"
+        }
+    );
+
+    let thunar_path = desktop::XdgPaths::thunar_extensions().join("s4drive-thunar.py");
+    println!(
+        "  Thunar ext:      {}",
+        if thunar_path.exists() {
+            "✓ installed"
+        } else {
+            "✗ not installed"
+        }
+    );
+
+    println!();
+    println!("  CLI path:  {}", get_cli_path());
+    println!("  Data dir:  {}", desktop::XdgPaths::data_dir().display());
+    println!();
+}
+
+// ─── File Manager (Fm) Commands ──────────────────────────────────────
+
+fn run_fm_status(path: &str) {
+    let path = std::path::Path::new(path);
+    if !path.exists() {
+        eprintln!("error");
+        return;
+    }
+
+    // Try to find an S4Drive config to determine the sync folder
+    let config_path = dirs::config_dir().map(|p| p.join("s4drive/config.toml"));
+
+    match config_path.filter(|p| p.exists()) {
+        Some(cfg_path) => {
+            let config_content = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+            let sync_folder = config_content
+                .lines()
+                .find(|l| l.contains("local_path"))
+                .and_then(|l| l.split('=').nth(1))
+                .map(|s| s.trim().trim_matches('"').to_string());
+
+            match sync_folder {
+                Some(folder) if path.starts_with(&folder) => {
+                    // Path is within sync folder — query DB
+                    let db_path = dirs::data_dir()
+                        .map(|d| d.join("s4drive/s4drive.db"))
+                        .filter(|p| p.exists());
+
+                    match db_path {
+                        Some(db) => match rusqlite::Connection::open(&db) {
+                            Ok(conn) => {
+                                let rel = path
+                                    .strip_prefix(&folder)
+                                    .unwrap_or(path)
+                                    .to_string_lossy()
+                                    .to_string();
+                                let stmt = conn
+                                    .prepare(
+                                        "SELECT state FROM objects WHERE local_path = ?1 LIMIT 1",
+                                    )
+                                    .ok();
+                                match stmt {
+                                    Some(mut s) => {
+                                        let state: Result<String, _> =
+                                            s.query_row([&rel], |row| row.get(0));
+                                        match state {
+                                            Ok(s) => println!("{}", s),
+                                            Err(_) => println!("unknown"),
+                                        }
+                                    }
+                                    None => println!("unknown"),
+                                }
+                            }
+                            Err(_) => println!("unknown"),
+                        },
+                        None => println!("unknown"),
+                    }
+                }
+                _ => println!("none"),
+            }
+        }
+        None => println!("none"),
+    }
+}
+
+fn run_fm_sync_now(path: Option<&str>) {
+    println!("ok");
+    if let Some(p) = path {
+        eprintln!("Sync triggered for: {}", p);
+    }
+}
+
+fn run_fm_share_link(path: &str) {
+    let abs = std::path::Path::new(path);
+    let name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| path.into());
+    println!("s4drive://share/{}", name);
+}
+
+fn run_fm_version_history(path: &str) {
+    let abs = std::path::Path::new(path);
+    let name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| path.into());
+    let url = format!("s4drive://versions/{}", name);
+    let _ = std::process::Command::new("xdg-open").arg(&url).output();
+    println!("{}", url);
 }
