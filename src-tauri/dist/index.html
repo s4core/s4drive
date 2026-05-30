@@ -4,263 +4,228 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>S4Drive</title>
+  <link rel="stylesheet" href="css/main.css" />
   <style>
-    :root {
-      --bg: #1a1a2e;
-      --surface: #16213e;
-      --surface2: #0f3460;
-      --accent: #e94560;
-      --accent2: #53d769;
-      --text: #eaeaea;
-      --text2: #a0a0b0;
-      --radius: 10px;
-      --shadow: 0 4px 20px rgba(0,0,0,0.3);
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      height: 100vh;
-      overflow: hidden;
-    }
-    #app {
-      display: flex;
-      flex-direction: column;
-      height: 100vh;
-    }
-
-    /* Header */
-    .header {
-      -webkit-app-region: drag;
-      padding: 12px 16px;
-      background: var(--surface);
-      border-bottom: 1px solid rgba(255,255,255,0.05);
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .header .logo {
-      width: 24px; height: 24px;
-      background: var(--accent);
-      border-radius: 6px;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 14px;
-      -webkit-app-region: no-drag;
-    }
-    .header h1 { font-size: 16px; font-weight: 600; flex: 1; }
-    .header .status-dot {
-      width: 8px; height: 8px; border-radius: 50%;
-      background: var(--accent2);
-      -webkit-app-region: no-drag;
-    }
-    .header .status-dot.paused { background: #f0ad4e; }
-    .header .status-dot.error { background: var(--accent); }
-
-    /* Nav tabs */
-    .nav {
-      display: flex;
-      background: var(--surface);
-      padding: 0 8px;
-      gap: 2px;
-    }
-    .nav button {
-      flex: 1;
-      padding: 8px 4px;
-      background: transparent;
-      border: none;
-      color: var(--text2);
-      font-size: 12px;
-      cursor: pointer;
-      border-bottom: 2px solid transparent;
-      transition: all 0.2s;
-    }
-    .nav button:hover { color: var(--text); }
-    .nav button.active {
-      color: var(--accent);
-      border-bottom-color: var(--accent);
-    }
-
-    /* Content */
-    .content {
-      flex: 1;
-      overflow-y: auto;
-      padding: 16px;
-    }
-    .content::-webkit-scrollbar { width: 4px; }
-    .content::-webkit-scrollbar-thumb { background: var(--surface2); border-radius: 2px; }
-
-    /* Cards */
-    .card {
-      background: var(--surface);
-      border-radius: var(--radius);
-      padding: 12px 16px;
-      margin-bottom: 10px;
-    }
-    .card h3 { font-size: 14px; margin-bottom: 6px; color: var(--text2); }
-    .card .value { font-size: 18px; font-weight: 700; }
-    .card .row { display: flex; justify-content: space-between; padding: 4px 0; }
-    .card .row span:last-child { color: var(--text2); font-size: 13px; }
-
-    /* Activity item */
-    .activity-item {
-      display: flex;
-      gap: 10px;
-      padding: 8px 0;
-      border-bottom: 1px solid rgba(255,255,255,0.05);
-    }
-    .activity-item:last-child { border-bottom: none; }
-    .activity-icon { font-size: 18px; width: 24px; text-align: center; }
-    .activity-text { flex: 1; font-size: 13px; }
-    .activity-time { font-size: 11px; color: var(--text2); }
-
-    .hidden { display: none; }
-
-    /* Empty states */
-    .empty-state {
-      text-align: center;
-      padding: 40px 20px;
-      color: var(--text2);
-    }
-    .empty-state .icon { font-size: 40px; margin-bottom: 12px; }
-
-    @media (prefers-color-scheme: light) {
-      :root {
-        --bg: #f5f5f5;
-        --surface: #ffffff;
-        --surface2: #e0e0e0;
-        --text: #1a1a2e;
-        --text2: #666;
-      }
-    }
+    /* Critical path — flash prevention */
+    body { opacity: 0; }
+    body.ready { opacity: 1; }
   </style>
 </head>
 <body>
   <div id="app">
-    <div class="header">
-      <div class="logo">S4</div>
-      <h1>S4Drive</h1>
-      <div class="status-dot" id="statusDot"></div>
-    </div>
-
-    <div class="nav" id="nav">
-      <button class="active" data-tab="overview">Overview</button>
-      <button data-tab="activity">Activity</button>
-      <button data-tab="conflicts">Conflicts</button>
-      <button data-tab="settings">Settings</button>
-    </div>
-
-    <div class="content" id="content">
-      <div id="tab-overview" class="tab-content">
-        <div class="card">
-          <div class="row"><span>Status</span><span id="syncState">Loading...</span></div>
-          <div class="row"><span>Conflicts</span><span id="conflictCount">0</span></div>
-          <div class="row"><span>Last Sync</span><span id="lastSync">-</span></div>
-        </div>
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="app-icon" aria-label="S4Drive">S4</div>
+        <h1 class="app-title">S4Drive</h1>
       </div>
-
-      <div id="tab-activity" class="tab-content hidden">
-        <div class="card" id="activityList"></div>
+      <div class="header-right">
+        <span class="status-badge" id="statusBadge">Idle</span>
+        <button class="icon-btn" id="themeToggle" title="Toggle theme" aria-label="Toggle theme">🌙</button>
       </div>
+    </header>
 
-      <div id="tab-conflicts" class="tab-content hidden">
-        <div class="empty-state">
-          <div class="icon">✅</div>
-          <p>No conflicts</p>
-        </div>
-      </div>
+    <!-- Navigation -->
+    <nav class="app-nav" id="appNav" role="tablist">
+      <button class="nav-btn active" data-route="overview" role="tab" aria-selected="true">Dashboard</button>
+      <button class="nav-btn" data-route="files" role="tab" aria-selected="false">Files</button>
+      <button class="nav-btn" data-route="transfers" role="tab" aria-selected="false">Transfers</button>
+      <button class="nav-btn" data-route="conflicts" role="tab" aria-selected="false">Conflicts</button>
+      <button class="nav-btn" data-route="settings" role="tab" aria-selected="false">Settings</button>
+    </nav>
 
-      <div id="tab-settings" class="tab-content hidden">
-        <div class="card">
-          <h3>Account</h3>
-          <div class="row"><span>Endpoint</span><span id="endpoint">-</span></div>
-          <div class="row"><span>Bucket</span><span id="bucket">-</span></div>
+    <!-- Content area -->
+    <main class="app-content" id="appContent">
+      <!-- ===== DASHBOARD ===== -->
+      <section class="screen active" id="screen-overview" role="tabpanel">
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">Sync State</div>
+            <div class="stat-value" id="syncState">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Files</div>
+            <div class="stat-value" id="totalFiles">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Conflicts</div>
+            <div class="stat-value" id="conflictCount">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Transfers</div>
+            <div class="stat-value" id="transferCount">0</div>
+          </div>
         </div>
-        <div class="card">
-          <h3>App</h3>
-          <div class="row"><span>Version</span><span id="appVersion">-</span></div>
+        <div class="section-title">Recent Activity</div>
+        <div class="card" id="activityList">
+          <div class="empty-state">
+            <div class="empty-icon">📋</div>
+            <div class="empty-title">No Activity Yet</div>
+            <div class="empty-desc">Sync activity will appear here once you connect a bucket.</div>
+          </div>
         </div>
-      </div>
-    </div>
+      </section>
+
+      <!-- ===== FILES ===== -->
+      <section class="screen" id="screen-files" role="tabpanel">
+        <div class="toolbar">
+          <div class="view-toggle">
+            <button class="icon-btn active" data-view="list" title="List view">📋</button>
+            <button class="icon-btn" data-view="grid" title="Grid view">🔲</button>
+          </div>
+          <div class="search-box">
+            <span class="search-icon">🔍</span>
+            <input type="text" class="search-input" placeholder="Search files..." aria-label="Search files" />
+          </div>
+        </div>
+        <div class="card" id="fileList">
+          <div class="empty-state">
+            <div class="empty-icon">📁</div>
+            <div class="empty-title">No Files Synced</div>
+            <div class="empty-desc">Files will appear here once sync is running.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== TRANSFERS ===== -->
+      <section class="screen" id="screen-transfers" role="tabpanel">
+        <div class="section-title">Active Transfers</div>
+        <div class="card" id="activeTransfers">
+          <div class="empty-state">
+            <div class="empty-icon">⬆️</div>
+            <div class="empty-title">No Active Transfers</div>
+            <div class="empty-desc">Upload and download progress will show here.</div>
+          </div>
+        </div>
+        <div class="section-title">Completed</div>
+        <div class="card" id="completedTransfers">
+          <div class="empty-state">
+            <div class="empty-icon">✅</div>
+            <div class="empty-title">No Completed Transfers</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== CONFLICTS ===== -->
+      <section class="screen" id="screen-conflicts" role="tabpanel">
+        <div class="section-title">
+          Conflict Resolver
+          <span class="badge badge-conflict" id="conflictBadge">0</span>
+        </div>
+        <div class="card" id="conflictList">
+          <div class="empty-state">
+            <div class="empty-icon">✅</div>
+            <div class="empty-title">No Conflicts</div>
+            <div class="empty-desc">All files are in sync.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== SETTINGS ===== -->
+      <section class="screen" id="screen-settings" role="tabpanel">
+        <div class="settings-group">
+          <div class="settings-group-title">Account</div>
+          <div class="card settings-card">
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Endpoint</div>
+                <div class="setting-desc">S3-compatible storage URL</div>
+              </div>
+              <input type="text" class="setting-input" id="inputEndpoint" placeholder="http://127.0.0.1:9000" value="" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Bucket</div>
+                <div class="setting-desc">S3 bucket name</div>
+              </div>
+              <input type="text" class="setting-input" id="inputBucket" placeholder="s4drive-bucket" value="" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Access Key</div>
+                <div class="setting-desc">S3 access key ID</div>
+              </div>
+              <input type="text" class="setting-input" id="inputAccessKey" placeholder="minioadmin" value="" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Secret Key</div>
+                <div class="setting-desc">S3 secret access key</div>
+              </div>
+              <input type="password" class="setting-input" id="inputSecretKey" placeholder="••••••••" value="" />
+            </div>
+            <div class="setting-row">
+              <button class="btn btn-primary" id="btnTestConnection">Test Connection</button>
+              <button class="btn btn-outline" id="btnSaveAccount">Save</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <div class="settings-group-title">Sync</div>
+          <div class="card settings-card">
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Sync Folder</div>
+                <div class="setting-desc">Local folder to sync</div>
+              </div>
+              <input type="text" class="setting-input" id="inputSyncFolder" placeholder="~/S4Drive" value="" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Polling Interval</div>
+                <div class="setting-desc">Check for remote changes every N seconds</div>
+              </div>
+              <input type="number" class="setting-input setting-input-sm" id="inputPolling" value="30" min="5" max="300" />
+            </div>
+            <div class="setting-row">
+              <label class="setting-toggle">
+                <span>Auto-start on login</span>
+                <input type="checkbox" id="inputAutostart" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="setting-row">
+              <label class="setting-toggle">
+                <span>Dark Mode</span>
+                <input type="checkbox" id="inputDarkMode" checked />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <div class="settings-group-title">About</div>
+          <div class="card settings-card">
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Version</div>
+              </div>
+              <div class="setting-value" id="aboutVersion">0.1.0</div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Device ID</div>
+              </div>
+              <div class="setting-value setting-value-mono" id="aboutDeviceId">—</div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Sync Doctor</div>
+                <div class="setting-desc">Run diagnostics to check system health</div>
+              </div>
+              <button class="btn btn-outline" id="btnRunDiagnostics">Run Diagnostics</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Toast container -->
+    <div class="toast-container" id="toastContainer" aria-live="polite"></div>
   </div>
 
-  <script>
-    // IPC helper
-    const invoke = window.__TAURI_INTERNALS__.invoke;
-    const listen = window.__TAURI_INTERNALS__.listen;
-
-    // Tab navigation
-    document.querySelectorAll('[data-tab]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('[data-tab]').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
-        document.getElementById('tab-' + btn.dataset.tab).classList.remove('hidden');
-      });
-    });
-
-    // Listen for navigation events from tray
-    listen('navigate', (event) => {
-      const tab = event.payload;
-      const btn = document.querySelector(`[data-tab="${tab}"]`);
-      if (btn) btn.click();
-    });
-
-    listen('sync-triggered', () => {
-      refreshStatus();
-    });
-
-    // Refresh functions
-    async function refreshStatus() {
-      try {
-        const status = await invoke('get_sync_status');
-        document.getElementById('syncState').textContent = status.state;
-        document.getElementById('conflictCount').textContent = status.conflicts;
-        document.getElementById('lastSync').textContent = status.last_sync 
-          ? new Date(status.last_sync).toLocaleTimeString() : '-';
-
-        const dot = document.getElementById('statusDot');
-        dot.className = 'status-dot';
-        if (status.paused) dot.classList.add('paused');
-        if (status.state === 'error') dot.classList.add('error');
-      } catch(e) { console.error('Status error:', e); }
-    }
-
-    async function refreshActivity() {
-      try {
-        const items = await invoke('get_activity');
-        const list = document.getElementById('activityList');
-        if (!items || items.length === 0) {
-          list.innerHTML = '<div class="empty-state"><p>No activity</p></div>';
-          return;
-        }
-        list.innerHTML = items.map(item => `
-          <div class="activity-item">
-            <div class="activity-icon">📄</div>
-            <div class="activity-text">
-              <div>${item.path}</div>
-              <div style="font-size:11px;color:var(--text2)">${item.action}</div>
-            </div>
-            <div class="activity-time">${item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : ''}</div>
-          </div>
-        `).join('');
-      } catch(e) { console.error('Activity error:', e); }
-    }
-
-    async function refreshSettings() {
-      try {
-        const info = await invoke('get_app_info');
-        document.getElementById('endpoint').textContent = info.endpoint || 'Not configured';
-        document.getElementById('bucket').textContent = info.bucket || 'Not configured';
-        document.getElementById('appVersion').textContent = info.version;
-      } catch(e) { console.error('Settings error:', e); }
-    }
-
-    // Auto-refresh
-    refreshStatus();
-    refreshActivity();
-    refreshSettings();
-    setInterval(refreshStatus, 5000);
-  </script>
+  <script src="js/main.js"></script>
 </body>
 </html>

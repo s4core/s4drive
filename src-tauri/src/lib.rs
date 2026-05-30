@@ -79,6 +79,7 @@ pub fn run() {
             open_window,
             get_activity,
             get_conflicts,
+            resolve_conflict,
         ])
         .build(tauri::generate_context!())
         .expect("error building S4Drive Tauri application")
@@ -298,4 +299,11 @@ struct ConflictItem {
 fn get_conflicts() -> Result<Vec<ConflictItem>, String> {
     // Placeholder — will wire to core ConflictEngine
     Ok(vec![])
+}
+
+#[tauri::command]
+fn resolve_conflict(conflict_id: String, resolution: String) -> Result<(), String> {
+    tracing::info!("Conflict resolved: {} → {}", conflict_id, resolution);
+    // Placeholder — will wire to core ConflictEngine::resolve()
+    Ok(())
 }
