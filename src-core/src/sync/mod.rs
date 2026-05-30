@@ -9,11 +9,15 @@
 
 pub mod activity;
 pub mod conflict;
+pub mod conflict_engine;
 pub mod download;
+pub mod versions;
 
 pub use activity::ActivityLog;
 pub use conflict::ConflictHandler;
+pub use conflict_engine::{ConflictDetector, ConflictEngine, ConflictResolution, ConflictType};
 pub use download::DownloadEngine;
+pub use versions::{VersionApi, VersionHistory, VersionInfo};
 
 use crate::db::LocalDatabase;
 use crate::error::{CoreError, CoreResult};
@@ -46,6 +50,8 @@ pub struct SyncEngine {
     db: Option<LocalDatabase>,
     download: Option<DownloadEngine>,
     conflict: Option<ConflictHandler>,
+    conflict_engine: Option<ConflictEngine>,
+    versions: Option<VersionApi>,
     activity: Option<ActivityLog>,
 }
 
@@ -72,6 +78,8 @@ impl SyncEngine {
             db: None,
             download: None,
             conflict: None,
+            conflict_engine: None,
+            versions: None,
             activity: None,
         }
     }
@@ -98,10 +106,21 @@ impl SyncEngine {
             ActivityLog::new_in_memory()
         });
 
-        self.db = Some(db);
+        let device_id = uuid::Uuid::now_v7().to_string();
+        let device_name = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "device".to_string());
+
+        self.db = Some(db.clone());
         self.sync_folder = sync_folder.to_string();
         self.max_retries = max_retries;
         self.conflict = Some(ConflictHandler::new());
+        self.conflict_engine = Some(ConflictEngine::new(
+            Some(db.clone()),
+            &device_id,
+            &device_name,
+        ));
+        self.versions = Some(VersionApi::new(Some(db), &device_id, &device_name));
         self.activity = Some(activity);
         self.download = Some(DownloadEngine::new(s3, sync_folder.to_string()));
         self.configured = true;
@@ -304,8 +323,24 @@ impl Clone for SyncEngine {
             db: self.db.clone(),
             download: self.download.clone(),
             conflict: self.conflict.clone(),
+            conflict_engine: self.conflict_engine.clone(),
+            versions: self.versions.clone(),
             activity: self.activity.clone(),
         }
+    }
+}
+
+// ─── Phase 5 Accessors ─────────────────────────────────────────
+
+impl SyncEngine {
+    /// Get the ConflictEngine for conflict detection and resolution.
+    pub fn conflict_engine(&self) -> Option<&ConflictEngine> {
+        self.conflict_engine.as_ref()
+    }
+
+    /// Get the VersionApi for version history queries.
+    pub fn versions(&self) -> Option<&VersionApi> {
+        self.versions.as_ref()
     }
 }
 

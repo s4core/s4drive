@@ -91,6 +91,16 @@ impl LocalDatabase {
             .map_err(|e| CoreError::Database(e.to_string()))?;
         }
 
+        if version < 2 {
+            conn.execute_batch(include_str!("../migrations/v002_revisions.sql"))
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (2, datetime('now'))",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -603,4 +613,369 @@ impl LocalDatabase {
             .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(result == "ok")
     }
+
+    // ─── Revision History (Phase 5) ─────────────────────────────────
+
+    /// Insert a revision record.
+    pub fn insert_revision(&self, rev: &RevisionRecord) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO revisions (revision_id, file_id, parent_revision_id,
+             content_hash, size, mime, author_device_id, author_name, created_at,
+             merge_state, conflict_revision_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                rev.revision_id,
+                rev.file_id,
+                rev.parent_revision_id,
+                rev.content_hash,
+                rev.size as i64,
+                rev.mime,
+                rev.author_device_id,
+                rev.author_name,
+                rev.created_at,
+                rev.merge_state,
+                rev.conflict_revision_id,
+            ],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get all revisions for a file, newest first.
+    pub fn get_revisions(&self, file_id: &str) -> CoreResult<Vec<RevisionRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT revision_id, file_id, parent_revision_id, content_hash,
+                        size, mime, author_device_id, author_name, created_at,
+                        merge_state, conflict_revision_id
+                 FROM revisions WHERE file_id = ?1
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let results = stmt
+            .query_map(rusqlite::params![file_id], |row| {
+                Ok(RevisionRecord {
+                    revision_id: row.get::<_, String>(0)?,
+                    file_id: row.get::<_, String>(1)?,
+                    parent_revision_id: row.get::<_, Option<String>>(2)?,
+                    content_hash: row.get::<_, Option<String>>(3)?,
+                    size: row.get::<_, i64>(4)? as u64,
+                    mime: row.get::<_, Option<String>>(5)?,
+                    author_device_id: row.get::<_, String>(6)?,
+                    author_name: row.get::<_, String>(7)?,
+                    created_at: row.get::<_, String>(8)?,
+                    merge_state: row.get::<_, String>(9)?,
+                    conflict_revision_id: row.get::<_, Option<String>>(10)?,
+                })
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get a single revision by ID.
+    pub fn get_revision(&self, revision_id: &str) -> CoreResult<Option<RevisionRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT revision_id, file_id, parent_revision_id, content_hash,
+                        size, mime, author_device_id, author_name, created_at,
+                        merge_state, conflict_revision_id
+                 FROM revisions WHERE revision_id = ?1",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let result = stmt.query_row(rusqlite::params![revision_id], |row| {
+            Ok(RevisionRecord {
+                revision_id: row.get::<_, String>(0)?,
+                file_id: row.get::<_, String>(1)?,
+                parent_revision_id: row.get::<_, Option<String>>(2)?,
+                content_hash: row.get::<_, Option<String>>(3)?,
+                size: row.get::<_, i64>(4)? as u64,
+                mime: row.get::<_, Option<String>>(5)?,
+                author_device_id: row.get::<_, String>(6)?,
+                author_name: row.get::<_, String>(7)?,
+                created_at: row.get::<_, String>(8)?,
+                merge_state: row.get::<_, String>(9)?,
+                conflict_revision_id: row.get::<_, Option<String>>(10)?,
+            })
+        });
+
+        match result {
+            Ok(rev) => Ok(Some(rev)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoreError::Database(e.to_string())),
+        }
+    }
+
+    /// Get sibling revisions — revisions with the same parent (parallel edits).
+    pub fn get_sibling_revisions(
+        &self,
+        file_id: &str,
+        parent_revision_id: &str,
+    ) -> CoreResult<Vec<RevisionRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT revision_id, file_id, parent_revision_id, content_hash,
+                        size, mime, author_device_id, author_name, created_at,
+                        merge_state, conflict_revision_id
+                 FROM revisions
+                 WHERE file_id = ?1 AND parent_revision_id = ?2 AND revision_id != ?3
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let results = stmt
+            .query_map(
+                rusqlite::params![file_id, parent_revision_id, parent_revision_id],
+                |row| {
+                    Ok(RevisionRecord {
+                        revision_id: row.get::<_, String>(0)?,
+                        file_id: row.get::<_, String>(1)?,
+                        parent_revision_id: row.get::<_, Option<String>>(2)?,
+                        content_hash: row.get::<_, Option<String>>(3)?,
+                        size: row.get::<_, i64>(4)? as u64,
+                        mime: row.get::<_, Option<String>>(5)?,
+                        author_device_id: row.get::<_, String>(6)?,
+                        author_name: row.get::<_, String>(7)?,
+                        created_at: row.get::<_, String>(8)?,
+                        merge_state: row.get::<_, String>(9)?,
+                        conflict_revision_id: row.get::<_, Option<String>>(10)?,
+                    })
+                },
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Count revisions for a file.
+    pub fn count_revisions(&self, file_id: &str) -> CoreResult<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM revisions WHERE file_id = ?1",
+                rusqlite::params![file_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    // ─── Conflict Records (Phase 5) ─────────────────────────────────
+
+    /// Insert a conflict record.
+    pub fn insert_conflict_record(&self, rec: &ConflictRecord) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO conflict_records
+             (conflict_id, file_id, local_revision_id, remote_revision_id,
+              local_path, remote_path, sibling_path, conflict_type,
+              human_reason, file_size, mime, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12)",
+            rusqlite::params![
+                rec.conflict_id,
+                rec.file_id,
+                rec.local_revision_id,
+                rec.remote_revision_id,
+                rec.local_path,
+                rec.remote_path,
+                rec.sibling_path,
+                rec.conflict_type,
+                rec.human_reason,
+                rec.file_size as i64,
+                rec.mime,
+                rec.created_at,
+            ],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get all open (unresolved) conflict records.
+    pub fn get_open_conflicts(&self) -> CoreResult<Vec<ConflictRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, conflict_id, file_id, local_revision_id, remote_revision_id,
+                        local_path, remote_path, sibling_path, conflict_type,
+                        human_reason, file_size, mime, status, created_at, resolved_at
+                 FROM conflict_records WHERE status = 'open'
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let results = stmt
+            .query_map([], |row| {
+                Ok(ConflictRecord {
+                    id: row.get::<_, i64>(0)?,
+                    conflict_id: row.get::<_, String>(1)?,
+                    file_id: row.get::<_, String>(2)?,
+                    local_revision_id: row.get::<_, Option<String>>(3)?,
+                    remote_revision_id: row.get::<_, Option<String>>(4)?,
+                    local_path: row.get::<_, String>(5)?,
+                    remote_path: row.get::<_, String>(6)?,
+                    sibling_path: row.get::<_, String>(7)?,
+                    conflict_type: row.get::<_, String>(8)?,
+                    human_reason: row.get::<_, String>(9)?,
+                    file_size: row.get::<_, i64>(10)? as u64,
+                    mime: row.get::<_, Option<String>>(11)?,
+                    status: row.get::<_, String>(12)?,
+                    created_at: row.get::<_, String>(13)?,
+                    resolved_at: row.get::<_, Option<String>>(14)?,
+                })
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get all conflict records for a specific file.
+    pub fn get_conflicts_for_file(&self, file_id: &str) -> CoreResult<Vec<ConflictRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, conflict_id, file_id, local_revision_id, remote_revision_id,
+                        local_path, remote_path, sibling_path, conflict_type,
+                        human_reason, file_size, mime, status, created_at, resolved_at
+                 FROM conflict_records WHERE file_id = ?1 AND status = 'open'
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let results = stmt
+            .query_map(rusqlite::params![file_id], |row| {
+                Ok(ConflictRecord {
+                    id: row.get::<_, i64>(0)?,
+                    conflict_id: row.get::<_, String>(1)?,
+                    file_id: row.get::<_, String>(2)?,
+                    local_revision_id: row.get::<_, Option<String>>(3)?,
+                    remote_revision_id: row.get::<_, Option<String>>(4)?,
+                    local_path: row.get::<_, String>(5)?,
+                    remote_path: row.get::<_, String>(6)?,
+                    sibling_path: row.get::<_, String>(7)?,
+                    conflict_type: row.get::<_, String>(8)?,
+                    human_reason: row.get::<_, String>(9)?,
+                    file_size: row.get::<_, i64>(10)? as u64,
+                    mime: row.get::<_, Option<String>>(11)?,
+                    status: row.get::<_, String>(12)?,
+                    created_at: row.get::<_, String>(13)?,
+                    resolved_at: row.get::<_, Option<String>>(14)?,
+                })
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Resolve a conflict record.
+    pub fn resolve_conflict(
+        &self,
+        conflict_id: &str,
+        resolution: &str,
+        note: &str,
+    ) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE conflict_records SET status = ?1, resolved_at = datetime('now'), resolution_note = ?2
+             WHERE conflict_id = ?3 AND status = 'open'",
+            rusqlite::params![resolution, note, conflict_id],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Count open conflicts.
+    pub fn count_open_conflicts(&self) -> CoreResult<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conflict_records WHERE status = 'open'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(count as u32)
+    }
+}
+
+// ─── Structs for Phase 5 ─────────────────────────────────────────
+
+/// A file revision stored in SQLite.
+/// Mirrors `metadata::types::Revision` but flattened for DB storage.
+#[derive(Debug, Clone)]
+pub struct RevisionRecord {
+    pub revision_id: String,
+    pub file_id: String,
+    pub parent_revision_id: Option<String>,
+    pub content_hash: Option<String>,
+    pub size: u64,
+    pub mime: Option<String>,
+    pub author_device_id: String,
+    pub author_name: String,
+    pub created_at: String,
+    pub merge_state: String,
+    pub conflict_revision_id: Option<String>,
+}
+
+/// An enriched conflict record stored in SQLite conflict_records table.
+#[derive(Debug, Clone)]
+pub struct ConflictRecord {
+    pub id: i64,
+    pub conflict_id: String,
+    pub file_id: String,
+    pub local_revision_id: Option<String>,
+    pub remote_revision_id: Option<String>,
+    pub local_path: String,
+    pub remote_path: String,
+    pub sibling_path: String,
+    pub conflict_type: String,
+    pub human_reason: String,
+    pub file_size: u64,
+    pub mime: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
 }
