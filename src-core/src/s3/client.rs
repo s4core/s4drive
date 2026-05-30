@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::error::{CoreError, CoreResult};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
-use std::time::Duration;
 
 /// S3 adapter wrapping the aws-sdk-s3 client.
 pub struct S3Adapter {
@@ -41,6 +40,7 @@ impl S3Adapter {
             .region(aws_sdk_s3::config::Region::new(region.clone()))
             .credentials_provider(creds)
             .force_path_style(true)
+            .behavior_version_latest()
             .build();
 
         let client = S3Client::from_conf(s3_config);

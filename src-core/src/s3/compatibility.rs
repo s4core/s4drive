@@ -1,5 +1,4 @@
 use crate::s3::client::S3Adapter;
-use std::time::Duration;
 
 /// Result of a single compatibility test.
 #[derive(Debug, Clone)]
@@ -384,7 +383,7 @@ impl S3Adapter {
         let key = format!("{}multipart-abort", prefix);
 
         // Initiate multipart upload
-        let upload = match self.put_object(&key, b"test".to_vec()).await {
+        let _upload = match self.put_object(&key, b"test".to_vec()).await {
             Ok(_) => return TestResult::skip("Multipart abort", "backend does not expose upload IDs for abort test"),
             Err(e) => return TestResult::fail("Multipart abort (init)", &e.to_string()),
         };
