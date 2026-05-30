@@ -1,5 +1,6 @@
 /target/
 .codegraph/
+src-tauri/gen/
 *.swp
 *.swo
 .DS_Store
