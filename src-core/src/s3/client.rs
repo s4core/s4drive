@@ -385,7 +385,11 @@ pub(crate) fn classify_s3_error(e: impl std::fmt::Display, context: &str) -> Cor
 
     if msg_lower.contains("412") || msg_lower.contains("precondition") {
         CoreError::S3(format!("412 PreconditionFailed: {}", context))
-    } else if msg_lower.contains("404") || msg_lower.contains("not found") {
+    } else if msg_lower.contains("404")
+        || msg_lower.contains("not found")
+        || msg_lower.contains("nosuchkey")
+        || msg_lower.contains("notfound")
+    {
         CoreError::NotFound(format!("not found: {}", context))
     } else if msg_lower.contains("403")
         || msg_lower.contains("forbidden")
