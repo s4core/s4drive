@@ -365,6 +365,231 @@ impl LocalDatabase {
         Ok(deleted as u64)
     }
 
+    // ─── Extended File Operations (Phase 4) ────────────────────────
+
+    /// Find a file by its full local path.
+    pub fn get_file_by_local_path(&self, local_path: &str) -> CoreResult<Option<FileEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_id, local_path, s3_key, size, state, is_folder, parent_file_id 
+                 FROM objects WHERE local_path = ?1",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let result = stmt.query_row(rusqlite::params![local_path], |row| {
+            Ok(FileEntry {
+                file_id: uuid::Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                parent_id: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|s| uuid::Uuid::parse_str(&s).ok()),
+                name: String::new(),
+                normalized_name: String::new(),
+                entry_type: crate::metadata::types::EntryType::File,
+                current_revision_id: None,
+                content_ref: None,
+                size: row.get::<_, i64>(3)? as u64,
+                content_hash: None,
+                mime: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+                deleted_at: None,
+                version_history: Vec::new(),
+                attributes: crate::metadata::types::FileAttributes::default(),
+                lock_state: crate::metadata::types::LockState::default(),
+            })
+        });
+
+        match result {
+            Ok(entry) => Ok(Some(entry)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoreError::Database(e.to_string())),
+        }
+    }
+
+    /// Register a new local file in the objects table.
+    pub fn register_local_file(&self, entry: &FileEntry) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO objects 
+            (file_id, local_path, s3_key, size, state, is_folder, parent_file_id, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                entry.file_id.to_string(),
+                "", // local_path — populated later via update_local_path
+                "", // s3_key
+                entry.size as i64,
+                if entry.deleted_at.is_some() { "deleted_locally" } else { "pending_upload" },
+                matches!(entry.entry_type, crate::metadata::types::EntryType::Folder),
+                entry.parent_id.map(|id| id.to_string()),
+                entry.created_at,
+                entry.updated_at,
+            ],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get file size by file_id.
+    pub fn get_file_size(&self, file_id: &uuid::Uuid) -> CoreResult<Option<u64>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let size: Option<i64> = conn
+            .query_row(
+                "SELECT size FROM objects WHERE file_id = ?1",
+                rusqlite::params![file_id.to_string()],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(size.map(|s| s as u64))
+    }
+
+    /// Update file size.
+    pub fn update_file_size(&self, file_id: &uuid::Uuid, size: u64) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE objects SET size = ?1, updated_at = datetime('now') WHERE file_id = ?2",
+            rusqlite::params![size as i64, file_id.to_string()],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Mark a file as deleted locally.
+    pub fn mark_file_deleted(&self, file_id: &uuid::Uuid) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE objects SET state = 'deleted_locally', updated_at = datetime('now') WHERE file_id = ?1",
+            rusqlite::params![file_id.to_string()],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Remove a file entry from the local index.
+    pub fn remove_file(&self, file_id: &uuid::Uuid) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM objects WHERE file_id = ?1",
+            rusqlite::params![file_id.to_string()],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Update local path and S3 key (e.g., after rename).
+    pub fn update_local_path(
+        &self,
+        file_id: &uuid::Uuid,
+        local_path: &str,
+        s3_key: &str,
+    ) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE objects SET local_path = ?1, s3_key = ?2, updated_at = datetime('now') WHERE file_id = ?3",
+            rusqlite::params![local_path, s3_key, file_id.to_string()],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    // ─── Activity Log Table ─────────────────────────────────────────
+
+    /// Ensure activity_log table exists (lazy migration).
+    pub fn ensure_activity_table(&self) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp DESC);",
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Insert an activity log entry.
+    pub fn insert_activity(&self, entry: &crate::sync::activity::ActivityEntry) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO activity_log (action, file_id, path, status, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                entry.action,
+                entry.file_id,
+                entry.path,
+                entry.status,
+                entry.timestamp
+            ],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get recent activity log entries.
+    pub fn get_recent_activity(
+        &self,
+        limit: usize,
+    ) -> CoreResult<Vec<crate::sync::activity::ActivityEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT action, file_id, path, status, timestamp 
+                 FROM activity_log ORDER BY timestamp DESC LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let results = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok(crate::sync::activity::ActivityEntry {
+                    action: row.get::<_, String>(0)?,
+                    file_id: row.get::<_, String>(1)?,
+                    path: row.get::<_, String>(2)?,
+                    status: row.get::<_, String>(3)?,
+                    timestamp: row.get::<_, String>(4)?,
+                })
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
     // ─── Integrity ──────────────────────────────────────────────────
 
     /// Check database integrity

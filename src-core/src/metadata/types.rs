@@ -82,7 +82,7 @@ pub struct FileEntry {
     pub lock_state: LockState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EntryType {
     File,
     Folder,

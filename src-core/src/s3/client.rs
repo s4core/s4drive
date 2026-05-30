@@ -4,6 +4,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
 
 /// S3 adapter wrapping the aws-sdk-s3 client.
+#[derive(Clone)]
 pub struct S3Adapter {
     client: S3Client,
     bucket: String,

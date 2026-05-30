@@ -75,6 +75,11 @@ enum Commands {
         #[command(subcommand)]
         action: MetadataAction,
     },
+    /// Синхронизация локальной папки с бакетом
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -157,6 +162,40 @@ enum MetadataAction {
     },
 }
 
+#[derive(Subcommand)]
+enum SyncAction {
+    Start {
+        #[arg(short, long)]
+        endpoint: String,
+        #[arg(short, long)]
+        bucket: String,
+        #[arg(short, long)]
+        access_key: String,
+        #[arg(short = 's', long = "secret")]
+        secret_key: String,
+        #[arg(short, long, default_value = "us-east-1")]
+        region: String,
+        #[arg(short, long)]
+        local_path: String,
+        #[arg(short, long, default_value = "s4drive-cli")]
+        device_name: String,
+    },
+    Status {
+        #[arg(short, long)]
+        endpoint: String,
+        #[arg(short, long)]
+        bucket: String,
+        #[arg(short, long)]
+        access_key: String,
+        #[arg(short = 's', long = "secret")]
+        secret_key: String,
+        #[arg(short, long, default_value = "us-east-1")]
+        region: String,
+        #[arg(short, long)]
+        local_path: String,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -224,6 +263,46 @@ async fn main() {
             } => {
                 run_metadata_ops(&endpoint, &bucket, &access_key, &secret_key, &region, limit)
                     .await;
+            }
+        },
+        Commands::Sync { action } => match action {
+            SyncAction::Start {
+                endpoint,
+                bucket,
+                access_key,
+                secret_key,
+                region,
+                local_path,
+                device_name,
+            } => {
+                run_sync_start(
+                    &endpoint,
+                    &bucket,
+                    &access_key,
+                    &secret_key,
+                    &region,
+                    &local_path,
+                    &device_name,
+                )
+                .await;
+            }
+            SyncAction::Status {
+                endpoint,
+                bucket,
+                access_key,
+                secret_key,
+                region,
+                local_path,
+            } => {
+                run_sync_status(
+                    &endpoint,
+                    &bucket,
+                    &access_key,
+                    &secret_key,
+                    &region,
+                    &local_path,
+                )
+                .await;
             }
         },
     }
@@ -605,4 +684,139 @@ fn level_badge(level: u32) -> &'static str {
         4 => "FULL ENHANCED ✓",
         _ => "UNKNOWN",
     }
+}
+
+// ─── Sync Commands ────────────────────────────────────────────────────
+
+async fn run_sync_start(
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    local_path: &str,
+    device_name: &str,
+) {
+    println!();
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║   S4Drive — Sync Start                      ║");
+    println!("╚══════════════════════════════════════════════╝");
+    println!();
+    println!("  Endpoint:    {}", endpoint);
+    println!("  Bucket:      {}", bucket);
+    println!("  Local path:  {}", local_path);
+    println!("  Device:      {}", device_name);
+    println!();
+
+    let mut config = build_config(endpoint, bucket, access_key, secret_key, region);
+    config.sync_folder.local_path = local_path.to_string();
+    config.sync_folder.polling_interval_sec = 10;
+
+    let mut core = s4drive_core::core::S4DriveCore::new(config);
+
+    // Init core
+    if let Err(e) = core.init().await {
+        println!("  ✗ Init failed: {}", e);
+        return;
+    }
+    println!("  ✓ Core initialized");
+
+    // Init bucket if needed
+    match core.check_initialized().await {
+        Ok(true) => println!("  ✓ Bucket already has .s4drive/ metadata"),
+        Ok(false) => {
+            println!("  Initializing bucket...");
+            if let Err(e) = core.init_bucket(device_name).await {
+                println!("  ✗ Bucket init failed: {}", e);
+                return;
+            }
+            println!("  ✓ Bucket initialized");
+        }
+        Err(e) => {
+            println!("  ✗ Check failed: {}", e);
+            return;
+        }
+    }
+
+    // Start sync
+    if let Err(e) = core.start().await {
+        println!("  ✗ Sync start failed: {}", e);
+        return;
+    }
+    println!("  ✓ Sync engine started");
+    println!("  ✓ Monitoring: {}", local_path);
+    println!();
+    println!("  Press Ctrl+C to stop");
+    println!();
+
+    // Keep running until Ctrl+C
+    tokio::signal::ctrl_c().await.ok();
+    println!("  Shutting down...");
+    let _ = core.stop().await;
+    println!("  ✓ Sync stopped");
+    println!();
+}
+
+async fn run_sync_status(
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    local_path: &str,
+) {
+    println!();
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║   S4Drive — Sync Status                     ║");
+    println!("╚══════════════════════════════════════════════╝");
+    println!();
+
+    let mut config = build_config(endpoint, bucket, access_key, secret_key, region);
+    config.sync_folder.local_path = local_path.to_string();
+
+    let mut core = s4drive_core::core::S4DriveCore::new(config);
+
+    if let Err(e) = core.init().await {
+        println!("  ✗ Init failed: {}", e);
+        return;
+    }
+
+    let initialized = core.check_initialized().await.unwrap_or(false);
+    println!(
+        "  Bucket initialized:  {}",
+        if initialized { "✓" } else { "✗" }
+    );
+
+    if core.health_check() {
+        println!("  Core health:         ✓");
+    } else {
+        println!("  Core health:         ⚠");
+    }
+
+    if let Some(sync) = &core.sync {
+        println!("  Sync state:          {:?}", sync.current_state());
+        println!(
+            "  Sync running:        {}",
+            if sync.is_running() { "✓" } else { "✗" }
+        );
+        println!(
+            "  Sync paused:         {}",
+            if sync.is_paused() { "yes" } else { "no" }
+        );
+    }
+
+    if let Some(db) = &core.db {
+        println!(
+            "  Database healthy:    {}",
+            if db.is_healthy() { "✓" } else { "✗" }
+        );
+    }
+
+    if let Some(transfer) = &core.transfer {
+        if let Ok((up, down)) = transfer.pending_count() {
+            println!("  Pending:             {} uploads, {} downloads", up, down);
+        }
+    }
+
+    println!();
 }

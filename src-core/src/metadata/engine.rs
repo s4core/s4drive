@@ -11,6 +11,7 @@ use crate::s3::S3Adapter;
 /// - `FileTree` — CRUD файлов/папок
 /// - `TombstoneManager` — GC удалённых записей
 /// - `SnapshotManager` — периодические снепшоты
+#[derive(Clone)]
 pub struct MetadataEngine {
     s3: S3Adapter,
     #[allow(dead_code)]

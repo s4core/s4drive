@@ -45,6 +45,7 @@ pub enum TransferStatus {
 
 /// Persistent transfer queue for upload/download jobs.
 /// Backed by the SQLite database's `transfer_queue` table.
+#[derive(Clone)]
 pub struct TransferQueue {
     db: LocalDatabase,
 }
