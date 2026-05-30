@@ -104,7 +104,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: s4drive-linux
-          path: src-tauri/target/release/bundle/
+          path: target/release/bundle/
           retention-days: 14
           compression-level: 0
 
@@ -146,7 +146,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: s4drive-windows
-          path: src-tauri/target/release/bundle/
+          path: target/release/bundle/
           retention-days: 14
           compression-level: 0
 
@@ -171,6 +171,36 @@ jobs:
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^${{ env.TAURI_CLI_VERSION }}"
+
+      - name: Generate .icns icon (macOS)
+        run: |
+          mkdir -p src-tauri/icons/s4drive.iconset
+          cp src-tauri/icons/128x128.png src-tauri/icons/s4drive.iconset/icon_128x128.png
+          cp src-tauri/icons/128x128@2x.png src-tauri/icons/s4drive.iconset/icon_256x256.png
+          if command -v sips &>/dev/null; then
+            sips -z 16 16 src-tauri/icons/128x128.png \
+              --out src-tauri/icons/s4drive.iconset/icon_16x16.png
+            sips -z 32 32 src-tauri/icons/128x128.png \
+              --out src-tauri/icons/s4drive.iconset/icon_32x32.png
+            sips -z 48 48 src-tauri/icons/128x128.png \
+              --out src-tauri/icons/s4drive.iconset/icon_48x48.png
+            sips -z 64 64 src-tauri/icons/128x128.png \
+              --out src-tauri/icons/s4drive.iconset/icon_64x64.png
+            iconutil -c icns src-tauri/icons/s4drive.iconset \
+              -o src-tauri/icons/icon.icns
+            echo "icon.icns created"
+          else
+            echo "sips not available"
+          fi
+
+      - name: Add .icns to tauri.conf.json (if generated)
+        run: |
+          if [ -f src-tauri/icons/icon.icns ]; then
+            jq '.bundle.icon = ["icons/icon.icns"] + .bundle.icon' \
+              src-tauri/tauri.conf.json > /tmp/tauri.conf.tmp \
+              && mv /tmp/tauri.conf.tmp src-tauri/tauri.conf.json
+            echo "Added icon.icns to config"
+          fi
 
       - name: Build for x86_64
         run: |
@@ -232,8 +262,7 @@ jobs:
         with:
           name: s4drive-macos
           path: src-tauri/target/release/*.dmg
-          retention-days: 14
-          compression-level: 0
+          if-no-files-found: error
 
   # ─── CLI binary ──────────────────────────────────────────────
   build-cli:
@@ -319,6 +348,13 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^${{ env.TAURI_CLI_VERSION }}"
 
+      - name: Init Android project
+        run: |
+          cd src-tauri
+          cargo tauri android init --ci
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+
       - name: Build Android APK
         run: |
           cd src-tauri
@@ -353,6 +389,11 @@ jobs:
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^${{ env.TAURI_CLI_VERSION }}"
+
+      - name: Init iOS project
+        run: |
+          cd src-tauri
+          cargo tauri ios init --ci
 
       - name: Build iOS (debug — unsigned)
         run: |
