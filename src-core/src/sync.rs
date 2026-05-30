@@ -1,12 +1,14 @@
 use crate::error::CoreResult;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The sync engine orchestrates two-way synchronization.
 pub struct SyncEngine {
     running: Arc<AtomicBool>,
     polling_interval: u64,
+    /// Current sync state (shared with the tokio task).
+    current_state: Arc<Mutex<SyncState>>,
     /// Handle to the sync loop task.
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -22,12 +24,21 @@ impl SyncEngine {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             polling_interval: 30,
+            current_state: Arc::new(Mutex::new(SyncState::Idle)),
             task_handle: None,
         }
     }
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    /// Get the current sync state.
+    pub fn current_state(&self) -> SyncState {
+        self.current_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Start the sync loop.
@@ -40,24 +51,51 @@ impl SyncEngine {
         self.running.store(true, Ordering::Relaxed);
         let running = self.running.clone();
         let interval = self.polling_interval;
+        let state = self.current_state.clone();
 
         self.task_handle = Some(tokio::spawn(async move {
             tracing::info!("Sync loop started (interval: {}s)", interval);
             let mut cycle_count: u64 = 0;
 
+            // Mark idle on startup
+            {
+                if let Ok(mut s) = state.lock() {
+                    *s = SyncState::Idle;
+                }
+            }
+
             while running.load(Ordering::Relaxed) {
                 cycle_count += 1;
                 tracing::debug!("Sync cycle #{}", cycle_count);
 
-                // In Phase 2, this is a skeleton. Real sync logic
-                // will be implemented in Phase 4.
-                //
-                // Future sync cycle steps:
+                // Phase 2 skeleton — extended in Phase 4:
                 // 1. Detect local changes (from file watcher)
                 // 2. Scan remote for new/changed objects
                 // 3. Compute diff (what to upload/download)
                 // 4. Apply transfers
                 // 5. Update local index
+
+                {
+                    if let Ok(mut s) = state.lock() {
+                        *s = SyncState::ScanningLocal;
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                {
+                    if let Ok(mut s) = state.lock() {
+                        *s = SyncState::ScanningRemote;
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                {
+                    if let Ok(mut s) = state.lock() {
+                        *s = SyncState::Idle;
+                    }
+                }
 
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
@@ -84,17 +122,21 @@ impl SyncEngine {
             }
         }
 
+        if let Ok(mut s) = self.current_state.lock() {
+            *s = SyncState::Idle;
+        }
+
         tracing::info!("Sync engine stopped");
         Ok(())
     }
 
     /// Trigger an immediate sync cycle.
     pub async fn sync_now(&self) -> CoreResult<()> {
+        if let Ok(mut s) = self.current_state.lock() {
+            *s = SyncState::ScanningLocal;
+        }
         tracing::info!("Manual sync triggered");
-        // In Phase 4, this will:
-        // 1. Scan local changes
-        // 2. Scan remote changes
-        // 3. Compute and apply diffs
+        // In Phase 4, this will run a full sync cycle.
         Ok(())
     }
 
@@ -184,5 +226,11 @@ mod tests {
         let mut engine = SyncEngine::new();
         engine.set_polling_interval(10);
         assert!(!engine.is_running());
+    }
+
+    #[test]
+    fn test_current_state_starts_idle() {
+        let engine = SyncEngine::new();
+        assert_eq!(engine.current_state(), SyncState::Idle);
     }
 }

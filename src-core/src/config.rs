@@ -18,7 +18,8 @@ pub struct S3Config {
     pub bucket: String,
     pub access_key_id: String,
     /// Encrypted secret key (keychain-managed)
-    pub encrypted_secret_key: Option<String>,
+    /// Fallback secret key (plaintext, only used when keychain unavailable).
+    pub secret_key_fallback: Option<String>,
     pub use_tls: bool,
 }
 
@@ -47,7 +48,7 @@ impl Default for Config {
                 region: "us-east-1".into(),
                 bucket: String::new(),
                 access_key_id: String::new(),
-                encrypted_secret_key: None,
+                secret_key_fallback: None,
                 use_tls: true,
             },
             sync_folder: SyncFolderConfig {

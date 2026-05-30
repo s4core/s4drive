@@ -137,8 +137,8 @@ pub struct TempCredentials {
 /// Utility: resolve credentials from config, trying keychain first.
 ///
 /// Resolution order:
-/// 1. Keychain (if `encrypted_secret_key` is absent or empty)
-/// 2. Config's `encrypted_secret_key` field (plaintext fallback)
+/// 1. Keychain (if `secret_key_fallback` is absent or empty)
+/// 2. Config's `secret_key_fallback` field (plaintext fallback)
 pub fn resolve_secret(
     store: &CredentialStore,
     config_endpoint: &str,
@@ -184,12 +184,20 @@ mod tests {
     }
 
     /// Test resolve_secret with no keychain (should fail gracefully).
+    /// Test resolve_secret with no keychain (should fall back to config).
     #[test]
     fn test_resolve_secret_no_keychain() {
         let store = CredentialStore::new("test-unit");
-        // Without a keychain backend, this should fall through to config fallback
         let result = resolve_secret(&store, "endpoint", "key", Some("config-secret"));
         assert_eq!(result.unwrap(), "config-secret");
+    }
+
+    /// Test resolve_secret with empty config fallback.
+    #[test]
+    fn test_resolve_secret_empty_fallback() {
+        let store = CredentialStore::new("test-unit");
+        let result = resolve_secret(&store, "endpoint", "key", Some(""));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -197,5 +205,61 @@ mod tests {
         let store = CredentialStore::new("test-unit");
         let result = resolve_secret(&store, "endpoint", "key", None);
         assert!(result.is_err());
+    }
+
+    /// Test store → get round-trip (uses a unique service per test run).
+    /// NOTE: Requires a running OS keychain backend (fails in headless CI).
+    #[ignore = "requires OS keychain backend"]
+    #[test]
+    fn test_store_and_get_credential() {
+        let store = CredentialStore::new(&format!("s4drive-test-{}", std::process::id()));
+        let endpoint = "http://localhost:9000";
+        let ak = "test-access-key";
+        let sk = "test-secret-key";
+        let region = "us-east-1";
+        let bucket = "test-bucket";
+
+        // Store
+        store.store(endpoint, ak, sk, region, bucket).unwrap();
+
+        // Get
+        let cred = store.get(endpoint, ak).unwrap();
+        assert_eq!(cred.endpoint, endpoint);
+        assert_eq!(cred.access_key_id, ak);
+        assert_eq!(cred.secret_key, sk);
+        assert_eq!(cred.region, region);
+        assert_eq!(cred.bucket, bucket);
+
+        // Cleanup
+        store.delete(endpoint, ak).unwrap();
+
+        // Verify deleted
+        assert!(!store.exists(endpoint, ak));
+    }
+
+    /// Test exists() returns false for missing credentials.
+    #[test]
+    fn test_exists_missing() {
+        let store = CredentialStore::new("test-exists");
+        assert!(!store.exists("http://missing", "no-key"));
+    }
+
+    /// Test overwrite (store twice with same key).
+    /// NOTE: Requires a running OS keychain backend (fails in headless CI).
+    #[ignore = "requires OS keychain backend"]
+    #[test]
+    fn test_overwrite_credential() {
+        let store = CredentialStore::new(&format!("s4drive-overwrite-{}", std::process::id()));
+        let ep = "http://example.com";
+        let ak = "user1";
+
+        store.store(ep, ak, "v1", "us-east-1", "b1").unwrap();
+        store.store(ep, ak, "v2", "eu-west-1", "b2").unwrap();
+
+        let cred = store.get(ep, ak).unwrap();
+        assert_eq!(cred.secret_key, "v2");
+        assert_eq!(cred.region, "eu-west-1");
+
+        store.delete(ep, ak).unwrap();
     }
 }

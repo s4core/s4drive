@@ -29,7 +29,7 @@ impl S3Adapter {
         let bucket = config.s3.bucket.clone();
         let region = &config.s3.region;
         let access_key = &config.s3.access_key_id;
-        let secret = config.s3.encrypted_secret_key.as_deref().unwrap_or("");
+        let secret = config.s3.secret_key_fallback.as_deref().unwrap_or("");
 
         let creds = aws_sdk_s3::config::Credentials::new(access_key, secret, None, None, "s4drive");
 
@@ -271,15 +271,19 @@ impl S3Adapter {
     }
 
     /// Check if a bucket exists and is accessible.
-    pub async fn check_bucket_access(&self) -> CoreResult<bool> {
-        match self.client.head_bucket().bucket(&self.bucket).send().await {
-            Ok(_) => Ok(true),
-            Err(err) => {
+    /// Returns Ok(()) if accessible, Err with details if not.
+    pub async fn check_bucket_access(&self) -> CoreResult<()> {
+        self.client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|err| {
                 let service_err = err.into_service_error();
                 let code = service_err.meta().code().unwrap_or("unknown");
-                Err(CoreError::S3(format!("bucket access denied: {}", code)))
-            }
-        }
+                CoreError::S3(format!("bucket access denied: {}", code))
+            })
     }
 
     // ─── Multipart Upload ───────────────────────────────────────────

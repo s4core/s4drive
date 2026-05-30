@@ -144,12 +144,12 @@ impl S4DriveCore {
             &self.cred_store,
             &self.config.s3.endpoint,
             &self.config.s3.access_key_id,
-            self.config.s3.encrypted_secret_key.as_deref(),
+            self.config.s3.secret_key_fallback.as_deref(),
         )?;
 
         // 3. Inject resolved secret into config for S3Adapter
         let mut s3_config = self.config.clone();
-        s3_config.s3.encrypted_secret_key = Some(secret_key);
+        s3_config.s3.secret_key_fallback = Some(secret_key);
 
         let s3 = S3Adapter::new(&s3_config).await?;
         self.diagnostics.log(&format!(
@@ -159,15 +159,43 @@ impl S4DriveCore {
 
         // 4. Verify bucket access
         self.diagnostics.log("Verifying bucket access...");
-        let accessible = s3.check_bucket_access().await?;
-        if !accessible {
-            return Err(CoreError::Auth(
-                "bucket not accessible — check credentials and bucket name".into(),
-            ));
+        if let Err(e) = s3.check_bucket_access().await {
+            return Err(CoreError::Auth(format!("bucket not accessible: {}", e)));
         }
         self.diagnostics.log("Bucket access OK");
 
-        // 5. Create subsystems
+        // 5. Check if bucket already initialized (restart recovery)
+        self.diagnostics
+            .log("Checking bucket initialization state...");
+        match s3
+            .head_object(&crate::metadata::serializer::Serializer::descriptor_key())
+            .await
+        {
+            Ok(_) => {
+                self.diagnostics
+                    .log("Bucket already initialized — restoring state");
+                // Read descriptor for state recovery
+                let desc_key = crate::metadata::serializer::Serializer::descriptor_key();
+                if let Ok(data) = s3.get_object(&desc_key).await {
+                    if let Ok(text) = String::from_utf8(data) {
+                        if let Ok(desc) =
+                            crate::metadata::serializer::Serializer::deserialize_descriptor(&text)
+                        {
+                            self.diagnostics.log(&format!(
+                                "Restored bucket: schema v{}, created at {}",
+                                desc.schema_version, desc.created_at
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                self.diagnostics
+                    .log("Fresh bucket — will need init_bucket()");
+            }
+        }
+
+        // 6. Create subsystems
         let watcher = FileWatcher::new(&self.config)?;
         let transfer = TransferQueue::new(&db);
         let sync = SyncEngine::new();

@@ -7,12 +7,14 @@ use std::sync::{Arc, Mutex};
 
 /// Cross-platform file system watcher.
 /// Wraps the `notify` crate and debounces events.
+///
+/// Two modes:
+/// - `FileWatcher::start()` — simple fire-and-forget (events logged, no stream).
+/// - `FileWatcher::with_channel()` — returns an `FsEventStream` for the sync engine.
 pub struct FileWatcher {
     running: bool,
     watch_path: String,
     watcher: Option<RecommendedWatcher>,
-    #[allow(dead_code)]
-    event_rx: Option<Arc<Mutex<mpsc::Receiver<FsEvent>>>>,
 }
 
 /// A detected file system event, debounced and deduplicated.
@@ -53,10 +55,8 @@ impl FsEventStream {
     /// Drain all available events without blocking.
     pub fn drain(&mut self) -> Vec<FsEvent> {
         let mut events = Vec::new();
-        // Take pending from previous drain
         events.append(&mut self.pending);
 
-        // Try to receive from channel without blocking
         if let Ok(rx) = self.rx.lock() {
             while let Ok(event) = rx.try_recv() {
                 events.push(event);
@@ -68,17 +68,20 @@ impl FsEventStream {
 }
 
 impl FileWatcher {
+    /// Create a new (stopped) file watcher.
+    /// Use `start()` or `with_channel()` to begin watching.
     pub fn new(config: &Config) -> CoreResult<Self> {
         Ok(Self {
             running: false,
             watch_path: config.sync_folder.local_path.clone(),
             watcher: None,
-            event_rx: None,
         })
     }
 
     /// Create a channel-based watcher interface.
     /// This is the preferred way to integrate with the sync engine.
+    /// Returns a (FileWatcher, FsEventStream) pair. The FsEventStream
+    /// should be passed to the SyncEngine in Phase 4 for event-driven sync.
     pub fn with_channel(config: &Config) -> CoreResult<(Self, FsEventStream)> {
         let path = shellexpand::tilde(&config.sync_folder.local_path).to_string();
         let watch_path = Path::new(&path);
@@ -92,7 +95,6 @@ impl FileWatcher {
                 .map_err(|e| CoreError::FileSystem(e.to_string()))?;
         }
 
-        // Create channel for notify events
         let (tx, rx) = mpsc::channel::<FsEvent>();
 
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
@@ -120,7 +122,6 @@ impl FileWatcher {
                 running: true,
                 watch_path: path,
                 watcher: Some(watcher),
-                event_rx: Some(rx.clone()),
             },
             FsEventStream {
                 rx,
@@ -129,7 +130,9 @@ impl FileWatcher {
         ))
     }
 
-    /// Start watching the sync folder (stub for compatibility with old API).
+    /// Start watching the sync folder (simple API, no event stream).
+    /// Events are logged to `tracing::debug!` but not stored.
+    /// For event-driven sync, use `with_channel()` instead.
     pub fn start(&mut self) -> CoreResult<()> {
         if self.running {
             return Ok(());
@@ -145,10 +148,8 @@ impl FileWatcher {
 
         let mut watcher = notify::recommended_watcher(|res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
-                let _fs_event = convert_notify_event(&event);
-                // Events are discarded when using the simple start() API
-                // Use with_channel() for event streaming
-                if let Some(e) = _fs_event {
+                let fs_event = convert_notify_event(&event);
+                if let Some(e) = fs_event {
                     tracing::debug!("FS event: {} -> {}", e.event_type(), e.path());
                 }
             }
@@ -201,11 +202,9 @@ impl Drop for FileWatcher {
 
 /// Convert a notify event to S4Drive FsEvent.
 fn convert_notify_event(event: &Event) -> Option<FsEvent> {
-    // Get the first path (most notify events have one)
     let path = event.paths.first()?;
     let path_str = path.to_string_lossy().to_string();
 
-    // Skip common temporary/metadata files
     if should_ignore(&path_str) {
         return None;
     }
@@ -224,11 +223,9 @@ fn convert_notify_event(event: &Event) -> Option<FsEvent> {
 /// Skip common system/temporary files.
 fn should_ignore(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or("");
-    // Hidden files (except .s4drive metadata)
     if name.starts_with('.') && !name.starts_with(".s4drive") {
         return true;
     }
-    // Temporary files
     if name.ends_with('~')
         || name.ends_with(".tmp")
         || name.ends_with(".swp")
@@ -236,7 +233,6 @@ fn should_ignore(path: &str) -> bool {
     {
         return true;
     }
-    // System files
     if name == "Thumbs.db" || name == ".DS_Store" || name == "desktop.ini" {
         return true;
     }

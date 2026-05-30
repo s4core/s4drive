@@ -77,7 +77,7 @@ async fn run_check(endpoint: &str, bucket: &str, access_key: &str, secret_key: &
     config.s3.bucket = bucket.to_string();
     config.s3.region = region.to_string();
     config.s3.access_key_id = access_key.to_string();
-    config.s3.encrypted_secret_key = Some(secret_key.to_string());
+    config.s3.secret_key_fallback = Some(secret_key.to_string());
 
     println!("  Connecting...");
     let adapter = match S3Adapter::new(&config).await {
@@ -94,11 +94,7 @@ async fn run_check(endpoint: &str, bucket: &str, access_key: &str, secret_key: &
     // Check bucket access
     println!("  Checking bucket access...");
     match adapter.check_bucket_access().await {
-        Ok(true) => println!("  ✓ Bucket '{}' is accessible", bucket),
-        Ok(false) => println!(
-            "  ✗ Bucket '{}' exists but returned unexpected status",
-            bucket
-        ),
+        Ok(()) => println!("  ✓ Bucket '{}' is accessible", bucket),
         Err(e) => {
             println!("  ✗ {}", e);
             return;

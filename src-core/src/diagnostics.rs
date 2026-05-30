@@ -53,13 +53,22 @@ impl Diagnostics {
 
     /// Export diagnostics as JSON bundle.
     pub fn export_bundle(&self) -> String {
+        let events: Vec<serde_json::Value> = self
+            .events
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "message": e.message,
+                    "timestamp": e.timestamp,
+                    "level": e.level,
+                })
+            })
+            .collect();
+
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "events": self.events.iter().last().map(|e| serde_json::json!({
-                "message": e.message,
-                "timestamp": e.timestamp,
-                "level": e.level,
-            })),
+            "events": events,
+            "event_count": events.len(),
         })
         .to_string()
     }
