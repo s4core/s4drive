@@ -761,8 +761,8 @@ impl LocalDatabase {
             .conn
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
-        conn.execute(
-            "INSERT OR IGNORE INTO revisions (revision_id, file_id, parent_revision_id,
+        match conn.execute(
+            "INSERT INTO revisions (revision_id, file_id, parent_revision_id,
              content_hash, size, mime, author_device_id, author_name, created_at,
              merge_state, conflict_revision_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -779,8 +779,45 @@ impl LocalDatabase {
                 rev.merge_state,
                 rev.conflict_revision_id,
             ],
-        )
-        .map_err(|e| CoreError::Database(e.to_string()))?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                let existing = conn.query_row(
+                    "SELECT revision_id, file_id, parent_revision_id, content_hash,
+                            size, mime, author_device_id, author_name, created_at,
+                            merge_state, conflict_revision_id
+                     FROM revisions WHERE revision_id = ?1",
+                    rusqlite::params![rev.revision_id],
+                    |row| {
+                        Ok(RevisionRecord {
+                            revision_id: row.get::<_, String>(0)?,
+                            file_id: row.get::<_, String>(1)?,
+                            parent_revision_id: row.get::<_, Option<String>>(2)?,
+                            content_hash: row.get::<_, Option<String>>(3)?,
+                            size: row.get::<_, i64>(4)? as u64,
+                            mime: row.get::<_, Option<String>>(5)?,
+                            author_device_id: row.get::<_, String>(6)?,
+                            author_name: row.get::<_, String>(7)?,
+                            created_at: row.get::<_, String>(8)?,
+                            merge_state: row.get::<_, String>(9)?,
+                            conflict_revision_id: row.get::<_, Option<String>>(10)?,
+                        })
+                    },
+                );
+                if let Ok(existing) = existing {
+                    if existing.same_revision_content(rev) {
+                        return Ok(());
+                    }
+                }
+                return Err(CoreError::Conflict(format!(
+                    "revision id already exists with different content: {}",
+                    rev.revision_id
+                )));
+            }
+            Err(e) => return Err(CoreError::Database(e.to_string())),
+        }
         Ok(())
     }
 
@@ -796,7 +833,7 @@ impl LocalDatabase {
                         size, mime, author_device_id, author_name, created_at,
                         merge_state, conflict_revision_id
                  FROM revisions WHERE file_id = ?1
-                 ORDER BY created_at DESC",
+                 ORDER BY created_at DESC, revision_id DESC",
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
 
@@ -880,30 +917,27 @@ impl LocalDatabase {
                         size, mime, author_device_id, author_name, created_at,
                         merge_state, conflict_revision_id
                  FROM revisions
-                 WHERE file_id = ?1 AND parent_revision_id = ?2 AND revision_id != ?3
-                 ORDER BY created_at DESC",
+                 WHERE file_id = ?1 AND parent_revision_id = ?2
+                 ORDER BY created_at DESC, revision_id DESC",
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
 
         let rows = stmt
-            .query_map(
-                rusqlite::params![file_id, parent_revision_id, parent_revision_id],
-                |row| {
-                    Ok(RevisionRecord {
-                        revision_id: row.get::<_, String>(0)?,
-                        file_id: row.get::<_, String>(1)?,
-                        parent_revision_id: row.get::<_, Option<String>>(2)?,
-                        content_hash: row.get::<_, Option<String>>(3)?,
-                        size: row.get::<_, i64>(4)? as u64,
-                        mime: row.get::<_, Option<String>>(5)?,
-                        author_device_id: row.get::<_, String>(6)?,
-                        author_name: row.get::<_, String>(7)?,
-                        created_at: row.get::<_, String>(8)?,
-                        merge_state: row.get::<_, String>(9)?,
-                        conflict_revision_id: row.get::<_, Option<String>>(10)?,
-                    })
-                },
-            )
+            .query_map(rusqlite::params![file_id, parent_revision_id], |row| {
+                Ok(RevisionRecord {
+                    revision_id: row.get::<_, String>(0)?,
+                    file_id: row.get::<_, String>(1)?,
+                    parent_revision_id: row.get::<_, Option<String>>(2)?,
+                    content_hash: row.get::<_, Option<String>>(3)?,
+                    size: row.get::<_, i64>(4)? as u64,
+                    mime: row.get::<_, Option<String>>(5)?,
+                    author_device_id: row.get::<_, String>(6)?,
+                    author_name: row.get::<_, String>(7)?,
+                    created_at: row.get::<_, String>(8)?,
+                    merge_state: row.get::<_, String>(9)?,
+                    conflict_revision_id: row.get::<_, Option<String>>(10)?,
+                })
+            })
             .map_err(|e| CoreError::Database(e.to_string()))?;
 
         let mut results = Vec::new();
@@ -930,6 +964,39 @@ impl LocalDatabase {
         Ok(count as u32)
     }
 
+    /// Set the current revision and synced content metadata for a file.
+    pub fn set_current_revision_content(
+        &self,
+        file_id: &uuid::Uuid,
+        revision_id: &str,
+        size: u64,
+        local_hash: &str,
+    ) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let updated = conn
+            .execute(
+                "UPDATE objects
+                 SET current_revision_id = ?2,
+                     size = ?3,
+                     local_hash = ?4,
+                     state = 'synced',
+                     updated_at = datetime('now')
+                 WHERE file_id = ?1",
+                rusqlite::params![file_id.to_string(), revision_id, size as i64, local_hash],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        if updated == 0 {
+            return Err(CoreError::NotFound(format!(
+                "object not found for file_id {}",
+                file_id
+            )));
+        }
+        Ok(())
+    }
+
     // ─── Conflict Records (Phase 5) ─────────────────────────────────
 
     /// Insert a conflict record.
@@ -939,7 +1006,7 @@ impl LocalDatabase {
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         conn.execute(
-            "INSERT OR IGNORE INTO conflict_records
+            "INSERT INTO conflict_records
              (conflict_id, file_id, local_revision_id, remote_revision_id,
               local_path, remote_path, sibling_path, conflict_type,
               human_reason, file_size, mime, status, created_at)
@@ -1066,12 +1133,19 @@ impl LocalDatabase {
             .conn
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
-        conn.execute(
+        let updated = conn
+            .execute(
             "UPDATE conflict_records SET status = ?1, resolved_at = datetime('now'), resolution_note = ?2
              WHERE conflict_id = ?3 AND status = 'open'",
-            rusqlite::params![resolution, note, conflict_id],
-        )
-        .map_err(|e| CoreError::Database(e.to_string()))?;
+                rusqlite::params![resolution, note, conflict_id],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        if updated == 0 {
+            return Err(CoreError::NotFound(format!(
+                "open conflict not found: {}",
+                conflict_id
+            )));
+        }
         Ok(())
     }
 
@@ -1170,6 +1244,18 @@ pub struct RevisionRecord {
     pub conflict_revision_id: Option<String>,
 }
 
+impl RevisionRecord {
+    fn same_revision_content(&self, other: &RevisionRecord) -> bool {
+        self.file_id == other.file_id
+            && self.parent_revision_id == other.parent_revision_id
+            && self.content_hash == other.content_hash
+            && self.size == other.size
+            && self.mime == other.mime
+            && self.merge_state == other.merge_state
+            && self.conflict_revision_id == other.conflict_revision_id
+    }
+}
+
 /// An enriched conflict record stored in SQLite conflict_records table.
 #[derive(Debug, Clone)]
 pub struct ConflictRecord {
@@ -1249,5 +1335,70 @@ mod tests {
         let loaded = db.get_file(&entry.file_id).unwrap().unwrap();
         assert_eq!(loaded.name, "loose.txt");
         assert_eq!(loaded.size, 7);
+    }
+
+    #[test]
+    fn insert_revision_is_idempotent_for_same_content() {
+        let db = test_db();
+        let entry = file_entry("versioned.txt", 10);
+        db.register_local_file(&entry).unwrap();
+
+        let revision = RevisionRecord {
+            revision_id: entry.current_revision_id.unwrap().to_string(),
+            file_id: entry.file_id.to_string(),
+            parent_revision_id: None,
+            content_hash: Some("blake3:abc".to_string()),
+            size: 10,
+            mime: Some("text/plain".to_string()),
+            author_device_id: "device-1".to_string(),
+            author_name: "Device".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            merge_state: "clean".to_string(),
+            conflict_revision_id: None,
+        };
+
+        db.insert_revision(&revision).unwrap();
+        let mut duplicate = revision.clone();
+        duplicate.created_at = chrono::Utc::now().to_rfc3339();
+        db.insert_revision(&duplicate).unwrap();
+        assert_eq!(db.count_revisions(&entry.file_id.to_string()).unwrap(), 1);
+    }
+
+    #[test]
+    fn insert_revision_rejects_duplicate_id_with_different_content() {
+        let db = test_db();
+        let entry = file_entry("versioned.txt", 10);
+        db.register_local_file(&entry).unwrap();
+
+        let revision = RevisionRecord {
+            revision_id: entry.current_revision_id.unwrap().to_string(),
+            file_id: entry.file_id.to_string(),
+            parent_revision_id: None,
+            content_hash: Some("blake3:abc".to_string()),
+            size: 10,
+            mime: Some("text/plain".to_string()),
+            author_device_id: "device-1".to_string(),
+            author_name: "Device".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            merge_state: "clean".to_string(),
+            conflict_revision_id: None,
+        };
+
+        db.insert_revision(&revision).unwrap();
+        let mut conflicting = revision;
+        conflicting.content_hash = Some("blake3:different".to_string());
+        assert!(matches!(
+            db.insert_revision(&conflicting),
+            Err(CoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_missing_conflict_returns_not_found() {
+        let db = test_db();
+        assert!(matches!(
+            db.resolve_conflict("missing", "resolved_keep_local", ""),
+            Err(CoreError::NotFound(_))
+        ));
     }
 }

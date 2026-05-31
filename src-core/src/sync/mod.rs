@@ -198,6 +198,14 @@ impl SyncEngine {
             .conflict
             .clone()
             .ok_or_else(|| CoreError::Internal("conflict handler missing".into()))?;
+        let conflict_engine = self
+            .conflict_engine
+            .clone()
+            .ok_or_else(|| CoreError::Internal("conflict engine missing".into()))?;
+        let versions = self
+            .versions
+            .clone()
+            .ok_or_else(|| CoreError::Internal("version api missing".into()))?;
         let activity = self
             .activity
             .clone()
@@ -220,6 +228,8 @@ impl SyncEngine {
                 &db,
                 &activity,
                 &conflict,
+                &conflict_engine,
+                &versions,
                 &state,
                 &paused,
                 max_retries,
@@ -251,6 +261,8 @@ impl SyncEngine {
                     &db,
                     &activity,
                     &conflict,
+                    &conflict_engine,
+                    &versions,
                     &state,
                     &sync_folder,
                     max_retries,
@@ -468,6 +480,8 @@ async fn run_initial_sync(
     db: &LocalDatabase,
     activity: &ActivityLog,
     conflict: &ConflictHandler,
+    conflict_engine: &ConflictEngine,
+    versions: &VersionApi,
     state: &Arc<Mutex<SyncState>>,
     paused: &AtomicBool,
     max_retries: u32,
@@ -563,6 +577,9 @@ async fn run_initial_sync(
             db,
             activity,
             conflict,
+            conflict_engine,
+            versions,
+            sync_folder,
             max_retries,
         )
         .await?;
@@ -602,6 +619,17 @@ async fn run_initial_sync(
                         &entry.name,
                         "pending_download",
                     )?;
+                    record_entry_revision(
+                        versions,
+                        file_id,
+                        entry.current_revision_id,
+                        parent_revision_from_history(&entry),
+                        Some(content_ref),
+                        "remote",
+                        "remote",
+                        "clean",
+                        None,
+                    )?;
                 }
             }
         }
@@ -631,6 +659,8 @@ async fn run_sync_cycle(
     db: &LocalDatabase,
     activity: &ActivityLog,
     conflict: &ConflictHandler,
+    conflict_engine: &ConflictEngine,
+    versions: &VersionApi,
     state: &Arc<Mutex<SyncState>>,
     _sync_folder: &str,
     max_retries: u32,
@@ -749,6 +779,9 @@ async fn run_sync_cycle(
             db,
             activity,
             conflict,
+            conflict_engine,
+            versions,
+            _sync_folder,
             max_retries,
         )
         .await?;
@@ -759,15 +792,18 @@ async fn run_sync_cycle(
 
     // ── 3. Poll remote changes ──
     set_state(state, SyncState::ScanningRemote);
-    let download_jobs = poll_remote_changes(
+    let (download_jobs, remote_conflicts) = poll_remote_changes(
         download.s3(),
         db,
         transfer,
         activity,
         conflict,
+        conflict_engine,
+        versions,
         _sync_folder,
     )
     .await?;
+    result.conflicts_detected += remote_conflicts;
 
     // ── 4. Process download queue ──
     let (_, pending_downloads) = transfer.pending_count()?;
@@ -792,6 +828,9 @@ async fn process_upload_queue(
     db: &LocalDatabase,
     activity: &ActivityLog,
     conflict: &ConflictHandler,
+    conflict_engine: &ConflictEngine,
+    versions: &VersionApi,
+    sync_folder: &str,
     max_retries: u32,
 ) -> CoreResult<(u32, u64, u32)> {
     let mut uploaded = 0u32;
@@ -849,9 +888,17 @@ async fn process_upload_queue(
                     continue;
                 }
             };
+            let previous_entry = db.get_file(&parsed_file_id)?;
+            let parent_revision_id = previous_entry
+                .as_ref()
+                .and_then(|entry| entry.current_revision_id);
 
             let revision_id = uuid::Uuid::now_v7();
             let local_hash = blake3_local_hash(&content_ref.hash);
+            let version_history = parent_revision_id
+                .into_iter()
+                .chain(std::iter::once(revision_id))
+                .collect();
             let entry = FileEntry {
                 file_id: parsed_file_id,
                 parent_id: None,
@@ -866,19 +913,71 @@ async fn process_upload_queue(
                 created_at: chrono::Utc::now().to_rfc3339(),
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 deleted_at: None,
-                version_history: vec![revision_id],
+                version_history,
                 attributes: Default::default(),
                 lock_state: Default::default(),
             };
 
             let tree = FileTree::new(s3);
-            let op_type = match tree.get_entry(&parsed_file_id).await {
-                Ok(_) => OpType::UploadNewRevision,
-                Err(CoreError::NotFound(_)) => OpType::CreateFile,
+            let mut remote_lookup_failed = false;
+            let remote_entry = match tree.get_entry(&parsed_file_id).await {
+                Ok(entry) => Some(entry),
+                Err(CoreError::NotFound(_)) => None,
                 Err(e) => {
                     tracing::debug!("Could not read remote tree before upload commit: {}", e);
-                    OpType::UploadNewRevision
+                    remote_lookup_failed = true;
+                    None
                 }
+            };
+
+            if let Some(remote_entry) = remote_entry.as_ref() {
+                if remote_revision_diverged(parent_revision_id, remote_entry, &local_hash) {
+                    if has_open_conflict(db, &parsed_file_id, ConflictType::EditEdit.as_str())? {
+                        transfer.mark_failed(job.id, "conflict: remote revision diverged")?;
+                        conflicts += 1;
+                        continue;
+                    }
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let conflict_path = ConflictEngine::create_conflict_copy(
+                        &local_path,
+                        sync_folder,
+                        &s3_key,
+                        versions.device_name(),
+                        &now,
+                    )?;
+                    let local_rev = parent_revision_id.map(|id| id.to_string());
+                    let remote_rev = remote_entry.current_revision_id.map(|id| id.to_string());
+                    let reason = ConflictEngine::explain_conflict(
+                        &ConflictType::EditEdit,
+                        &local_path,
+                        &s3_key,
+                        versions.device_name(),
+                        "remote",
+                        &now,
+                        &remote_entry.updated_at,
+                    );
+                    conflict.register(&file_id, &local_path, &reason);
+                    conflict_engine.record_conflict(
+                        &file_id,
+                        &ConflictType::EditEdit,
+                        &local_path,
+                        &s3_key,
+                        &conflict_path,
+                        local_rev.as_deref(),
+                        remote_rev.as_deref(),
+                        &reason,
+                    )?;
+                    transfer.mark_failed(job.id, "conflict: remote revision diverged")?;
+                    activity.log("upload_conflict", &file_id, &s3_key, &reason)?;
+                    conflicts += 1;
+                    continue;
+                }
+            }
+
+            let op_type = if remote_entry.is_some() || remote_lookup_failed {
+                OpType::UploadNewRevision
+            } else {
+                OpType::CreateFile
             };
             let remote_exists = matches!(op_type, OpType::UploadNewRevision);
 
@@ -902,6 +1001,19 @@ async fn process_upload_queue(
                     if let Err(e) = tree.upsert_entry(&entry).await {
                         tracing::warn!("Materialized tree update failed after op commit: {}", e);
                     }
+                    let parent_revision = parent_revision_id.map(|id| id.to_string());
+                    versions.record_revision(
+                        &revision_id.to_string(),
+                        &parsed_file_id,
+                        parent_revision.as_deref(),
+                        Some(&local_hash),
+                        data_len,
+                        Some(&content_ref.mime),
+                        &metadata.device_id().to_string(),
+                        versions.device_name(),
+                        "clean",
+                        None,
+                    )?;
                     db.register_file_at_path_with_state(&entry, &local_path, &s3_key, "synced")?;
                     transfer.mark_completed(job.id)?;
                     uploaded += 1;
@@ -987,14 +1099,17 @@ async fn process_download_queue(
 
 // ─── Remote Polling ─────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_remote_changes(
     s3: &S3Adapter,
     db: &LocalDatabase,
     transfer: &TransferQueue,
     activity: &ActivityLog,
     conflict: &ConflictHandler,
+    conflict_engine: &ConflictEngine,
+    versions: &VersionApi,
     _sync_folder: &str,
-) -> CoreResult<usize> {
+) -> CoreResult<(usize, u32)> {
     let mut clock: u64 = 0;
     let device_id = uuid::Uuid::now_v7(); // temporary device ID for scanning
     let ops_log = OperationLog::new(s3, device_id, &mut clock);
@@ -1003,15 +1118,16 @@ async fn poll_remote_changes(
         Ok(ops) => ops,
         Err(e) => {
             tracing::debug!("No remote ops: {}", e);
-            return Ok(0);
+            return Ok((0, 0));
         }
     };
 
     if ops.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
 
     let mut new_downloads = 0usize;
+    let mut conflicts = 0u32;
     let tree = FileTree::new(s3);
 
     for op_key in &ops {
@@ -1050,40 +1166,167 @@ async fn poll_remote_changes(
                         )
                         .await?
                         {
+                            if has_open_conflict(db, &file_id, ConflictType::EditEdit.as_str())? {
+                                continue;
+                            }
+                            if let Some(merged) = try_text_auto_merge(
+                                s3,
+                                versions,
+                                &local_entry,
+                                &local_path,
+                                &remote_path,
+                                &content_ref,
+                            )
+                            .await?
+                            {
+                                let (hash_hex, size) =
+                                    write_merged_content(&local_path, &merged).await?;
+                                let mut merged_entry = entry.clone();
+                                merged_entry.content_hash = Some(blake3_local_hash(&hash_hex));
+                                merged_entry.size = size;
+                                merged_entry.current_revision_id = local_entry.current_revision_id;
+                                db.register_file_at_path_with_state(
+                                    &merged_entry,
+                                    &local_path_text,
+                                    &remote_path,
+                                    "pending_upload",
+                                )?;
+                                transfer.enqueue_upload(
+                                    &file_id.to_string(),
+                                    &local_path_text,
+                                    &remote_path,
+                                )?;
+                                let now = chrono::Utc::now().to_rfc3339();
+                                let remote_rev =
+                                    op.effects.new_revision_id.map(|id| id.to_string());
+                                let local_rev =
+                                    local_entry.current_revision_id.map(|id| id.to_string());
+                                let reason = ConflictEngine::explain_conflict(
+                                    &ConflictType::EditEdit,
+                                    &local_path_text,
+                                    &remote_path,
+                                    versions.device_name(),
+                                    "remote",
+                                    &now,
+                                    &op.timestamp,
+                                );
+                                let conflict_id = conflict_engine.record_conflict(
+                                    &file_id.to_string(),
+                                    &ConflictType::EditEdit,
+                                    &local_path_text,
+                                    &remote_path,
+                                    "",
+                                    local_rev.as_deref(),
+                                    remote_rev.as_deref(),
+                                    &reason,
+                                )?;
+                                conflict_engine.resolve(
+                                    &conflict_id,
+                                    ConflictResolution::Merged(String::new()),
+                                    "automatic text 3-way merge",
+                                )?;
+                                activity.log(
+                                    "auto_merge",
+                                    &file_id.to_string(),
+                                    &remote_path,
+                                    "queued merged upload",
+                                )?;
+                                conflicts += 1;
+                                continue;
+                            }
+
+                            let now = chrono::Utc::now().to_rfc3339();
                             let conflict_path = ConflictEngine::create_conflict_copy(
                                 &local_path_text,
                                 _sync_folder,
                                 &remote_path,
-                                "remote",
-                                &chrono::Utc::now().to_rfc3339(),
+                                versions.device_name(),
+                                &now,
                             )?;
-                            conflict.register(
-                                &file_id.to_string(),
+                            let remote_rev = op.effects.new_revision_id.map(|id| id.to_string());
+                            let local_rev =
+                                local_entry.current_revision_id.map(|id| id.to_string());
+                            let reason = ConflictEngine::explain_conflict(
+                                &ConflictType::EditEdit,
                                 &local_path_text,
-                                &format!(
-                                    "remote update conflicts with local changes: {}",
-                                    conflict_path
-                                ),
+                                &remote_path,
+                                versions.device_name(),
+                                "remote",
+                                &now,
+                                &op.timestamp,
                             );
+                            conflict.register(&file_id.to_string(), &local_path_text, &reason);
+                            conflict_engine.record_conflict(
+                                &file_id.to_string(),
+                                &ConflictType::EditEdit,
+                                &local_path_text,
+                                &remote_path,
+                                &conflict_path,
+                                local_rev.as_deref(),
+                                remote_rev.as_deref(),
+                                &reason,
+                            )?;
+                            conflicts += 1;
                         }
                     } else if local_path.exists() {
+                        if has_open_conflict(db, &file_id, ConflictType::CreateCreate.as_str())? {
+                            continue;
+                        }
+                        let now = chrono::Utc::now().to_rfc3339();
                         let conflict_path = ConflictEngine::create_conflict_copy(
                             &local_path_text,
                             _sync_folder,
                             &remote_path,
-                            "remote",
-                            &chrono::Utc::now().to_rfc3339(),
+                            versions.device_name(),
+                            &now,
                         )?;
-                        conflict.register(
-                            &file_id.to_string(),
+                        let remote_rev = op.effects.new_revision_id.map(|id| id.to_string());
+                        let reason = ConflictEngine::explain_conflict(
+                            &ConflictType::CreateCreate,
                             &local_path_text,
-                            &format!(
-                                "remote create conflicts with existing local file: {}",
-                                conflict_path
-                            ),
+                            &remote_path,
+                            versions.device_name(),
+                            "remote",
+                            &now,
+                            &op.timestamp,
                         );
+                        conflict.register(&file_id.to_string(), &local_path_text, &reason);
+                        conflict_engine.record_conflict(
+                            &file_id.to_string(),
+                            &ConflictType::CreateCreate,
+                            &local_path_text,
+                            &remote_path,
+                            &conflict_path,
+                            None,
+                            remote_rev.as_deref(),
+                            &reason,
+                        )?;
+                        conflicts += 1;
                     }
 
+                    let remote_revision_uuid =
+                        op.effects.new_revision_id.or(entry.current_revision_id);
+                    let parent_revision_uuid = db
+                        .get_file(&file_id)?
+                        .and_then(|entry| entry.current_revision_id)
+                        .filter(|revision| Some(*revision) != remote_revision_uuid)
+                        .or_else(|| parent_revision_from_history(&entry));
+                    let parent_revision = parent_revision_uuid.map(|id| id.to_string());
+                    let remote_revision = remote_revision_uuid.map(|id| id.to_string());
+                    if let Some(revision_id) = remote_revision.as_deref() {
+                        versions.record_revision(
+                            revision_id,
+                            &file_id,
+                            parent_revision.as_deref(),
+                            Some(&blake3_local_hash(&content_ref.hash)),
+                            content_ref.size,
+                            Some(&content_ref.mime),
+                            &op.device_id.to_string(),
+                            &op.actor_id,
+                            "clean",
+                            None,
+                        )?;
+                    }
                     transfer.enqueue_download(
                         &file_id.to_string(),
                         &local_path_text,
@@ -1102,7 +1345,47 @@ async fn poll_remote_changes(
                     if let Some(new_name) = op.effects.new_name.as_deref() {
                         if let Some(old_path) = db.get_local_path(&file_id)? {
                             let new_path = safe_join_sync_path(_sync_folder, new_name)?;
-                            if Path::new(&old_path).exists() {
+                            let old_path_obj = Path::new(&old_path);
+                            if new_path.exists() && !same_path(old_path_obj, &new_path) {
+                                if has_open_conflict(
+                                    db,
+                                    &file_id,
+                                    ConflictType::RenameRename.as_str(),
+                                )? {
+                                    continue;
+                                }
+                                let now = chrono::Utc::now().to_rfc3339();
+                                let conflict_path = ConflictEngine::create_conflict_copy(
+                                    &new_path.to_string_lossy(),
+                                    _sync_folder,
+                                    new_name,
+                                    versions.device_name(),
+                                    &now,
+                                )?;
+                                let reason = ConflictEngine::explain_conflict(
+                                    &ConflictType::RenameRename,
+                                    &old_path,
+                                    new_name,
+                                    versions.device_name(),
+                                    "remote",
+                                    &now,
+                                    &op.timestamp,
+                                );
+                                conflict.register(&file_id.to_string(), &old_path, &reason);
+                                conflict_engine.record_conflict(
+                                    &file_id.to_string(),
+                                    &ConflictType::RenameRename,
+                                    &old_path,
+                                    new_name,
+                                    &conflict_path,
+                                    None,
+                                    None,
+                                    &reason,
+                                )?;
+                                conflicts += 1;
+                                continue;
+                            }
+                            if old_path_obj.exists() {
                                 if let Some(parent) = new_path.parent() {
                                     std::fs::create_dir_all(parent).map_err(|e| {
                                         CoreError::FileSystem(format!(
@@ -1128,6 +1411,62 @@ async fn poll_remote_changes(
                 OpType::Delete => {
                     if let Ok(Some(_entry)) = db.get_file(&file_id) {
                         if let Some(local_path) = db.get_local_path(&file_id)? {
+                            let local_path_obj = PathBuf::from(&local_path);
+                            let local_hash =
+                                db.get_file(&file_id)?.and_then(|entry| entry.content_hash);
+                            if local_file_changed_since_sync(&local_path_obj, local_hash.as_deref())
+                                .await?
+                            {
+                                if has_open_conflict(
+                                    db,
+                                    &file_id,
+                                    ConflictType::DeleteEdit.as_str(),
+                                )? {
+                                    continue;
+                                }
+                                let now = chrono::Utc::now().to_rfc3339();
+                                let conflict_name =
+                                    relative_s3_key(_sync_folder, Path::new(&local_path))
+                                        .unwrap_or_else(|_| {
+                                            Path::new(&local_path)
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| "deleted".to_string())
+                                        });
+                                let conflict_path = ConflictEngine::create_conflict_copy(
+                                    &local_path,
+                                    _sync_folder,
+                                    &conflict_name,
+                                    versions.device_name(),
+                                    &now,
+                                )?;
+                                let local_rev = db
+                                    .get_file(&file_id)?
+                                    .and_then(|entry| entry.current_revision_id)
+                                    .map(|id| id.to_string());
+                                let reason = ConflictEngine::explain_conflict(
+                                    &ConflictType::DeleteEdit,
+                                    &local_path,
+                                    &local_path,
+                                    versions.device_name(),
+                                    "remote",
+                                    &now,
+                                    &op.timestamp,
+                                );
+                                conflict.register(&file_id.to_string(), &local_path, &reason);
+                                conflict_engine.record_conflict(
+                                    &file_id.to_string(),
+                                    &ConflictType::DeleteEdit,
+                                    &local_path,
+                                    &local_path,
+                                    &conflict_path,
+                                    local_rev.as_deref(),
+                                    None,
+                                    &reason,
+                                )?;
+                                conflicts += 1;
+                                continue;
+                            }
                             move_local_file_to_trash(_sync_folder, &local_path, &file_id)?;
                         }
                         db.mark_file_deleted(&file_id)?;
@@ -1139,7 +1478,7 @@ async fn poll_remote_changes(
         }
     }
 
-    Ok(new_downloads)
+    Ok((new_downloads, conflicts))
 }
 
 async fn handle_local_delete(
@@ -1321,12 +1660,193 @@ async fn remote_file_state(
     entry.size = content_ref.size;
     entry.content_hash = Some(blake3_local_hash(&content_ref.hash));
     entry.mime = Some(content_ref.mime.clone());
+    if let Some(revision_id) = op.effects.new_revision_id {
+        entry.current_revision_id = Some(revision_id);
+        if !entry.version_history.contains(&revision_id) {
+            entry.version_history.push(revision_id);
+        }
+    }
 
     if entry.entry_type != EntryType::File {
         return Ok(None);
     }
 
     Ok(Some((entry, content_ref, remote_path)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_entry_revision(
+    versions: &VersionApi,
+    file_id: &uuid::Uuid,
+    revision_id: Option<uuid::Uuid>,
+    parent_revision_id: Option<uuid::Uuid>,
+    content_ref: Option<&ContentRef>,
+    author_device_id: &str,
+    author_name: &str,
+    merge_state: &str,
+    conflict_revision_id: Option<&str>,
+) -> CoreResult<()> {
+    let Some(revision_id) = revision_id else {
+        return Ok(());
+    };
+    let parent_revision_id = parent_revision_id.map(|id| id.to_string());
+    let content_hash = content_ref.map(|content| blake3_local_hash(&content.hash));
+    let size = content_ref.map(|content| content.size).unwrap_or_default();
+    let mime = content_ref.map(|content| content.mime.as_str());
+
+    versions.record_revision(
+        &revision_id.to_string(),
+        file_id,
+        parent_revision_id.as_deref(),
+        content_hash.as_deref(),
+        size,
+        mime,
+        author_device_id,
+        author_name,
+        merge_state,
+        conflict_revision_id,
+    )
+}
+
+fn parent_revision_from_history(entry: &FileEntry) -> Option<uuid::Uuid> {
+    let current = entry.current_revision_id?;
+    entry
+        .version_history
+        .iter()
+        .rev()
+        .copied()
+        .find(|revision| *revision != current)
+}
+
+fn has_open_conflict(
+    db: &LocalDatabase,
+    file_id: &uuid::Uuid,
+    conflict_type: &str,
+) -> CoreResult<bool> {
+    Ok(db
+        .get_conflicts_for_file(&file_id.to_string())?
+        .iter()
+        .any(|record| record.conflict_type == conflict_type))
+}
+
+fn remote_revision_diverged(
+    parent_revision_id: Option<uuid::Uuid>,
+    remote_entry: &FileEntry,
+    local_hash: &str,
+) -> bool {
+    let Some(parent_revision_id) = parent_revision_id else {
+        return false;
+    };
+    let Some(remote_revision_id) = remote_entry.current_revision_id else {
+        return false;
+    };
+    if parent_revision_id == remote_revision_id {
+        return false;
+    }
+
+    let remote_hash = remote_entry
+        .content_ref
+        .as_ref()
+        .map(|content| content.hash.as_str())
+        .or(remote_entry.content_hash.as_deref());
+    !content_hash_matches(remote_hash, local_hash)
+}
+
+async fn try_text_auto_merge(
+    s3: &S3Adapter,
+    versions: &VersionApi,
+    local_entry: &FileEntry,
+    local_path: &Path,
+    remote_path: &str,
+    remote_content: &ContentRef,
+) -> CoreResult<Option<String>> {
+    if !ConflictEngine::is_text_file(remote_path) {
+        return Ok(None);
+    }
+
+    let Some(base_revision_id) = local_entry.current_revision_id else {
+        return Ok(None);
+    };
+    let Some(base_revision) = versions.get_revision(&base_revision_id.to_string())? else {
+        return Ok(None);
+    };
+    let Some(base_hash) = base_revision.content_hash.as_deref() else {
+        return Ok(None);
+    };
+
+    let blob_store = BlobStore::new(s3);
+    let base_bytes = match blob_store
+        .get_blob(base_hash.trim_start_matches("blake3:"))
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::debug!("Auto-merge skipped: base blob unavailable: {}", e);
+            return Ok(None);
+        }
+    };
+    let local_bytes = match tokio::fs::read(local_path).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::debug!("Auto-merge skipped: local file unreadable: {}", e);
+            return Ok(None);
+        }
+    };
+    let remote_bytes = match s3.get_object(&remote_content.storage_key).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::debug!("Auto-merge skipped: remote blob unavailable: {}", e);
+            return Ok(None);
+        }
+    };
+
+    let base = match String::from_utf8(base_bytes) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
+    };
+    let local = match String::from_utf8(local_bytes) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
+    };
+    let remote = match String::from_utf8(remote_bytes) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
+    };
+
+    let merged = ConflictEngine::text_three_way_merge(
+        &base,
+        &local,
+        &remote,
+        &local_path.to_string_lossy(),
+        remote_path,
+    )?;
+    if ConflictEngine::has_conflict_markers(&merged) {
+        Ok(None)
+    } else {
+        Ok(Some(merged))
+    }
+}
+
+async fn write_merged_content(local_path: &Path, merged: &str) -> CoreResult<(String, u64)> {
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| CoreError::FileSystem(format!("create merge parent: {}", e)))?;
+    }
+    tokio::fs::write(local_path, merged.as_bytes())
+        .await
+        .map_err(|e| CoreError::FileSystem(format!("write merged file: {}", e)))?;
+    blake3_file_hash(local_path).await
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1634,6 +2154,42 @@ mod tests {
     fn test_safe_join_sync_path_rejects_parent_dir() {
         let err = safe_join_sync_path("/tmp/s4drive", "../escape.txt").unwrap_err();
         assert!(matches!(err, CoreError::Protocol(_)));
+    }
+
+    #[test]
+    fn test_remote_revision_diverged_detects_sibling_content() {
+        let parent = uuid::Uuid::now_v7();
+        let remote_revision = uuid::Uuid::now_v7();
+        let mut entry = FileEntry {
+            file_id: uuid::Uuid::now_v7(),
+            parent_id: None,
+            name: "file.txt".to_string(),
+            normalized_name: "file.txt".to_string(),
+            entry_type: EntryType::File,
+            current_revision_id: Some(remote_revision),
+            content_ref: None,
+            size: 4,
+            content_hash: Some("blake3:remote".to_string()),
+            mime: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            deleted_at: None,
+            version_history: vec![parent, remote_revision],
+            attributes: Default::default(),
+            lock_state: Default::default(),
+        };
+
+        assert!(remote_revision_diverged(
+            Some(parent),
+            &entry,
+            "blake3:local"
+        ));
+        entry.content_hash = Some("blake3:local".to_string());
+        assert!(!remote_revision_diverged(
+            Some(parent),
+            &entry,
+            "blake3:local"
+        ));
     }
 
     #[tokio::test]

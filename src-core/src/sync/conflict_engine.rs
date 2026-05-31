@@ -9,7 +9,7 @@
 
 use crate::db::LocalDatabase;
 use crate::error::{CoreError, CoreResult};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 /// Тип конфликта
@@ -126,7 +126,10 @@ impl ConflictEngine {
     /// Generate a conflict-safe filename:
     /// `name (conflict from <Device> <Date>).ext`
     pub fn conflict_filename(name: &str, device_name: &str, date: &str) -> String {
-        let path = Path::new(name);
+        let path = Path::new(name)
+            .file_name()
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new(name));
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -136,8 +139,9 @@ impl ConflictEngine {
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
 
-        // Simplify date to YYYY-MM-DD HH:MM
-        let short_date = if date.len() >= 16 { &date[..16] } else { date };
+        let short_date = sanitize_filename_part(&short_date(date));
+        let device_name = sanitize_filename_part(device_name);
+        let stem = sanitize_filename_part(&stem);
 
         format!(
             "{} (conflict from {} {}).{}",
@@ -160,8 +164,16 @@ impl ConflictEngine {
         device_name: &str,
         date: &str,
     ) -> CoreResult<String> {
-        let conflict_name = Self::conflict_filename(original_name, device_name, date);
-        let conflict_path = Path::new(sync_folder).join(&conflict_name);
+        let original = Path::new(original_name);
+        let file_name = original
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| original_name.to_string());
+        let conflict_name = Self::conflict_filename(&file_name, device_name, date);
+        let conflict_dir = conflict_parent_dir(sync_folder, original_name)?;
+        std::fs::create_dir_all(&conflict_dir)
+            .map_err(|e| CoreError::FileSystem(format!("conflict dir: {}", e)))?;
+        let conflict_path = unique_conflict_path(conflict_dir.join(&conflict_name));
 
         if Path::new(source_path).exists() {
             std::fs::copy(source_path, &conflict_path)
@@ -189,6 +201,8 @@ impl ConflictEngine {
             .file_name()
             .map(|s| s.to_string_lossy())
             .unwrap_or_else(|| std::borrow::Cow::Borrowed(local_path));
+        let local_date = short_date(local_date);
+        let remote_date = short_date(remote_date);
 
         match conflict_type {
             ConflictType::EditEdit => format!(
@@ -196,8 +210,8 @@ impl ConflictEngine {
                  · Локально: {} изменён {} на «{}»\n\
                  · Удалённо: {} изменён {} на «{}»\n\
                  Обе версии сохранены. Выберите нужную.",
-                file_name, local_device, &local_date[..16], local_path,
-                remote_device, &remote_date[..16], remote_path,
+                file_name, local_device, local_date, local_path,
+                remote_device, remote_date, remote_path,
             ),
             ConflictType::DeleteEdit => format!(
                 "🗑️ Конфликт удаления/изменения: «{}» удалён на одном устройстве, но изменён на другом.\n\
@@ -205,8 +219,8 @@ impl ConflictEngine {
                  · {} изменён {} на {}\n\
                  Изменённая версия сохранена как конфликтная копия.",
                 file_name,
-                remote_device, &remote_date[..16],
-                local_device, &local_date[..16], local_path,
+                remote_device, remote_date,
+                local_device, local_date, local_path,
             ),
             ConflictType::RenameRename => format!(
                 "🔄 Конфликт переименования: «{}» переименован по-разному на двух устройствах.\n\
@@ -277,6 +291,9 @@ impl ConflictEngine {
                 resolved_at: None,
             };
             db.insert_conflict_record(&record)?;
+            if let Ok(file_id) = Uuid::parse_str(file_id) {
+                db.mark_file_conflict(&file_id)?;
+            }
         }
 
         tracing::warn!(
@@ -302,7 +319,10 @@ impl ConflictEngine {
             ConflictResolution::KeepRemote => "resolved_keep_remote",
             ConflictResolution::KeepBoth => "resolved_keep_both",
             ConflictResolution::Merged(_) => "resolved_merged",
-            ConflictResolution::MergeFailed => "open", // not really resolved
+            ConflictResolution::MergeFailed => {
+                tracing::info!("Conflict {} remains open after failed merge", conflict_id);
+                return Ok(());
+            }
         };
 
         if let Some(ref db) = self.db {
@@ -325,13 +345,19 @@ impl ConflictEngine {
         local_path: &str,
         remote_path: &str,
     ) -> CoreResult<String> {
+        if local_content == remote_content {
+            return Ok(local_content.to_string());
+        }
+        if local_content == base_content {
+            return Ok(remote_content.to_string());
+        }
+        if remote_content == base_content {
+            return Ok(local_content.to_string());
+        }
+
         let base: Vec<&str> = base_content.lines().collect();
         let local: Vec<&str> = local_content.lines().collect();
         let remote: Vec<&str> = remote_content.lines().collect();
-
-        let mut out: Vec<String> = Vec::new();
-        let mut li = 0usize;
-        let mut ri = 0usize;
 
         let local_name = Path::new(local_path)
             .file_name()
@@ -344,118 +370,21 @@ impl ConflictEngine {
             .unwrap_or_else(|| std::borrow::Cow::Borrowed("remote"))
             .to_string();
 
-        for &base_line in &base {
-            // Where does this base line appear next in each side?
-            let local_pos = local[li..].iter().position(|&l| l == base_line);
-            let remote_pos = remote[ri..].iter().position(|&r| r == base_line);
+        let local_changes = diff_lines(&base, &local);
+        let remote_changes = diff_lines(&base, &remote);
+        let merged = merge_line_changes(
+            &base,
+            &local_changes,
+            &remote_changes,
+            &local_name,
+            &remote_name,
+        );
 
-            match (local_pos, remote_pos) {
-                (None, None) => {
-                    // Line deleted on both sides — can't happen on same line reference
-                    // but if it does, take what's ahead
-                    if li < local.len() && ri < remote.len() {
-                        out.push(format!("<<<<<<< {}", local_name));
-                        out.push(local[li].to_string());
-                        li += 1;
-                        out.push("=======".to_string());
-                        out.push(remote[ri].to_string());
-                        ri += 1;
-                        out.push(format!(">>>>>>> {}", remote_name));
-                    }
-                }
-                (None, Some(rp)) => {
-                    // Deleted locally, present remotely
-                    for _ in 0..rp {
-                        out.push(remote[ri].to_string());
-                        ri += 1;
-                    }
-                    out.push(remote[ri].to_string()); // the matching line
-                    ri += 1;
-                }
-                (Some(lp), None) => {
-                    // Deleted remotely, present locally
-                    for _ in 0..lp {
-                        out.push(local[li].to_string());
-                        li += 1;
-                    }
-                    out.push(local[li].to_string());
-                    li += 1;
-                }
-                (Some(lp), Some(rp)) => {
-                    // Both have this line
-                    if lp == 0 && rp == 0 {
-                        // Aligned — no new lines before it
-                        out.push(local[li].to_string());
-                        li += 1;
-                        ri += 1;
-                    } else if lp > 0 && rp > 0 {
-                        // Both inserted lines → conflict
-                        out.push(format!("<<<<<<< {}", local_name));
-                        for _ in 0..lp {
-                            out.push(local[li].to_string());
-                            li += 1;
-                        }
-                        out.push("=======".to_string());
-                        for _ in 0..rp {
-                            out.push(remote[ri].to_string());
-                            ri += 1;
-                        }
-                        out.push(format!(">>>>>>> {}", remote_name));
-                        out.push(local[li].to_string()); // the common line
-                        li += 1;
-                        ri += 1;
-                    } else if lp > 0 {
-                        // Only local inserted lines
-                        for _ in 0..lp {
-                            out.push(local[li].to_string());
-                            li += 1;
-                        }
-                        out.push(local[li].to_string()); // common line
-                        li += 1;
-                        ri += 1;
-                    } else {
-                        // Only remote inserted lines
-                        for _ in 0..rp {
-                            out.push(remote[ri].to_string());
-                            ri += 1;
-                        }
-                        out.push(remote[ri].to_string()); // common line
-                        ri += 1;
-                        li += 1;
-                    }
-                }
-            }
-        }
+        Ok(merged.join("\n"))
+    }
 
-        // Trailing lines (additions at end)
-        while li < local.len() || ri < remote.len() {
-            if li < local.len() && ri < remote.len() && local[li] == remote[ri] {
-                out.push(local[li].to_string());
-                li += 1;
-                ri += 1;
-            } else if li < local.len() && ri >= remote.len() {
-                out.push(local[li].to_string());
-                li += 1;
-            } else if ri < remote.len() && li >= local.len() {
-                out.push(remote[ri].to_string());
-                ri += 1;
-            } else {
-                // Both have different trailing lines → conflict
-                out.push(format!("<<<<<<< {}", local_name));
-                if li < local.len() {
-                    out.push(local[li].to_string());
-                    li += 1;
-                }
-                out.push("=======".to_string());
-                if ri < remote.len() {
-                    out.push(remote[ri].to_string());
-                    ri += 1;
-                }
-                out.push(format!(">>>>>>> {}", remote_name));
-            }
-        }
-
-        Ok(out.join("\n"))
+    pub fn has_conflict_markers(content: &str) -> bool {
+        content.contains("<<<<<<< ") && content.contains("=======") && content.contains(">>>>>>> ")
     }
 
     /// Check if a file is likely text-based (by extension).
@@ -465,58 +394,64 @@ impl ConflictEngine {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
 
-        matches!(
-            ext.as_str(),
-            "txt"
-                | "md"
-                | "json"
-                | "yaml"
-                | "yml"
-                | "toml"
-                | "xml"
-                | "html"
-                | "htm"
-                | "css"
-                | "js"
-                | "ts"
-                | "jsx"
-                | "tsx"
-                | "rs"
-                | "py"
-                | "rb"
-                | "go"
-                | "java"
-                | "kt"
-                | "swift"
-                | "c"
-                | "h"
-                | "cpp"
-                | "hpp"
-                | "sh"
-                | "bash"
-                | "zsh"
-                | "fish"
-                | "env"
-                | "ini"
-                | "cfg"
-                | "conf"
-                | "log"
-                | "csv"
-                | "tsv"
-                | "sql"
-                | "r"
-                | "scala"
-                | "clj"
-                | "lua"
-                | "pl"
-                | "pm"
-                | "php"
-                | "dart"
-                | "gradle"
-                | "lock"
-                | "gitignore"
-                | "dockerfile"
-        )
+        let name = Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        matches!(name.as_str(), "dockerfile" | "makefile" | ".gitignore")
+            || matches!(
+                ext.as_str(),
+                "txt"
+                    | "md"
+                    | "json"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "xml"
+                    | "html"
+                    | "htm"
+                    | "css"
+                    | "js"
+                    | "ts"
+                    | "jsx"
+                    | "tsx"
+                    | "rs"
+                    | "py"
+                    | "rb"
+                    | "go"
+                    | "java"
+                    | "kt"
+                    | "swift"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "hpp"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "fish"
+                    | "env"
+                    | "ini"
+                    | "cfg"
+                    | "conf"
+                    | "log"
+                    | "csv"
+                    | "tsv"
+                    | "sql"
+                    | "r"
+                    | "scala"
+                    | "clj"
+                    | "lua"
+                    | "pl"
+                    | "pm"
+                    | "php"
+                    | "dart"
+                    | "gradle"
+                    | "lock"
+                    | "gitignore"
+                    | "dockerfile"
+            )
     }
 
     // ─── Private: LCS indices ───────────────────────────────────────
@@ -525,42 +460,255 @@ impl ConflictEngine {
     /// base lines are preserved in the modified version.
     #[allow(dead_code)]
     fn lcs_indices<'a>(base: &[&'a str], modified: &[&'a str]) -> Vec<usize> {
-        let m = base.len();
-        let n = modified.len();
-        if m == 0 || n == 0 {
-            return Vec::new();
-        }
-
-        // Build DP table
-        let mut dp = vec![vec![0u32; n + 1]; m + 1];
-        for i in 1..=m {
-            for j in 1..=n {
-                if base[i - 1] == modified[j - 1] {
-                    dp[i][j] = dp[i - 1][j - 1] + 1;
-                } else {
-                    dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
-                }
-            }
-        }
-
-        // Backtrack to find which base indices are in LCS
-        let mut result = Vec::new();
-        let mut i = m;
-        let mut j = n;
-        while i > 0 && j > 0 {
-            if base[i - 1] == modified[j - 1] {
-                result.push(i - 1);
-                i -= 1;
-                j -= 1;
-            } else if dp[i - 1][j] > dp[i][j - 1] {
-                i -= 1;
-            } else {
-                j -= 1;
-            }
-        }
-        result.reverse();
-        result
+        lcs_pairs(base, modified)
+            .into_iter()
+            .map(|(base_index, _)| base_index)
+            .collect()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineChange {
+    start: usize,
+    end: usize,
+    replacement: Vec<String>,
+}
+
+fn short_date(date: &str) -> String {
+    date.chars().take(16).collect()
+}
+
+fn sanitize_filename_part(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim().trim_matches('.').to_string();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn conflict_parent_dir(sync_folder: &str, original_name: &str) -> CoreResult<PathBuf> {
+    let mut dir = PathBuf::from(sync_folder);
+    let Some(parent) = Path::new(original_name).parent() else {
+        return Ok(dir);
+    };
+
+    for component in parent.components() {
+        match component {
+            Component::Normal(part) => dir.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(CoreError::Protocol(format!(
+                    "conflict path escapes sync folder: {}",
+                    original_name
+                )));
+            }
+        }
+    }
+    Ok(dir)
+}
+
+fn unique_conflict_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "conflict".to_string());
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+
+    for index in 2..10_000 {
+        let file_name = match &ext {
+            Some(ext) if !ext.is_empty() => format!("{} {}.{}", stem, index, ext),
+            _ => format!("{} {}", stem, index),
+        };
+        let candidate = parent.join(file_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    parent.join(format!("{} {}", stem, Uuid::now_v7()))
+}
+
+fn lcs_pairs(base: &[&str], modified: &[&str]) -> Vec<(usize, usize)> {
+    let m = base.len();
+    let n = modified.len();
+    if m == 0 || n == 0 {
+        return Vec::new();
+    }
+
+    let mut dp = vec![vec![0u32; n + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=n {
+            if base[i - 1] == modified[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut i = m;
+    let mut j = n;
+    while i > 0 && j > 0 {
+        if base[i - 1] == modified[j - 1] {
+            result.push((i - 1, j - 1));
+            i -= 1;
+            j -= 1;
+        } else if dp[i - 1][j] > dp[i][j - 1] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    result.reverse();
+    result
+}
+
+fn diff_lines(base: &[&str], modified: &[&str]) -> Vec<LineChange> {
+    let pairs = lcs_pairs(base, modified);
+    let mut changes = Vec::new();
+    let mut base_cursor = 0usize;
+    let mut modified_cursor = 0usize;
+
+    for (base_index, modified_index) in pairs {
+        if base_cursor < base_index || modified_cursor < modified_index {
+            changes.push(LineChange {
+                start: base_cursor,
+                end: base_index,
+                replacement: modified[modified_cursor..modified_index]
+                    .iter()
+                    .map(|line| (*line).to_string())
+                    .collect(),
+            });
+        }
+        base_cursor = base_index + 1;
+        modified_cursor = modified_index + 1;
+    }
+
+    if base_cursor < base.len() || modified_cursor < modified.len() {
+        changes.push(LineChange {
+            start: base_cursor,
+            end: base.len(),
+            replacement: modified[modified_cursor..]
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect(),
+        });
+    }
+
+    changes
+}
+
+fn merge_line_changes(
+    base: &[&str],
+    local_changes: &[LineChange],
+    remote_changes: &[LineChange],
+    local_name: &str,
+    remote_name: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    let mut local_index = 0usize;
+    let mut remote_index = 0usize;
+
+    while local_index < local_changes.len() || remote_index < remote_changes.len() {
+        let local = local_changes.get(local_index);
+        let remote = remote_changes.get(remote_index);
+
+        match (local, remote) {
+            (Some(local), Some(remote)) if changes_overlap_or_same_insertion(local, remote) => {
+                append_base(&mut out, base, cursor, local.start.min(remote.start));
+                if local.start == remote.start
+                    && local.end == remote.end
+                    && local.replacement == remote.replacement
+                {
+                    out.extend(local.replacement.clone());
+                } else {
+                    append_conflict(
+                        &mut out,
+                        local_name,
+                        &local.replacement,
+                        remote_name,
+                        &remote.replacement,
+                    );
+                }
+                cursor = local.end.max(remote.end);
+                local_index += 1;
+                remote_index += 1;
+            }
+            (Some(local), Some(remote)) if local.end <= remote.start => {
+                append_base(&mut out, base, cursor, local.start);
+                out.extend(local.replacement.clone());
+                cursor = local.end;
+                local_index += 1;
+            }
+            (Some(_), Some(remote)) => {
+                append_base(&mut out, base, cursor, remote.start);
+                out.extend(remote.replacement.clone());
+                cursor = remote.end;
+                remote_index += 1;
+            }
+            (Some(local), None) => {
+                append_base(&mut out, base, cursor, local.start);
+                out.extend(local.replacement.clone());
+                cursor = local.end;
+                local_index += 1;
+            }
+            (None, Some(remote)) => {
+                append_base(&mut out, base, cursor, remote.start);
+                out.extend(remote.replacement.clone());
+                cursor = remote.end;
+                remote_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    append_base(&mut out, base, cursor, base.len());
+    out
+}
+
+fn changes_overlap_or_same_insertion(left: &LineChange, right: &LineChange) -> bool {
+    let same_insertion =
+        left.start == left.end && right.start == right.end && left.start == right.start;
+    same_insertion || (left.start < right.end && right.start < left.end)
+}
+
+fn append_base(out: &mut Vec<String>, base: &[&str], start: usize, end: usize) {
+    for line in &base[start.min(base.len())..end.min(base.len())] {
+        out.push((*line).to_string());
+    }
+}
+
+fn append_conflict(
+    out: &mut Vec<String>,
+    local_name: &str,
+    local_lines: &[String],
+    remote_name: &str,
+    remote_lines: &[String],
+) {
+    out.push(format!("<<<<<<< {}", local_name));
+    out.extend(local_lines.iter().cloned());
+    out.push("=======".to_string());
+    out.extend(remote_lines.iter().cloned());
+    out.push(format!(">>>>>>> {}", remote_name));
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────
@@ -584,7 +732,21 @@ mod tests {
             ConflictEngine::conflict_filename("report.txt", "Laptop", "2026-05-30T10:00:00Z");
         assert!(name.contains("report"));
         assert!(name.contains("conflict from Laptop"));
+        assert!(!name.contains(':'));
         assert!(name.ends_with(".txt"));
+    }
+
+    #[test]
+    fn test_conflict_filename_uses_basename_and_sanitizes_device() {
+        let name = ConflictEngine::conflict_filename(
+            "nested/report.txt",
+            "Bad/Device:Name",
+            "2026-05-30T10:00:00Z",
+        );
+        assert!(name.starts_with("report "));
+        assert!(name.contains("Bad-Device-Name"));
+        assert!(!name.contains('/'));
+        assert!(!name.contains(':'));
     }
 
     #[test]
@@ -688,6 +850,20 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_conflict_does_not_panic_on_short_dates() {
+        let explanation = ConflictEngine::explain_conflict(
+            &ConflictType::EditEdit,
+            "file.txt",
+            "file.txt",
+            "Laptop",
+            "Phone",
+            "short",
+            "",
+        );
+        assert!(explanation.contains("Два изменения"));
+    }
+
+    #[test]
     fn test_lcs_simple() {
         let base = vec!["a", "b", "c"];
         let modified = vec!["a", "x", "b", "c"];
@@ -715,6 +891,28 @@ mod tests {
             ConflictEngine::text_three_way_merge(base, local, remote, "a.txt", "b.txt").unwrap();
         // Should contain both changes since they're on different paths through LCS
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_text_three_way_merge_takes_remote_when_local_unchanged() {
+        let base = "line1\nline2\nline3";
+        let local = base;
+        let remote = "line1\nremote edit\nline3";
+        let result =
+            ConflictEngine::text_three_way_merge(base, local, remote, "a.txt", "b.txt").unwrap();
+        assert_eq!(result, remote);
+    }
+
+    #[test]
+    fn test_text_three_way_merge_same_line_edits_conflict() {
+        let base = "line1\nline2\nline3";
+        let local = "line1\nlocal edit\nline3";
+        let remote = "line1\nremote edit\nline3";
+        let result =
+            ConflictEngine::text_three_way_merge(base, local, remote, "a.txt", "b.txt").unwrap();
+        assert!(ConflictEngine::has_conflict_markers(&result));
+        assert!(result.contains("local edit"));
+        assert!(result.contains("remote edit"));
     }
 
     #[test]
@@ -776,6 +974,42 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&dest);
         let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn test_create_conflict_copy_preserves_relative_parent_and_is_unique() {
+        let tmp = std::env::temp_dir().join(format!(
+            "s4drive_test_conflict_copy_nested_{}",
+            Uuid::now_v7()
+        ));
+        let nested = tmp.join("docs");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let src = nested.join("report.txt");
+        std::fs::write(&src, b"local").unwrap();
+        let first = ConflictEngine::create_conflict_copy(
+            &src.to_string_lossy(),
+            &tmp.to_string_lossy(),
+            "docs/report.txt",
+            "Device",
+            "2026-05-30T10:00:00Z",
+        )
+        .unwrap();
+        let second = ConflictEngine::create_conflict_copy(
+            &src.to_string_lossy(),
+            &tmp.to_string_lossy(),
+            "docs/report.txt",
+            "Device",
+            "2026-05-30T10:00:00Z",
+        )
+        .unwrap();
+
+        assert_ne!(first, second);
+        assert!(Path::new(&first).parent().unwrap().ends_with("docs"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"local");
+        assert_eq!(std::fs::read(&second).unwrap(), b"local");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
