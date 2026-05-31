@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicegram/nicegram/main/docs/tauri-conf.schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "S4Drive",
   "version": "0.1.0",
   "identifier": "com.s4drive.app",
@@ -10,20 +10,7 @@
     "beforeDevCommand": ""
   },
   "app": {
-    "windows": [
-      {
-        "title": "S4Drive",
-        "label": "main",
-        "width": 500,
-        "height": 600,
-        "minWidth": 380,
-        "minHeight": 400,
-        "resizable": true,
-        "decorations": true,
-        "center": true,
-        "visible": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"
     },
@@ -40,4 +27,3 @@
     ]
   }
 }
-

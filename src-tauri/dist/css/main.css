@@ -388,6 +388,11 @@ body {
   color: #fff;
 }
 .btn-danger:hover { filter: brightness(1.1); }
+.btn-sm {
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
 
 .icon-btn {
   width: 30px;
@@ -568,6 +573,10 @@ body {
   padding: var(--space-sm) 0;
 }
 .setting-row + .setting-row { border-top: 1px solid var(--border-light); }
+.setting-row-stack {
+  align-items: stretch;
+  flex-direction: column;
+}
 .setting-name { font-size: 13px; font-weight: 500; }
 .setting-desc { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 .setting-value { font-size: 13px; color: var(--text-secondary); }
@@ -586,6 +595,17 @@ body {
 }
 .setting-input:focus { outline: none; border-color: var(--accent); }
 .setting-input-sm { width: 80px; text-align: center; }
+.setting-input-xs { width: 58px; text-align: center; }
+.setting-inline-inputs {
+  display: flex;
+  gap: var(--space-sm);
+}
+.setting-textarea {
+  width: 100%;
+  min-height: 74px;
+  resize: vertical;
+  line-height: 1.4;
+}
 .setting-input::placeholder { color: var(--text-muted); }
 
 /* Toggle switch */
@@ -700,6 +720,40 @@ body {
   flex-shrink: 0;
 }
 
+/* ─── Diagnostics ───────────────────────────────────────────── */
+.diagnostic-item {
+  display: flex;
+  gap: var(--space);
+  align-items: flex-start;
+  padding: var(--space-sm) 0;
+  border-bottom: 1px solid var(--border-light);
+}
+.diagnostic-item:last-child { border-bottom: none; }
+.diagnostic-status {
+  width: 64px;
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+  text-transform: uppercase;
+}
+.diagnostic-item.ok .diagnostic-status { color: var(--success); }
+.diagnostic-item.warning .diagnostic-status { color: var(--warning); }
+.diagnostic-item.error .diagnostic-status { color: var(--error); }
+.diagnostic-content { min-width: 0; }
+.diagnostic-name { font-size: 13px; font-weight: 600; }
+.diagnostic-detail {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 /* ─── Responsive & Mobile v1 ────────────────────────────────── */
 
 /* Mobile first: <480px phones */
@@ -728,6 +782,8 @@ body {
   .nav-btn { padding: var(--space-sm) var(--space); font-size: 12px; }
   .search-box { max-width: none; }
   .setting-input { width: 140px; }
+  .setting-textarea { width: 100%; }
+  .setting-row { align-items: flex-start; }
   .file-date { display: none; }
 
   /* Touch-friendly targets */

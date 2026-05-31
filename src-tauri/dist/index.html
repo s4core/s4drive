@@ -31,7 +31,10 @@
       <button class="nav-btn" data-route="files" role="tab" aria-selected="false">Files</button>
       <button class="nav-btn" data-route="transfers" role="tab" aria-selected="false">Transfers</button>
       <button class="nav-btn" data-route="conflicts" role="tab" aria-selected="false">Conflicts</button>
+      <button class="nav-btn" data-route="activity" role="tab" aria-selected="false">Activity</button>
       <button class="nav-btn" data-route="settings" role="tab" aria-selected="false">Settings</button>
+      <button class="nav-btn" data-route="diagnostics" role="tab" aria-selected="false">Diagnostics</button>
+      <button class="nav-btn" data-route="about" role="tab" aria-selected="false">About</button>
     </nav>
 
     <!-- Content area -->
@@ -58,6 +61,18 @@
         </div>
         <div class="section-title">Recent Activity</div>
         <div class="card" id="activityList">
+          <div class="empty-state">
+            <div class="empty-icon">📋</div>
+            <div class="empty-title">No Activity Yet</div>
+            <div class="empty-desc">Sync activity will appear here once you connect a bucket.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== ACTIVITY ===== -->
+      <section class="screen" id="screen-activity" role="tabpanel">
+        <div class="section-title">Recent Activity</div>
+        <div class="card" id="activityScreenList">
           <div class="empty-state">
             <div class="empty-icon">📋</div>
             <div class="empty-title">No Activity Yet</div>
@@ -155,6 +170,20 @@
               <input type="password" class="setting-input" id="inputSecretKey" placeholder="••••••••" value="" />
             </div>
             <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Region</div>
+                <div class="setting-desc">S3 signing region</div>
+              </div>
+              <input type="text" class="setting-input" id="inputRegion" placeholder="us-east-1" value="us-east-1" />
+            </div>
+            <div class="setting-row">
+              <label class="setting-toggle">
+                <span>Use TLS</span>
+                <input type="checkbox" id="inputUseTls" checked />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="setting-row">
               <button class="btn btn-primary" id="btnTestConnection">Test Connection</button>
               <button class="btn btn-outline" id="btnSaveAccount">Save</button>
             </div>
@@ -177,6 +206,37 @@
                 <div class="setting-desc">Check for remote changes every N seconds</div>
               </div>
               <input type="number" class="setting-input setting-input-sm" id="inputPolling" value="30" min="5" max="300" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Bandwidth Limit</div>
+                <div class="setting-desc">KB/s, empty for unlimited</div>
+              </div>
+              <input type="number" class="setting-input setting-input-sm" id="inputBandwidth" min="0" placeholder="0" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Concurrency</div>
+                <div class="setting-desc">Uploads / downloads</div>
+              </div>
+              <div class="setting-inline-inputs">
+                <input type="number" class="setting-input setting-input-xs" id="inputMaxUploads" value="4" min="1" max="16" />
+                <input type="number" class="setting-input setting-input-xs" id="inputMaxDownloads" value="4" min="1" max="16" />
+              </div>
+            </div>
+            <div class="setting-row setting-row-stack">
+              <div class="setting-label">
+                <div class="setting-name">Excludes</div>
+                <div class="setting-desc">One pattern per line</div>
+              </div>
+              <textarea class="setting-input setting-textarea" id="inputExcludes" rows="3" placeholder="node_modules&#10;.DS_Store"></textarea>
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Proxy</div>
+                <div class="setting-desc">Optional HTTP proxy</div>
+              </div>
+              <input type="text" class="setting-input" id="inputProxy" placeholder="http://127.0.0.1:8080" value="" />
             </div>
             <div class="setting-row">
               <label class="setting-toggle">
@@ -216,6 +276,51 @@
                 <div class="setting-desc">Run diagnostics to check system health</div>
               </div>
               <button class="btn btn-outline" id="btnRunDiagnostics">Run Diagnostics</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== DIAGNOSTICS ===== -->
+      <section class="screen" id="screen-diagnostics" role="tabpanel">
+        <div class="section-title">Diagnostics</div>
+        <div class="card" id="diagnosticsList">
+          <div class="empty-state">
+            <div class="empty-icon">🩺</div>
+            <div class="empty-title">No Diagnostics Yet</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== ABOUT ===== -->
+      <section class="screen" id="screen-about" role="tabpanel">
+        <div class="settings-group">
+          <div class="settings-group-title">Version</div>
+          <div class="card settings-card">
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Application</div>
+              </div>
+              <div class="setting-value" id="aboutScreenVersion">0.1.0</div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Core</div>
+              </div>
+              <div class="setting-value" id="aboutCoreVersion">0.1.0</div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Device ID</div>
+              </div>
+              <div class="setting-value setting-value-mono" id="aboutScreenDeviceId">—</div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <div class="setting-name">Updates</div>
+                <div class="setting-desc" id="updateStatus">Not checked</div>
+              </div>
+              <button class="btn btn-outline" id="btnCheckUpdates">Check</button>
             </div>
           </div>
         </div>
