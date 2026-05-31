@@ -78,8 +78,13 @@ impl TransferQueue {
         local_path: &str,
         s3_key: &str,
     ) -> CoreResult<()> {
+        let total_bytes = if direction == TransferDirection::Upload {
+            std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
         self.db
-            .enqueue_transfer(direction.as_str(), file_id, local_path, s3_key)
+            .enqueue_transfer(direction.as_str(), file_id, local_path, s3_key, total_bytes)
     }
 
     /// Get pending upload jobs (up to `limit`).
@@ -104,6 +109,11 @@ impl TransferQueue {
     /// Mark a job as in-progress.
     pub fn mark_in_progress(&self, job_id: i64) -> CoreResult<()> {
         self.db.update_transfer_status(job_id, "in_progress")
+    }
+
+    /// Put a job back into the queued state after a retryable failure.
+    pub fn mark_queued(&self, job_id: i64) -> CoreResult<()> {
+        self.db.update_transfer_status(job_id, "queued")
     }
 
     /// Mark a job as completed.
@@ -148,11 +158,22 @@ impl TransferQueue {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use std::path::PathBuf;
 
     fn test_db() -> LocalDatabase {
         let mut config = Config::default();
         config.core.db_path = ":memory:".to_string();
         LocalDatabase::new(&config).unwrap()
+    }
+
+    fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "s4drive-transfer-{}-{}",
+            uuid::Uuid::now_v7(),
+            name
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
     }
 
     #[test]
@@ -168,6 +189,46 @@ mod tests {
         assert_eq!(pending[0].local_path, "/tmp/test.txt");
         assert_eq!(pending[0].s3_key, "test.txt");
         assert_eq!(pending[0].status, TransferStatus::Queued);
+    }
+
+    #[test]
+    fn test_enqueue_upload_records_total_bytes() {
+        let db = test_db();
+        let queue = TransferQueue::new(&db);
+        let path = temp_file("size.txt", b"hello");
+
+        queue
+            .enqueue_upload("file-size", &path.to_string_lossy(), "size.txt")
+            .unwrap();
+
+        let pending = queue.pending_uploads(10).unwrap();
+        assert_eq!(pending[0].total_bytes, 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_duplicate_enqueue_coalesces_active_job() {
+        let db = test_db();
+        let queue = TransferQueue::new(&db);
+        let first = temp_file("first.txt", b"one");
+        let second = temp_file("second.txt", b"second");
+
+        queue
+            .enqueue_upload("file-dupe", &first.to_string_lossy(), "first.txt")
+            .unwrap();
+        queue
+            .enqueue_upload("file-dupe", &second.to_string_lossy(), "second.txt")
+            .unwrap();
+
+        let pending = queue.pending_uploads(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].local_path, second.to_string_lossy().as_ref());
+        assert_eq!(pending[0].s3_key, "second.txt");
+        assert_eq!(pending[0].total_bytes, 6);
+
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 
     #[test]
@@ -213,6 +274,25 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_queued_after_retryable_failure() {
+        let db = test_db();
+        let queue = TransferQueue::new(&db);
+        queue
+            .enqueue_upload("file-retry", "/tmp/retry.txt", "retry.txt")
+            .unwrap();
+        let job_id = queue.pending_uploads(10).unwrap()[0].id;
+
+        queue.mark_in_progress(job_id).unwrap();
+        assert!(queue.pending_uploads(10).unwrap().is_empty());
+
+        queue.mark_queued(job_id).unwrap();
+        let pending = queue.pending_uploads(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].file_id, "file-retry");
+        assert_eq!(pending[0].status, TransferStatus::Queued);
+    }
+
+    #[test]
     fn test_pending_count() {
         let db = test_db();
         let queue = TransferQueue::new(&db);
@@ -245,5 +325,36 @@ mod tests {
 
         let pending = queue.pending_uploads(10).unwrap();
         assert_eq!(pending.len(), 3);
+    }
+
+    #[test]
+    fn test_in_progress_jobs_recovered_on_database_open() {
+        let dir =
+            std::env::temp_dir().join(format!("s4drive-transfer-db-{}", uuid::Uuid::now_v7()));
+        let db_path = dir.join("queue.sqlite");
+        let mut config = Config::default();
+        config.core.db_path = db_path.to_string_lossy().to_string();
+
+        {
+            let db = LocalDatabase::new(&config).unwrap();
+            let queue = TransferQueue::new(&db);
+            queue
+                .enqueue_upload("recover-file", "/tmp/recover.txt", "recover.txt")
+                .unwrap();
+            let job_id = queue.pending_uploads(10).unwrap()[0].id;
+            queue.mark_in_progress(job_id).unwrap();
+            assert!(queue.pending_uploads(10).unwrap().is_empty());
+        }
+
+        {
+            let db = LocalDatabase::new(&config).unwrap();
+            let queue = TransferQueue::new(&db);
+            let pending = queue.pending_uploads(10).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].file_id, "recover-file");
+            assert_eq!(pending[0].status, TransferStatus::Queued);
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

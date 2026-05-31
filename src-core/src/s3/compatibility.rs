@@ -1,4 +1,75 @@
 use crate::s3::client::S3Adapter;
+use crate::s3::error::classify_error_code;
+use crate::s3::retry::RetryPolicy;
+
+const TEST_PUT_GET: &str = "PUT/GET object";
+const TEST_HEAD: &str = "HEAD object";
+const TEST_DELETE: &str = "DELETE object";
+const TEST_LIST_PREFIX_DELIMITER: &str = "LIST prefix/delimiter";
+const TEST_LIST_PAGINATION: &str = "LIST pagination";
+const TEST_RANGE_GET: &str = "Range GET";
+const TEST_MULTIPART_UPLOAD: &str = "Multipart upload";
+const TEST_MULTIPART_ABORT: &str = "Multipart abort";
+const TEST_CHECKSUM_UPLOAD: &str = "Checksum upload";
+const TEST_IF_NONE_MATCH: &str = "If-None-Match";
+const TEST_IF_MATCH: &str = "If-Match";
+const TEST_CONCURRENT_WRITES: &str = "Concurrent writes";
+const TEST_CONSISTENCY_PUT: &str = "Consistency after PUT";
+const TEST_CONSISTENCY_DELETE: &str = "Consistency after DELETE";
+const TEST_KEY_EDGE_CASES: &str = "Unicode, long paths, case-sensitive keys";
+const TEST_LARGE_FILE: &str = "Large file multipart";
+const TEST_5XX_RETRY: &str = "5xx retry classification";
+const TEST_CLOCK_SKEW: &str = "Clock skew classification";
+
+const LEVEL1_REQUIRED: &[&str] = &[
+    TEST_PUT_GET,
+    TEST_HEAD,
+    TEST_DELETE,
+    TEST_LIST_PREFIX_DELIMITER,
+    TEST_LIST_PAGINATION,
+    TEST_RANGE_GET,
+    TEST_KEY_EDGE_CASES,
+];
+
+const LEVEL2_REQUIRED: &[&str] = &[
+    TEST_MULTIPART_UPLOAD,
+    TEST_MULTIPART_ABORT,
+    TEST_CHECKSUM_UPLOAD,
+    TEST_IF_NONE_MATCH,
+    TEST_IF_MATCH,
+    TEST_CONCURRENT_WRITES,
+    TEST_CONSISTENCY_PUT,
+    TEST_CONSISTENCY_DELETE,
+    TEST_LARGE_FILE,
+    TEST_5XX_RETRY,
+    TEST_CLOCK_SKEW,
+];
+
+/// Compatibility suite runtime options.
+#[derive(Debug, Clone)]
+pub struct CompatibilityOptions {
+    pub large_file_bytes: usize,
+}
+
+impl Default for CompatibilityOptions {
+    fn default() -> Self {
+        Self {
+            large_file_bytes: 100 * 1024 * 1024,
+        }
+    }
+}
+
+impl CompatibilityOptions {
+    pub fn from_env() -> Self {
+        let mut options = Self::default();
+        if let Ok(value) = std::env::var("S4DRIVE_COMPAT_LARGE_BYTES") {
+            if let Ok(bytes) = value.parse::<usize>() {
+                options.large_file_bytes = bytes.max(6 * 1024 * 1024);
+            }
+        }
+        options
+    }
+}
 
 /// Result of a single compatibility test.
 #[derive(Debug, Clone)]
@@ -15,6 +86,12 @@ pub struct CompatibilityReport {
     pub tests_passed: Vec<String>,
     pub tests_failed: Vec<String>,
     pub details: Vec<TestResult>,
+}
+
+impl CompatibilityReport {
+    pub fn is_level2_supported(&self) -> bool {
+        self.level >= 2
+    }
 }
 
 impl std::fmt::Display for CompatibilityReport {
@@ -65,6 +142,14 @@ impl S3Adapter {
     /// Run the full S4Drive compatibility test suite.
     /// Tests are ordered by level: basic → conditional writes → advanced.
     pub async fn run_compatibility_test(&self) -> CompatibilityReport {
+        self.run_compatibility_test_with_options(CompatibilityOptions::from_env())
+            .await
+    }
+
+    pub async fn run_compatibility_test_with_options(
+        &self,
+        options: CompatibilityOptions,
+    ) -> CompatibilityReport {
         let mut tests: Vec<TestResult> = Vec::new();
         let prefix = format!(".s4drive-compat-test-{}/", uuid::Uuid::now_v7());
 
@@ -73,10 +158,10 @@ impl S3Adapter {
         tests.push(self.test_basic_put_get(&prefix).await);
         tests.push(self.test_head_object(&prefix).await);
         tests.push(self.test_delete_object(&prefix).await);
-        tests.push(self.test_list_objects(&prefix).await);
+        tests.push(self.test_list_prefix_delimiter(&prefix).await);
         tests.push(self.test_list_pagination(&prefix).await);
         tests.push(self.test_range_get(&prefix).await);
-        tests.push(self.test_unicode_keys(&prefix).await);
+        tests.push(self.test_key_edge_cases(&prefix).await);
 
         // ─── Level 2: Safe Sync ─────────────────────────────────────
 
@@ -87,31 +172,24 @@ impl S3Adapter {
         tests.push(self.test_consistency_after_delete(&prefix).await);
         tests.push(self.test_multipart_upload(&prefix).await);
         tests.push(self.test_multipart_abort(&prefix).await);
-
-        // ─── Level 3: Versioned Sync ────────────────────────────────
-        // (optional — checked via capability, not hard requirement)
+        tests.push(self.test_checksum_upload(&prefix).await);
+        tests.push(
+            self.test_large_file_multipart(&prefix, options.large_file_bytes)
+                .await,
+        );
+        tests.push(test_5xx_retry_classification());
+        tests.push(test_clock_skew_classification());
 
         // ─── Cleanup ────────────────────────────────────────────────
         self.cleanup_test_objects(&prefix).await;
 
-        // Calculate level
+        let level = calculate_level(&tests);
         let (passed, failed): (Vec<_>, Vec<_>) = tests.iter().cloned().partition(|t| t.passed);
-
-        let passed_names: Vec<String> = passed.iter().map(|t| t.name.clone()).collect();
-        let failed_names: Vec<String> = failed.iter().map(|t| t.name.clone()).collect();
-
-        let level = if failed_names.is_empty() {
-            2 // At least safe sync
-        } else if passed.len() >= 7 {
-            1 // Basic storage
-        } else {
-            0 // Not supported
-        };
 
         CompatibilityReport {
             level,
-            tests_passed: passed_names,
-            tests_failed: failed_names,
+            tests_passed: passed.iter().map(|t| t.name.clone()).collect(),
+            tests_failed: failed.iter().map(|t| t.name.clone()).collect(),
             details: tests,
         }
     }
@@ -124,18 +202,18 @@ impl S3Adapter {
 
         match self.put_object(&key, data.clone()).await {
             Ok(_) => match self.get_object(&key).await {
-                Ok(got) if got == data => TestResult::ok("PUT/GET object", "data matches"),
+                Ok(got) if got == data => TestResult::ok(TEST_PUT_GET, "data matches"),
                 Ok(got) => TestResult::fail(
-                    "PUT/GET object",
+                    TEST_PUT_GET,
                     &format!(
                         "data mismatch: got {} bytes, expected {}",
                         got.len(),
                         data.len()
                     ),
                 ),
-                Err(e) => TestResult::fail("GET object", &e.to_string()),
+                Err(e) => TestResult::fail(TEST_PUT_GET, &e.to_string()),
             },
-            Err(e) => TestResult::fail("PUT object", &e.to_string()),
+            Err(e) => TestResult::fail(TEST_PUT_GET, &e.to_string()),
         }
     }
 
@@ -144,21 +222,21 @@ impl S3Adapter {
         let data = b"head test data".to_vec();
 
         if let Err(e) = self.put_object(&key, data).await {
-            return TestResult::fail("HEAD object (setup)", &e.to_string());
+            return TestResult::fail(TEST_HEAD, &format!("setup failed: {}", e));
         }
 
         match self.head_object(&key).await {
             Ok(meta) => {
                 if meta.size > 0 && !meta.etag.is_empty() {
                     TestResult::ok(
-                        "HEAD object",
+                        TEST_HEAD,
                         &format!("size={}, etag={}", meta.size, meta.etag),
                     )
                 } else {
-                    TestResult::fail("HEAD object", "empty size or etag")
+                    TestResult::fail(TEST_HEAD, "empty size or etag")
                 }
             }
-            Err(e) => TestResult::fail("HEAD object", &e.to_string()),
+            Err(e) => TestResult::fail(TEST_HEAD, &e.to_string()),
         }
     }
 
@@ -167,66 +245,111 @@ impl S3Adapter {
         let data = b"to be deleted".to_vec();
 
         if let Err(e) = self.put_object(&key, data).await {
-            return TestResult::fail("DELETE object (setup)", &e.to_string());
+            return TestResult::fail(TEST_DELETE, &format!("setup failed: {}", e));
         }
 
         if let Err(e) = self.delete_object(&key).await {
-            return TestResult::fail("DELETE object", &e.to_string());
+            return TestResult::fail(TEST_DELETE, &e.to_string());
         }
 
-        // Verify it's gone
         match self.get_object(&key).await {
-            Ok(_) => TestResult::fail("DELETE object", "object still exists after delete"),
-            Err(_) => TestResult::ok("DELETE object", "object properly removed"),
+            Ok(_) => TestResult::fail(TEST_DELETE, "object still exists after delete"),
+            Err(_) => TestResult::ok(TEST_DELETE, "object properly removed"),
         }
     }
 
-    async fn test_list_objects(&self, prefix: &str) -> TestResult {
-        let keys = [
-            format!("{}list/a.txt", prefix),
-            format!("{}list/b.txt", prefix),
-        ];
-        for k in &keys {
-            if let Err(e) = self.put_object(k, b"data".to_vec()).await {
-                return TestResult::fail("LIST objects (setup)", &e.to_string());
+    async fn test_list_prefix_delimiter(&self, prefix: &str) -> TestResult {
+        let list_prefix = format!("{}folders/", prefix);
+        let root_key = format!("{}root.txt", list_prefix);
+        let nested_key = format!("{}nested/file.txt", list_prefix);
+        let outside_key = format!("{}outside/file.txt", prefix);
+
+        for key in [&root_key, &nested_key, &outside_key] {
+            if let Err(e) = self.put_object(key, b"data".to_vec()).await {
+                return TestResult::fail(
+                    TEST_LIST_PREFIX_DELIMITER,
+                    &format!("setup failed for '{}': {}", key, e),
+                );
             }
         }
 
-        match self.list_objects(&format!("{}list/", prefix)).await {
-            Ok(listed) => {
-                if listed.len() >= 2 {
-                    TestResult::ok("LIST objects", &format!("found {} objects", listed.len()))
+        match self
+            .list_objects_page(&list_prefix, Some("/"), 1000, None)
+            .await
+        {
+            Ok(page) => {
+                let nested_prefix = format!("{}nested/", list_prefix);
+                if page.keys.contains(&root_key)
+                    && !page.keys.contains(&nested_key)
+                    && page.common_prefixes.contains(&nested_prefix)
+                {
+                    TestResult::ok(
+                        TEST_LIST_PREFIX_DELIMITER,
+                        "delimiter returned immediate object and nested common prefix",
+                    )
                 } else {
                     TestResult::fail(
-                        "LIST objects",
-                        &format!("expected >=2, got {}", listed.len()),
+                        TEST_LIST_PREFIX_DELIMITER,
+                        &format!(
+                            "unexpected keys={:?}, common_prefixes={:?}",
+                            page.keys, page.common_prefixes
+                        ),
                     )
                 }
             }
-            Err(e) => TestResult::fail("LIST objects", &e.to_string()),
+            Err(e) => TestResult::fail(TEST_LIST_PREFIX_DELIMITER, &e.to_string()),
         }
     }
 
     async fn test_list_pagination(&self, prefix: &str) -> TestResult {
-        // Create enough objects to force pagination
         let page_prefix = format!("{}page/", prefix);
-        for i in 0..5 {
-            let key = format!("{}file{}", page_prefix, i);
-            if let Err(e) = self.put_object(&key, b"x".repeat(10).to_vec()).await {
-                return TestResult::fail("LIST pagination (setup)", &e.to_string());
+        let expected: Vec<String> = (0..5)
+            .map(|i| format!("{}file-{:02}.txt", page_prefix, i))
+            .collect();
+
+        for key in &expected {
+            if let Err(e) = self.put_object(key, b"x".repeat(10)).await {
+                return TestResult::fail(TEST_LIST_PAGINATION, &format!("setup failed: {}", e));
             }
         }
 
-        match self.list_objects(&page_prefix).await {
-            Ok(listed) if listed.len() >= 5 => TestResult::ok(
-                "LIST pagination",
-                &format!("found {} objects", listed.len()),
-            ),
-            Ok(listed) => TestResult::fail(
-                "LIST pagination",
-                &format!("expected >=5, got {}", listed.len()),
-            ),
-            Err(e) => TestResult::fail("LIST pagination", &e.to_string()),
+        let first = match self.list_objects_page(&page_prefix, None, 2, None).await {
+            Ok(page) => page,
+            Err(e) => return TestResult::fail(TEST_LIST_PAGINATION, &e.to_string()),
+        };
+
+        if !first.is_truncated || first.next_continuation_token.is_none() {
+            return TestResult::fail(
+                TEST_LIST_PAGINATION,
+                "first page was not truncated or had no ContinuationToken",
+            );
+        }
+
+        let second = match self
+            .list_objects_page(
+                &page_prefix,
+                None,
+                1000,
+                first.next_continuation_token.as_deref(),
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(e) => return TestResult::fail(TEST_LIST_PAGINATION, &e.to_string()),
+        };
+
+        let mut listed = first.keys;
+        listed.extend(second.keys);
+        if expected.iter().all(|key| listed.contains(key)) {
+            TestResult::ok(
+                TEST_LIST_PAGINATION,
+                &format!("ContinuationToken returned {} objects", listed.len()),
+            )
+        } else {
+            TestResult::fail(
+                TEST_LIST_PAGINATION,
+                &format!("expected {:?}, got {:?}", expected, listed),
+            )
         }
     }
 
@@ -235,33 +358,63 @@ impl S3Adapter {
         let data = b"0123456789ABCDEF".to_vec();
 
         if let Err(e) = self.put_object(&key, data).await {
-            return TestResult::fail("Range GET (setup)", &e.to_string());
+            return TestResult::fail(TEST_RANGE_GET, &format!("setup failed: {}", e));
         }
 
         match self.get_object_range(&key, "bytes=0-4").await {
-            Ok(part) if part == b"01234" => TestResult::ok("Range GET", "first 5 bytes match"),
+            Ok(part) if part == b"01234" => TestResult::ok(TEST_RANGE_GET, "first 5 bytes match"),
             Ok(part) => TestResult::fail(
-                "Range GET",
+                TEST_RANGE_GET,
                 &format!("expected '01234', got {:?}", String::from_utf8_lossy(&part)),
             ),
-            Err(e) => TestResult::fail("Range GET", &e.to_string()),
+            Err(e) => TestResult::fail(TEST_RANGE_GET, &e.to_string()),
         }
     }
 
-    async fn test_unicode_keys(&self, prefix: &str) -> TestResult {
-        // Unicode filename
-        let key = format!("{}имя-файла-🇷🇺.txt", prefix);
-        let data = b"unicode test".to_vec();
+    async fn test_key_edge_cases(&self, prefix: &str) -> TestResult {
+        let long_name = "a".repeat(220);
+        let keys = [
+            format!("{}unicode/文件-имя-файла.txt", prefix),
+            format!("{}case/File.txt", prefix),
+            format!("{}case/file.txt", prefix),
+            format!("{}special/space #+;=@[].txt", prefix),
+            format!("{}long/{}/file.txt", prefix, long_name),
+        ];
 
-        match self.put_object(&key, data.clone()).await {
-            Ok(_) => match self.get_object(&key).await {
-                Ok(got) if got == data => {
-                    TestResult::ok("Unicode keys", "put/get with unicode key works")
+        for key in &keys {
+            if let Err(e) = self.put_object(key, b"edge case".to_vec()).await {
+                return TestResult::fail(
+                    TEST_KEY_EDGE_CASES,
+                    &format!("put failed for '{}': {}", key, e),
+                );
+            }
+            match self.get_object(key).await {
+                Ok(got) if got == b"edge case" => {}
+                Ok(got) => {
+                    return TestResult::fail(
+                        TEST_KEY_EDGE_CASES,
+                        &format!("data mismatch for '{}': {} bytes", key, got.len()),
+                    )
                 }
-                Ok(_) => TestResult::fail("Unicode keys", "data mismatch"),
-                Err(e) => TestResult::fail("Unicode keys (get)", &e.to_string()),
-            },
-            Err(e) => TestResult::fail("Unicode keys (put)", &e.to_string()),
+                Err(e) => {
+                    return TestResult::fail(
+                        TEST_KEY_EDGE_CASES,
+                        &format!("get failed for '{}': {}", key, e),
+                    )
+                }
+            }
+        }
+
+        match self.list_objects(&format!("{}case/", prefix)).await {
+            Ok(listed) if listed.contains(&keys[1]) && listed.contains(&keys[2]) => TestResult::ok(
+                TEST_KEY_EDGE_CASES,
+                "unicode, long, special, and case keys work",
+            ),
+            Ok(listed) => TestResult::fail(
+                TEST_KEY_EDGE_CASES,
+                &format!("case-sensitive keys missing from list: {:?}", listed),
+            ),
+            Err(e) => TestResult::fail(TEST_KEY_EDGE_CASES, &e.to_string()),
         }
     }
 
@@ -269,86 +422,70 @@ impl S3Adapter {
         let key = format!("{}if-none-match", prefix);
         let data = b"first version".to_vec();
 
-        // First write should succeed
         match self.put_if_not_exists(&key, data).await {
-            Ok(true) => {} // Created successfully
-            Ok(false) => {
-                return TestResult::fail("If-None-Match", "first write returned 'already exists'")
-            }
-            Err(e) => return TestResult::fail("If-None-Match (first)", &e.to_string()),
+            Ok(true) => {}
+            Ok(false) => return TestResult::fail(TEST_IF_NONE_MATCH, "first write was blocked"),
+            Err(e) => return TestResult::fail(TEST_IF_NONE_MATCH, &e.to_string()),
         }
 
-        // Second write should be rejected (412)
         match self.put_if_not_exists(&key, b"second".to_vec()).await {
-            Ok(false) => TestResult::ok("If-None-Match", "second write correctly blocked (412)"),
-            Ok(true) => TestResult::fail(
-                "If-None-Match",
-                "second write succeeded (should have been blocked)",
-            ),
-            Err(e) => TestResult::fail("If-None-Match", &e.to_string()),
+            Ok(false) => TestResult::ok(TEST_IF_NONE_MATCH, "second write correctly blocked"),
+            Ok(true) => TestResult::fail(TEST_IF_NONE_MATCH, "second write overwrote object"),
+            Err(e) => TestResult::fail(TEST_IF_NONE_MATCH, &e.to_string()),
         }
     }
 
     async fn test_conditional_if_match(&self, prefix: &str) -> TestResult {
         let key = format!("{}if-match", prefix);
 
-        // Create initial object
         if let Err(e) = self.put_object(&key, b"v1".to_vec()).await {
-            return TestResult::fail("If-Match (setup)", &e.to_string());
+            return TestResult::fail(TEST_IF_MATCH, &format!("setup failed: {}", e));
         }
 
-        // Get the etag
         let meta = match self.head_object(&key).await {
             Ok(m) => m,
-            Err(e) => return TestResult::fail("If-Match (head)", &e.to_string()),
+            Err(e) => return TestResult::fail(TEST_IF_MATCH, &e.to_string()),
         };
 
-        // Update with correct etag should succeed
         match self.put_if_match(&key, b"v2".to_vec(), &meta.etag).await {
-            Ok(true) => {} // Updated correctly
-            Ok(false) => {
-                return TestResult::fail("If-Match", "update with correct etag was rejected")
-            }
-            Err(e) => return TestResult::fail("If-Match (update)", &e.to_string()),
+            Ok(true) => {}
+            Ok(false) => return TestResult::fail(TEST_IF_MATCH, "valid ETag was rejected"),
+            Err(e) => return TestResult::fail(TEST_IF_MATCH, &e.to_string()),
         }
 
-        // Update with wrong etag should be rejected (412)
         match self.put_if_match(&key, b"v3".to_vec(), "wrong-etag").await {
-            Ok(false) => TestResult::ok("If-Match", "wrong etag correctly rejected, CAS works"),
-            Ok(true) => TestResult::fail("If-Match", "wrong etag was accepted (CAS broken)"),
-            Err(e) => TestResult::fail("If-Match", &e.to_string()),
+            Ok(false) => TestResult::ok(TEST_IF_MATCH, "wrong ETag correctly rejected"),
+            Ok(true) => TestResult::fail(TEST_IF_MATCH, "wrong ETag was accepted"),
+            Err(e) => TestResult::fail(TEST_IF_MATCH, &e.to_string()),
         }
     }
 
     async fn test_concurrent_writes(&self, prefix: &str) -> TestResult {
         let key = format!("{}concurrent", prefix);
 
-        // Two sequential writes simulating concurrent CAS
         if let Err(e) = self.put_object(&key, b"base".to_vec()).await {
-            return TestResult::fail("Concurrent writes (setup)", &e.to_string());
+            return TestResult::fail(TEST_CONCURRENT_WRITES, &format!("setup failed: {}", e));
         }
 
         let meta = match self.head_object(&key).await {
             Ok(m) => m,
-            Err(e) => return TestResult::fail("Concurrent writes (head)", &e.to_string()),
+            Err(e) => return TestResult::fail(TEST_CONCURRENT_WRITES, &e.to_string()),
         };
 
-        // CAS with correct etag = success
-        if let Err(e) = self
-            .put_if_match(&key, b"writer-a".to_vec(), &meta.etag)
-            .await
-        {
-            return TestResult::fail("Concurrent writes (CAS correct)", &e.to_string());
-        }
+        let writer_a = self.put_if_match(&key, b"writer-a".to_vec(), &meta.etag);
+        let writer_b = self.put_if_match(&key, b"writer-b".to_vec(), &meta.etag);
 
-        // CAS with stale etag = conflict
-        match self
-            .put_if_match(&key, b"writer-b".to_vec(), &meta.etag)
-            .await
-        {
-            Ok(false) => TestResult::ok("Concurrent writes", "stale etag correctly rejected (412)"),
-            Ok(true) => TestResult::fail("Concurrent writes", "stale etag was accepted"),
-            Err(e) => TestResult::fail("Concurrent writes", &e.to_string()),
+        match tokio::join!(writer_a, writer_b) {
+            (Ok(true), Ok(false)) | (Ok(false), Ok(true)) => {
+                TestResult::ok(TEST_CONCURRENT_WRITES, "one write won and one got 412")
+            }
+            (a, b) => TestResult::fail(
+                TEST_CONCURRENT_WRITES,
+                &format!(
+                    "expected exactly one success, got left={:?}, right={:?}",
+                    a, b
+                ),
+            ),
         }
     }
 
@@ -357,22 +494,18 @@ impl S3Adapter {
         let data = b"consistency check".to_vec();
 
         if let Err(e) = self.put_object(&key, data.clone()).await {
-            return TestResult::fail("Consistency after PUT (write)", &e.to_string());
+            return TestResult::fail(TEST_CONSISTENCY_PUT, &e.to_string());
         }
 
-        // Read immediately — should get the data
         match self.get_object(&key).await {
             Ok(got) if got == data => {
-                TestResult::ok("Consistency after PUT", "read-after-write consistent")
+                TestResult::ok(TEST_CONSISTENCY_PUT, "read-after-write consistent")
             }
             Ok(got) => TestResult::fail(
-                "Consistency after PUT",
+                TEST_CONSISTENCY_PUT,
                 &format!("data mismatch: got {} bytes", got.len()),
             ),
-            Err(e) => TestResult::fail(
-                "Consistency after PUT",
-                &format!("read-after-write failed: {}", e),
-            ),
+            Err(e) => TestResult::fail(TEST_CONSISTENCY_PUT, &e.to_string()),
         }
     }
 
@@ -380,65 +513,103 @@ impl S3Adapter {
         let key = format!("{}consistency-delete", prefix);
 
         if let Err(e) = self.put_object(&key, b"temp".to_vec()).await {
-            return TestResult::fail("Consistency after DELETE (setup)", &e.to_string());
+            return TestResult::fail(TEST_CONSISTENCY_DELETE, &format!("setup failed: {}", e));
         }
 
         if let Err(e) = self.delete_object(&key).await {
-            return TestResult::fail("Consistency after DELETE (delete)", &e.to_string());
+            return TestResult::fail(TEST_CONSISTENCY_DELETE, &e.to_string());
         }
 
-        // Read immediately — should 404
         match self.head_object(&key).await {
-            Ok(_) => TestResult::fail(
-                "Consistency after DELETE",
-                "object still exists after delete",
-            ),
-            Err(_) => TestResult::ok("Consistency after DELETE", "read-after-delete properly 404"),
+            Ok(_) => TestResult::fail(TEST_CONSISTENCY_DELETE, "object still exists after delete"),
+            Err(_) => TestResult::ok(TEST_CONSISTENCY_DELETE, "read-after-delete returned 404"),
         }
     }
 
     async fn test_multipart_upload(&self, prefix: &str) -> TestResult {
         let key = format!("{}multipart", prefix);
-        // 6 MB to trigger multipart (> 5 MB part size)
         let data = vec![0xABu8; 6 * 1024 * 1024];
 
         match self.multipart_upload(&key, data.clone()).await {
             Ok(etag) => match self.get_object(&key).await {
-                Ok(got) if got.len() == data.len() => TestResult::ok(
-                    "Multipart upload",
+                Ok(got) if got == data => TestResult::ok(
+                    TEST_MULTIPART_UPLOAD,
                     &format!("{} bytes via multipart, etag={}", got.len(), etag),
                 ),
                 Ok(got) => TestResult::fail(
-                    "Multipart upload",
-                    &format!(
-                        "size mismatch: uploaded {} bytes, got {}",
-                        data.len(),
-                        got.len()
-                    ),
+                    TEST_MULTIPART_UPLOAD,
+                    &format!("uploaded {} bytes, got {}", data.len(), got.len()),
                 ),
-                Err(e) => TestResult::fail("Multipart upload (readback)", &e.to_string()),
+                Err(e) => TestResult::fail(TEST_MULTIPART_UPLOAD, &e.to_string()),
             },
-            Err(e) => TestResult::fail("Multipart upload", &e.to_string()),
+            Err(e) => TestResult::fail(TEST_MULTIPART_UPLOAD, &e.to_string()),
         }
     }
 
     async fn test_multipart_abort(&self, prefix: &str) -> TestResult {
         let key = format!("{}multipart-abort", prefix);
+        let upload = match self.create_multipart_upload(&key).await {
+            Ok(upload) => upload,
+            Err(e) => return TestResult::fail(TEST_MULTIPART_ABORT, &e.to_string()),
+        };
 
-        // Initiate multipart upload — use create_multipart_upload for proper test
-        // For now, just create and delete as a basic check
-        if let Err(e) = self.put_object(&key, b"test".to_vec()).await {
-            return TestResult::fail("Multipart abort (setup)", &e.to_string());
+        if let Err(e) = self
+            .upload_multipart_part(&key, &upload.upload_id, 1, vec![0xCD; 5 * 1024 * 1024])
+            .await
+        {
+            let _ = self.abort_multipart_upload(&key, &upload.upload_id).await;
+            return TestResult::fail(TEST_MULTIPART_ABORT, &format!("part upload failed: {}", e));
         }
 
-        match self.delete_object(&key).await {
-            Ok(_) => TestResult::ok("Multipart abort", "object cleanup works"),
-            Err(e) => TestResult::fail("Multipart abort (cleanup)", &e.to_string()),
+        match self.abort_multipart_upload(&key, &upload.upload_id).await {
+            Ok(()) => match self.head_object(&key).await {
+                Ok(_) => TestResult::fail(TEST_MULTIPART_ABORT, "aborted upload created object"),
+                Err(_) => TestResult::ok(TEST_MULTIPART_ABORT, "multipart upload aborted cleanly"),
+            },
+            Err(e) => TestResult::fail(TEST_MULTIPART_ABORT, &e.to_string()),
+        }
+    }
+
+    async fn test_checksum_upload(&self, prefix: &str) -> TestResult {
+        let key = format!("{}checksum", prefix);
+        let data = b"checksum validated upload".to_vec();
+
+        match self.put_object_with_checksum(&key, data.clone()).await {
+            Ok(_) => match self.get_object(&key).await {
+                Ok(got) if got == data => {
+                    TestResult::ok(TEST_CHECKSUM_UPLOAD, "Content-MD5 upload validated")
+                }
+                Ok(got) => TestResult::fail(
+                    TEST_CHECKSUM_UPLOAD,
+                    &format!("data mismatch: got {} bytes", got.len()),
+                ),
+                Err(e) => TestResult::fail(TEST_CHECKSUM_UPLOAD, &e.to_string()),
+            },
+            Err(e) => TestResult::fail(TEST_CHECKSUM_UPLOAD, &e.to_string()),
+        }
+    }
+
+    async fn test_large_file_multipart(&self, prefix: &str, bytes: usize) -> TestResult {
+        let key = format!("{}large-multipart", prefix);
+        let data = vec![0x5Au8; bytes];
+
+        match self.multipart_upload(&key, data.clone()).await {
+            Ok(_) => match self.head_object(&key).await {
+                Ok(meta) if meta.size == bytes as u64 => TestResult::ok(
+                    TEST_LARGE_FILE,
+                    &format!("{} bytes uploaded via multipart", bytes),
+                ),
+                Ok(meta) => TestResult::fail(
+                    TEST_LARGE_FILE,
+                    &format!("expected {} bytes, head reported {}", bytes, meta.size),
+                ),
+                Err(e) => TestResult::fail(TEST_LARGE_FILE, &e.to_string()),
+            },
+            Err(e) => TestResult::fail(TEST_LARGE_FILE, &e.to_string()),
         }
     }
 
     async fn cleanup_test_objects(&self, prefix: &str) {
-        // List all test objects and delete them
         if let Ok(keys) = self.list_objects(prefix).await {
             for key in keys {
                 let _ = self.delete_object(&key).await;
@@ -449,7 +620,6 @@ impl S3Adapter {
 
 // ─── Helper impls ──────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 impl TestResult {
     fn ok(name: &str, details: &str) -> Self {
         Self {
@@ -466,12 +636,78 @@ impl TestResult {
             details: details.to_string(),
         }
     }
+}
 
-    fn skip(name: &str, reason: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            passed: true, // skip = not a failure
-            details: format!("[SKIP] {}", reason),
-        }
+fn test_5xx_retry_classification() -> TestResult {
+    let classified = classify_error_code("InternalError", 500);
+    let policy = RetryPolicy::default();
+    let core_error = crate::error::CoreError::S3("HTTP 500 InternalError".into());
+
+    if classified.is_retryable && policy.should_retry(&core_error, 0) {
+        TestResult::ok(TEST_5XX_RETRY, "5xx errors are retryable")
+    } else {
+        TestResult::fail(TEST_5XX_RETRY, "5xx error was not classified as retryable")
+    }
+}
+
+fn test_clock_skew_classification() -> TestResult {
+    let classified = classify_error_code("RequestTimeTooSkewed", 403);
+    if classified.message.contains("Clock skew") && !classified.is_retryable {
+        TestResult::ok(
+            TEST_CLOCK_SKEW,
+            "clock skew produces a human-readable error",
+        )
+    } else {
+        TestResult::fail(
+            TEST_CLOCK_SKEW,
+            &format!("unexpected classification: {:?}", classified),
+        )
+    }
+}
+
+fn calculate_level(tests: &[TestResult]) -> u32 {
+    let level1 = LEVEL1_REQUIRED.iter().all(|name| test_passed(tests, name));
+    let level2 = level1 && LEVEL2_REQUIRED.iter().all(|name| test_passed(tests, name));
+
+    if level2 {
+        2
+    } else if level1 {
+        1
+    } else {
+        0
+    }
+}
+
+fn test_passed(tests: &[TestResult], name: &str) -> bool {
+    tests.iter().any(|test| test.name == name && test.passed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_requires_all_level1_tests() {
+        let mut results: Vec<TestResult> = LEVEL1_REQUIRED
+            .iter()
+            .map(|name| TestResult::ok(name, "ok"))
+            .collect();
+        assert_eq!(calculate_level(&results), 1);
+
+        results.retain(|result| result.name != TEST_RANGE_GET);
+        assert_eq!(calculate_level(&results), 0);
+    }
+
+    #[test]
+    fn level2_requires_safe_sync_tests() {
+        let mut results: Vec<TestResult> = LEVEL1_REQUIRED
+            .iter()
+            .chain(LEVEL2_REQUIRED.iter())
+            .map(|name| TestResult::ok(name, "ok"))
+            .collect();
+        assert_eq!(calculate_level(&results), 2);
+
+        results.retain(|result| result.name != TEST_IF_MATCH);
+        assert_eq!(calculate_level(&results), 1);
     }
 }

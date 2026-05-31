@@ -44,7 +44,8 @@ impl<'a> FileTree<'a> {
             .map_err(|e| CoreError::Protocol(format!("deserialize entry: {}", e)))
     }
 
-    /// Удалить запись (мягкое удаление — tombstone).
+    /// Удалить запись из materialized tree.
+    /// Tombstone creation is handled by `TombstoneManager`.
     pub async fn delete_entry(&self, file_id: &FileId) -> CoreResult<()> {
         let key = Self::entry_key(file_id);
         self.s3.delete_object(&key).await
@@ -74,7 +75,7 @@ impl<'a> FileTree<'a> {
 
 /// Tombstone Manager — запись, чтение и GC tombstones.
 ///
-/// Tombstones хранятся в `.s4drive/meta/tombstones/{file_id}.json`.
+/// Tombstones хранятся в `.s4drive/trash/tombstones/{file_id}.json`.
 pub struct TombstoneManager<'a> {
     s3: &'a S3Adapter,
 }
@@ -85,11 +86,11 @@ impl<'a> TombstoneManager<'a> {
     }
 
     fn tombstone_key(file_id: &FileId) -> String {
-        format!(".s4drive/meta/tombstones/{}.json", file_id)
+        Serializer::tombstone_key(&file_id.to_string())
     }
 
     fn tombstone_prefix() -> String {
-        ".s4drive/meta/tombstones/".to_string()
+        Serializer::tombstone_prefix()
     }
 
     /// Создать tombstone для удалённого файла.
@@ -144,7 +145,7 @@ impl<'a> TombstoneManager<'a> {
         let ids: Vec<FileId> = keys
             .iter()
             .filter_map(|k| {
-                k.strip_prefix(".s4drive/meta/tombstones/")
+                k.strip_prefix(".s4drive/trash/tombstones/")
                     .and_then(|s| s.strip_suffix(".json"))
                     .and_then(|s| uuid::Uuid::parse_str(s).ok())
             })
@@ -203,7 +204,7 @@ mod tests {
         let key = TombstoneManager::tombstone_key(&file_id);
         assert_eq!(
             key,
-            ".s4drive/meta/tombstones/550e8400-e29b-41d4-a716-446655440000.json"
+            ".s4drive/trash/tombstones/550e8400-e29b-41d4-a716-446655440000.json"
         );
     }
 }

@@ -443,7 +443,7 @@ async fn run_check(endpoint: &str, bucket: &str, access_key: &str, secret_key: &
     println!("{}", report);
 
     println!("╔══════════════════════════════════════════════╗");
-    if report.level >= 2 {
+    if report.is_level2_supported() {
         println!(
             "║   ✅ Level {}: {}                         ",
             report.level,
@@ -458,6 +458,11 @@ async fn run_check(endpoint: &str, bucket: &str, access_key: &str, secret_key: &
     }
     println!("╚══════════════════════════════════════════════╝");
     println!();
+
+    if !report.is_level2_supported() {
+        println!("  This bucket is below S4Drive Level 2 and will be rejected for sync.");
+        std::process::exit(2);
+    }
 }
 
 // ─── Init Bucket ─────────────────────────────────────────────────────
@@ -496,6 +501,13 @@ async fn run_init_bucket(
         return;
     }
     println!("  ✓ Bucket accessible");
+
+    if let Err(e) = adapter.verify_level2_prerequisites().await {
+        println!("  ✗ {}", e);
+        println!("  Run 's4drive check' for the full compatibility report.");
+        return;
+    }
+    println!("  ✓ S3 Level 2 prerequisites OK");
 
     let device_id = uuid::Uuid::now_v7();
     let engine = MetadataEngine::new(adapter, device_id);

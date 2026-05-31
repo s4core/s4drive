@@ -56,6 +56,22 @@ impl Serializer {
         ".s4drive/system/descriptor.json".to_string()
     }
 
+    pub fn schema_migration_key(version: u32) -> String {
+        format!(".s4drive/system/schema_migrations/{:04}.json", version)
+    }
+
+    pub fn device_registration_key(device_id: &str) -> String {
+        format!(".s4drive/devices/{}/registration.json", device_id)
+    }
+
+    pub fn device_capabilities_key(device_id: &str) -> String {
+        format!(".s4drive/devices/{}/capabilities.json", device_id)
+    }
+
+    pub fn device_registry_key() -> String {
+        ".s4drive/devices/registry.json".to_string()
+    }
+
     pub fn op_key(op_id: &str) -> String {
         format!(".s4drive/meta/ops/{}.json", op_id)
     }
@@ -64,13 +80,36 @@ impl Serializer {
         ".s4drive/meta/heads/current".to_string()
     }
 
+    pub fn ops_tail_key() -> String {
+        ".s4drive/meta/heads/ops_tail".to_string()
+    }
+
     pub fn snapshot_key(seq_num: u64) -> String {
         format!(".s4drive/meta/snapshots/{:020}/tree.json", seq_num)
     }
 
+    pub fn snapshot_metadata_key(seq_num: u64) -> String {
+        format!(".s4drive/meta/snapshots/{:020}/metadata.json", seq_num)
+    }
+
+    pub fn snapshot_latest_key() -> String {
+        ".s4drive/meta/snapshots/LATEST".to_string()
+    }
+
     pub fn blob_key(hash: &str) -> String {
-        // Split hash for directory prefix
-        let prefix = &hash[..2];
+        let prefix = hash.get(..2).unwrap_or(hash);
         format!(".s4drive/content/blobs/{}/{}", prefix, hash)
+    }
+
+    pub fn blob_manifest_key() -> String {
+        ".s4drive/content/blobs/manifest.json".to_string()
+    }
+
+    pub fn tombstone_key(file_id: &str) -> String {
+        format!(".s4drive/trash/tombstones/{}.json", file_id)
+    }
+
+    pub fn tombstone_prefix() -> String {
+        ".s4drive/trash/tombstones/".to_string()
     }
 }

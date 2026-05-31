@@ -13,7 +13,7 @@ pub struct ClassifiedError {
 /// Classify an S3 error code into a structured error.
 pub fn classify_error_code(code: &str, http_status: u16) -> ClassifiedError {
     let (message, is_retryable) = match code {
-        "PreconditionFailed" => ("Conditional write failed (ETag mismatch)".into(), true),
+        "PreconditionFailed" => ("Conditional write failed (ETag mismatch)".into(), false),
         "NoSuchKey" => ("Object not found in bucket".into(), false),
         "NoSuchBucket" => ("Bucket does not exist".into(), false),
         "AccessDenied" => (
@@ -28,6 +28,8 @@ pub fn classify_error_code(code: &str, http_status: u16) -> ClassifiedError {
         "InvalidPart" => ("Invalid multipart upload part".into(), true),
         "InvalidPartOrder" => ("Multipart parts uploaded out of order".into(), true),
         "NoSuchUpload" => ("Multipart upload ID not found".into(), true),
+        "OperationAborted" => ("Conflicting conditional S3 operation".into(), true),
+        "Conflict" => ("S3 operation conflict".into(), false),
         "InternalError" => ("Internal server error".into(), true),
         "ServiceUnavailable" => ("Service temporarily unavailable".into(), true),
         "SlowDown" => ("Slow down: reduce request rate".into(), true),
@@ -61,12 +63,20 @@ pub fn classify_error_code(code: &str, http_status: u16) -> ClassifiedError {
 pub fn is_retryable(err: &CoreError) -> bool {
     match err {
         CoreError::S3(msg) => {
+            let msg = msg.to_ascii_lowercase();
             msg.contains("timeout")
-                || msg.contains("InternalError")
-                || msg.contains("ServiceUnavailable")
-                || msg.contains("SlowDown")
-                || msg.contains("RequestTimeout")
+                || msg.contains("internalerror")
+                || msg.contains("internal server error")
+                || msg.contains("serviceunavailable")
+                || msg.contains("service unavailable")
+                || msg.contains("slowdown")
+                || msg.contains("requesttimeout")
+                || msg.contains("operationaborted")
                 || msg.contains("5xx")
+                || msg.contains("500")
+                || msg.contains("502")
+                || msg.contains("503")
+                || msg.contains("504")
                 || msg.contains("429")
         }
         CoreError::Network(_) => true,
@@ -90,7 +100,7 @@ mod tests {
     #[test]
     fn test_classify_known_errors() {
         let e = classify_error_code("PreconditionFailed", 412);
-        assert!(e.is_retryable);
+        assert!(!e.is_retryable);
         assert_eq!(e.http_status, 412);
 
         let e = classify_error_code("NoSuchKey", 404);
@@ -112,6 +122,10 @@ mod tests {
     #[test]
     fn test_is_retryable() {
         assert!(is_retryable(&CoreError::S3("timeout: connection".into())));
+        assert!(is_retryable(&CoreError::S3(
+            "HTTP 503 ServiceUnavailable".into()
+        )));
+        assert!(is_retryable(&CoreError::S3("409 OperationAborted".into())));
         assert!(is_retryable(&CoreError::Network("connection reset".into())));
         assert!(!is_retryable(&CoreError::Auth("access denied".into())));
     }

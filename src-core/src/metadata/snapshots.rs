@@ -2,6 +2,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::metadata::serializer::Serializer;
 use crate::metadata::types::FileEntry;
 use crate::s3::S3Adapter;
+use std::collections::BTreeMap;
 
 /// Snapshot Manager — периодические снепшоты состояния дерева файлов.
 ///
@@ -22,6 +23,26 @@ impl<'a> SnapshotManager<'a> {
         let json = Serializer::serialize_file_tree(entries)?;
         let key = Serializer::snapshot_key(seq_num);
         let etag = self.s3.put_metadata(&key, &json).await?;
+        let metadata = serde_json::json!({
+            "schema_version": crate::metadata::SUPPORTED_SCHEMA_VERSION,
+            "seq_num": seq_num,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "entry_count": entries.len(),
+            "tree_key": key,
+        });
+        self.s3
+            .put_metadata(
+                &Serializer::snapshot_metadata_key(seq_num),
+                &serde_json::to_string_pretty(&metadata)
+                    .map_err(|e| CoreError::Protocol(e.to_string()))?,
+            )
+            .await?;
+        self.s3
+            .put_object(
+                &Serializer::snapshot_latest_key(),
+                format!("{:020}", seq_num).into_bytes(),
+            )
+            .await?;
         tracing::info!(
             "Snapshot #{} written: {} entries, etag={}",
             seq_num,
@@ -51,6 +72,9 @@ impl<'a> SnapshotManager<'a> {
             .filter_map(|k| {
                 // Parse ".s4drive/meta/snapshots/{seq:020}/tree.json"
                 let rest = k.strip_prefix(".s4drive/meta/snapshots/")?;
+                if !rest.ends_with("/tree.json") {
+                    return None;
+                }
                 let seq_str = rest.split('/').next()?;
                 let seq_num: u64 = seq_str.parse().ok()?;
                 Some((seq_num, k.clone()))
@@ -66,21 +90,31 @@ impl<'a> SnapshotManager<'a> {
         let prefix = ".s4drive/meta/snapshots/";
         let keys = self.s3.list_objects(prefix).await?;
 
-        let mut snapshots: Vec<(u64, String)> = keys
-            .iter()
-            .filter_map(|k| {
-                let rest = k.strip_prefix(".s4drive/meta/snapshots/")?;
-                let seq_str = rest.split('/').next()?;
-                let seq_num: u64 = seq_str.parse().ok()?;
-                Some((seq_num, k.clone()))
-            })
-            .collect();
-
-        snapshots.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        let mut snapshots: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for key in keys {
+            let Some(rest) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            let Some(seq_str) = rest.split('/').next() else {
+                continue;
+            };
+            let Ok(seq_num) = seq_str.parse::<u64>() else {
+                continue;
+            };
+            snapshots.entry(seq_num).or_default().push(key);
+        }
 
         let mut pruned = 0u32;
-        for (_, key) in snapshots.iter().skip(keep_count as usize) {
-            self.s3.delete_object(key).await?;
+        for (_seq, keys) in snapshots
+            .iter()
+            .rev()
+            .skip(keep_count as usize)
+            .map(|(seq, keys)| (*seq, keys.clone()))
+            .collect::<Vec<_>>()
+        {
+            for key in keys {
+                self.s3.delete_object(&key).await?;
+            }
             pruned += 1;
         }
 
@@ -109,5 +143,17 @@ mod tests {
     fn test_snapshot_key_padding() {
         let key = Serializer::snapshot_key(1);
         assert!(key.contains("/00000000000000000001/"));
+    }
+
+    #[test]
+    fn test_snapshot_metadata_and_latest_keys() {
+        assert_eq!(
+            Serializer::snapshot_metadata_key(42),
+            ".s4drive/meta/snapshots/00000000000000000042/metadata.json"
+        );
+        assert_eq!(
+            Serializer::snapshot_latest_key(),
+            ".s4drive/meta/snapshots/LATEST"
+        );
     }
 }

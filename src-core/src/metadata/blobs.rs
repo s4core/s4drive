@@ -21,8 +21,9 @@ impl<'a> BlobStore<'a> {
     ///
     /// Returns `(BlobId, String)` — blob_id и BLAKE3 hash.
     pub async fn store_blob(&self, data: &[u8], mime: &str) -> CoreResult<(BlobId, ContentRef)> {
-        let hash = blake3::hash(data).to_hex().to_string();
-        let blob_id = uuid::Uuid::now_v7();
+        let digest = blake3::hash(data);
+        let hash = digest.to_hex().to_string();
+        let blob_id = blob_id_from_digest(&digest);
         let storage_key = Serializer::blob_key(&hash);
 
         // Проверяем, существует ли уже такой blob
@@ -47,8 +48,11 @@ impl<'a> BlobStore<'a> {
             Err(e) => return Err(e),
         }
 
-        // Загружаем новый blob
-        self.s3.put_object(&storage_key, data.to_vec()).await?;
+        // Загружаем новый blob. If another client wins the race with the same
+        // content hash, the existing object is accepted as the canonical blob.
+        self.s3
+            .put_if_not_exists(&storage_key, data.to_vec())
+            .await?;
 
         tracing::debug!(
             "Blob stored: {} bytes, hash={}, key={}",
@@ -108,6 +112,12 @@ impl<'a> BlobStore<'a> {
     }
 }
 
+fn blob_id_from_digest(digest: &blake3::Hash) -> BlobId {
+    let mut blob_id_bytes = [0u8; 16];
+    blob_id_bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    uuid::Uuid::from_bytes(blob_id_bytes)
+}
+
 /// Статистика по blobs.
 #[derive(Debug, Clone)]
 pub struct BlobStats {
@@ -131,5 +141,20 @@ mod tests {
         let hash = "00deadbeef1234567890abcdef1234567890abcdef1234567890abcdef12345678";
         let key = Serializer::blob_key(hash);
         assert!(key.starts_with(".s4drive/content/blobs/00/"));
+    }
+
+    #[test]
+    fn blob_id_is_deterministic_for_content_hash() {
+        let first = blob_id_from_digest(&blake3::hash(b"same bytes"));
+        let second = blob_id_from_digest(&blake3::hash(b"same bytes"));
+        let different = blob_id_from_digest(&blake3::hash(b"different bytes"));
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+    }
+
+    #[test]
+    fn blob_key_does_not_panic_on_short_hash() {
+        assert_eq!(Serializer::blob_key("a"), ".s4drive/content/blobs/a/a");
     }
 }

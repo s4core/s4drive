@@ -1,7 +1,30 @@
 use crate::config::Config;
 use crate::error::{CoreError, CoreResult};
+use crate::s3::retry::RetryPolicy;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
+use base64::{engine::general_purpose, Engine as _};
+use md5::{Digest, Md5};
+use std::future::Future;
+
+const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// Async object-store abstraction used by S4Drive's sync and metadata layers.
+#[allow(async_fn_in_trait)]
+pub trait S3ObjectStore {
+    fn bucket(&self) -> &str;
+    fn endpoint(&self) -> &str;
+
+    async fn put_object(&self, key: &str, body: Vec<u8>) -> CoreResult<String>;
+    async fn put_if_not_exists(&self, key: &str, body: Vec<u8>) -> CoreResult<bool>;
+    async fn put_if_match(&self, key: &str, body: Vec<u8>, expected_etag: &str)
+        -> CoreResult<bool>;
+    async fn get_object(&self, key: &str) -> CoreResult<Vec<u8>>;
+    async fn get_object_range(&self, key: &str, range: &str) -> CoreResult<Vec<u8>>;
+    async fn head_object(&self, key: &str) -> CoreResult<ObjectMeta>;
+    async fn delete_object(&self, key: &str) -> CoreResult<()>;
+    async fn list_objects(&self, prefix: &str) -> CoreResult<Vec<String>>;
+}
 
 /// S3 adapter wrapping the aws-sdk-s3 client.
 #[derive(Clone)]
@@ -10,6 +33,7 @@ pub struct S3Adapter {
     bucket: String,
     endpoint: String,
     connected: bool,
+    retry_policy: RetryPolicy,
 }
 
 /// Metadata about an S3 object.
@@ -20,6 +44,22 @@ pub struct ObjectMeta {
     pub etag: String,
     pub last_modified: String,
     pub version_id: Option<String>,
+}
+
+/// One page from ListObjectsV2.
+#[derive(Debug, Clone)]
+pub struct ListObjectsPage {
+    pub keys: Vec<String>,
+    pub common_prefixes: Vec<String>,
+    pub next_continuation_token: Option<String>,
+    pub is_truncated: bool,
+}
+
+/// Active multipart upload handle.
+#[derive(Debug, Clone)]
+pub struct MultipartUpload {
+    pub key: String,
+    pub upload_id: String,
 }
 
 impl S3Adapter {
@@ -43,12 +83,17 @@ impl S3Adapter {
             .build();
 
         let client = S3Client::from_conf(s3_config);
+        let retry_policy = RetryPolicy {
+            max_attempts: config.core.max_retries,
+            ..Default::default()
+        };
 
         Ok(Self {
             client,
             bucket,
             endpoint,
             connected: true,
+            retry_policy,
         })
     }
 
@@ -64,55 +109,107 @@ impl S3Adapter {
         &self.endpoint
     }
 
+    async fn with_retry<T, Fut, F>(&self, mut operation: F) -> CoreResult<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = CoreResult<T>>,
+    {
+        let mut attempt = 0;
+        loop {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(err) if self.retry_policy.should_retry(&err, attempt) => {
+                    let delay = self.retry_policy.delay_for_attempt(attempt);
+                    tracing::warn!(
+                        "retrying S3 operation after attempt {} failed: {}",
+                        attempt + 1,
+                        err
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     // ─── Basic Operations ───────────────────────────────────────────
 
     /// PUT an object — unconditional.
     pub async fn put_object(&self, key: &str, body: Vec<u8>) -> CoreResult<String> {
-        let resp = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, key))?;
+        self.with_retry(|| {
+            let body = body.clone();
+            async move {
+                let resp = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(ByteStream::from(body))
+                    .send()
+                    .await
+                    .map_err(|e| classify_s3_error(e, key))?;
 
-        Ok(resp
-            .e_tag()
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string())
+                Ok(normalize_etag(resp.e_tag()))
+            }
+        })
+        .await
+    }
+
+    /// PUT an object with Content-MD5 so the S3 backend validates upload integrity.
+    pub async fn put_object_with_checksum(&self, key: &str, body: Vec<u8>) -> CoreResult<String> {
+        let content_md5 = content_md5_base64(&body);
+        self.with_retry(|| {
+            let body = body.clone();
+            let content_md5 = content_md5.clone();
+            async move {
+                let resp = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .content_md5(content_md5)
+                    .body(ByteStream::from(body))
+                    .send()
+                    .await
+                    .map_err(|e| classify_s3_error(e, key))?;
+
+                Ok(normalize_etag(resp.e_tag()))
+            }
+        })
+        .await
     }
 
     /// PUT with conditional If-None-Match.
     /// Returns Ok(true) if created, Ok(false) if already exists (412).
     pub async fn put_if_not_exists(&self, key: &str, body: Vec<u8>) -> CoreResult<bool> {
-        let result = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(body))
-            .if_none_match("*")
-            .send()
-            .await;
+        self.with_retry(|| {
+            let body = body.clone();
+            async move {
+                let result = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(ByteStream::from(body))
+                    .if_none_match("*")
+                    .send()
+                    .await;
 
-        match result {
-            Ok(_) => Ok(true),
-            Err(err) => {
-                let service_err = err.into_service_error();
-                if service_err.meta().code() == Some("PreconditionFailed") {
-                    Ok(false)
-                } else {
-                    Err(CoreError::S3(format!(
-                        "if-none-match failed ({}): {}",
-                        service_err.meta().code().unwrap_or("?"),
-                        service_err.meta().message().unwrap_or("?"),
-                    )))
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(err) => {
+                        let service_err = err.into_service_error();
+                        if service_err.meta().code() == Some("PreconditionFailed") {
+                            Ok(false)
+                        } else {
+                            Err(classify_s3_error(service_err, key))
+                        }
+                    }
                 }
             }
-        }
+        })
+        .await
     }
 
     /// PUT with conditional If-Match (CAS).
@@ -123,117 +220,129 @@ impl S3Adapter {
         body: Vec<u8>,
         expected_etag: &str,
     ) -> CoreResult<bool> {
-        let result = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(body))
-            .if_match(expected_etag)
-            .send()
-            .await;
+        let expected_etag = quote_etag_for_condition(expected_etag);
+        self.with_retry(|| {
+            let body = body.clone();
+            let expected_etag = expected_etag.clone();
+            async move {
+                let result = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(ByteStream::from(body))
+                    .if_match(expected_etag)
+                    .send()
+                    .await;
 
-        match result {
-            Ok(_) => Ok(true),
-            Err(err) => {
-                let service_err = err.into_service_error();
-                if service_err.meta().code() == Some("PreconditionFailed") {
-                    Ok(false)
-                } else {
-                    Err(CoreError::S3(format!(
-                        "if-match failed ({}): {}",
-                        service_err.meta().code().unwrap_or("?"),
-                        service_err.meta().message().unwrap_or("?"),
-                    )))
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(err) => {
+                        let service_err = err.into_service_error();
+                        if service_err.meta().code() == Some("PreconditionFailed") {
+                            Ok(false)
+                        } else {
+                            Err(classify_s3_error(service_err, key))
+                        }
+                    }
                 }
             }
-        }
+        })
+        .await
     }
 
     /// GET object data by key.
     pub async fn get_object(&self, key: &str) -> CoreResult<Vec<u8>> {
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, key))?;
+        self.with_retry(|| async move {
+            let resp = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|e| classify_s3_error(e, key))?;
 
-        let data = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| CoreError::S3(format!("failed to read body: {}", e)))?
-            .into_bytes()
-            .to_vec();
+            let data = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| CoreError::S3(format!("failed to read body: {}", e)))?
+                .into_bytes()
+                .to_vec();
 
-        Ok(data)
+            Ok(data)
+        })
+        .await
     }
 
     /// GET object with range (for resume/partial download).
     pub async fn get_object_range(&self, key: &str, range: &str) -> CoreResult<Vec<u8>> {
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .range(range)
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, key))?;
+        self.with_retry(|| async move {
+            let resp = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .range(range)
+                .send()
+                .await
+                .map_err(|e| classify_s3_error(e, key))?;
 
-        let data = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| CoreError::S3(format!("failed to read body: {}", e)))?
-            .into_bytes()
-            .to_vec();
+            let data = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| CoreError::S3(format!("failed to read body: {}", e)))?
+                .into_bytes()
+                .to_vec();
 
-        Ok(data)
+            Ok(data)
+        })
+        .await
     }
 
     /// HEAD object — get metadata without downloading.
     pub async fn head_object(&self, key: &str) -> CoreResult<ObjectMeta> {
-        let resp = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, key))?;
+        self.with_retry(|| async move {
+            let resp = self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|e| classify_s3_error(e, key))?;
 
-        let size = resp.content_length().unwrap_or(0).max(0) as u64;
+            let size = resp.content_length().unwrap_or(0).max(0) as u64;
 
-        Ok(ObjectMeta {
-            key: key.to_string(),
-            size,
-            etag: resp
-                .e_tag()
-                .unwrap_or_default()
-                .trim_matches('"')
-                .to_string(),
-            last_modified: resp
-                .last_modified()
-                .map(|d| d.to_string())
-                .unwrap_or_default(),
-            version_id: resp.version_id().map(|s| s.to_string()),
+            Ok(ObjectMeta {
+                key: key.to_string(),
+                size,
+                etag: normalize_etag(resp.e_tag()),
+                last_modified: resp
+                    .last_modified()
+                    .map(|d| d.to_string())
+                    .unwrap_or_default(),
+                version_id: resp.version_id().map(|s| s.to_string()),
+            })
         })
+        .await
     }
 
     /// DELETE an object.
     pub async fn delete_object(&self, key: &str) -> CoreResult<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, key))?;
-        Ok(())
+        self.with_retry(|| async move {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|e| classify_s3_error(e, key))?;
+            Ok(())
+        })
+        .await
     }
 
     /// List objects with a given prefix.
@@ -242,27 +351,19 @@ impl S3Adapter {
         let mut continuation_token: Option<String> = None;
 
         loop {
-            let mut req = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(prefix)
-                .max_keys(1000);
+            let page = self
+                .list_objects_page(prefix, None, 1000, continuation_token.as_deref())
+                .await?;
+            keys.extend(page.keys);
 
-            if let Some(ref token) = continuation_token {
-                req = req.continuation_token(token);
-            }
-
-            let resp = req.send().await.map_err(|e| classify_s3_error(e, prefix))?;
-
-            for obj in resp.contents().iter() {
-                if let Some(key) = obj.key() {
-                    keys.push(key.to_string());
+            if page.is_truncated {
+                continuation_token = page.next_continuation_token;
+                if continuation_token.is_none() {
+                    return Err(CoreError::S3(format!(
+                        "LIST for '{}' was truncated without ContinuationToken",
+                        prefix
+                    )));
                 }
-            }
-
-            if resp.is_truncated() == Some(true) {
-                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
             } else {
                 break;
             }
@@ -271,105 +372,302 @@ impl S3Adapter {
         Ok(keys)
     }
 
+    /// List one page with optional delimiter, used by compatibility detection.
+    pub async fn list_objects_page(
+        &self,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: i32,
+        continuation_token: Option<&str>,
+    ) -> CoreResult<ListObjectsPage> {
+        let max_keys = max_keys.clamp(1, 1000);
+        self.with_retry(|| async move {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .max_keys(max_keys);
+
+            if let Some(delimiter) = delimiter {
+                req = req.delimiter(delimiter);
+            }
+
+            if let Some(token) = continuation_token {
+                req = req.continuation_token(token);
+            }
+
+            let resp = req.send().await.map_err(|e| classify_s3_error(e, prefix))?;
+            let keys = resp
+                .contents()
+                .iter()
+                .filter_map(|obj| obj.key().map(ToString::to_string))
+                .collect();
+            let common_prefixes = resp
+                .common_prefixes()
+                .iter()
+                .filter_map(|prefix| prefix.prefix().map(ToString::to_string))
+                .collect();
+
+            Ok(ListObjectsPage {
+                keys,
+                common_prefixes,
+                next_continuation_token: resp.next_continuation_token().map(ToString::to_string),
+                is_truncated: resp.is_truncated().unwrap_or(false),
+            })
+        })
+        .await
+    }
+
     /// Check if a bucket exists and is accessible.
     /// Returns Ok(()) if accessible, Err with details if not.
     pub async fn check_bucket_access(&self) -> CoreResult<()> {
-        self.client
-            .head_bucket()
-            .bucket(&self.bucket)
-            .send()
-            .await
-            .map(|_| ())
-            .map_err(|err| {
-                let service_err = err.into_service_error();
-                let code = service_err.meta().code().unwrap_or("unknown");
-                CoreError::S3(format!("bucket access denied: {}", code))
-            })
+        self.with_retry(|| async move {
+            self.client
+                .head_bucket()
+                .bucket(&self.bucket)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|err| {
+                    let service_err = err.into_service_error();
+                    let code = service_err.meta().code().unwrap_or("unknown");
+                    CoreError::S3(format!("bucket access denied: {}", code))
+                })
+        })
+        .await
+    }
+
+    /// Lightweight runtime guard for S4Drive's minimum safe-sync requirements.
+    ///
+    /// The full compatibility report is intentionally left to the CLI because it
+    /// includes heavier checks such as large multipart uploads.
+    pub async fn verify_level2_prerequisites(&self) -> CoreResult<()> {
+        let prefix = format!(".s4drive-compat-min-{}/", uuid::Uuid::now_v7());
+        let key = format!("{}cas", prefix);
+        let result = async {
+            self.put_object(&key, b"base".to_vec()).await?;
+            let meta = self.head_object(&key).await?;
+            if !self
+                .put_if_match(&key, b"updated".to_vec(), &meta.etag)
+                .await?
+            {
+                return Err(CoreError::Config(
+                    "S3 bucket is below S4Drive Level 2: If-Match rejected a valid ETag".into(),
+                ));
+            }
+            if self
+                .put_if_match(&key, b"stale".to_vec(), &meta.etag)
+                .await?
+            {
+                return Err(CoreError::Config(
+                    "S3 bucket is below S4Drive Level 2: stale If-Match write was accepted".into(),
+                ));
+            }
+
+            let create_key = format!("{}create-once", prefix);
+            if !self
+                .put_if_not_exists(&create_key, b"first".to_vec())
+                .await?
+            {
+                return Err(CoreError::Config(
+                    "S3 bucket is below S4Drive Level 2: If-None-Match rejected a new object"
+                        .into(),
+                ));
+            }
+            if self
+                .put_if_not_exists(&create_key, b"second".to_vec())
+                .await?
+            {
+                return Err(CoreError::Config(
+                    "S3 bucket is below S4Drive Level 2: If-None-Match overwrote an object".into(),
+                ));
+            }
+
+            if self.get_object(&key).await? != b"updated" {
+                return Err(CoreError::Config(
+                    "S3 bucket is below S4Drive Level 2: read-after-write is inconsistent".into(),
+                ));
+            }
+            self.delete_object(&key).await?;
+            if self.head_object(&key).await.is_ok() {
+                return Err(CoreError::Config(
+                    "S3 bucket is below S4Drive Level 2: read-after-delete is inconsistent".into(),
+                ));
+            }
+
+            Ok(())
+        }
+        .await;
+
+        self.cleanup_prefix_best_effort(&prefix).await;
+        result.map_err(|err| match err {
+            CoreError::Config(_) => err,
+            other => CoreError::Config(format!(
+                "S3 bucket is below S4Drive Level 2 or cannot be verified: {}",
+                other
+            )),
+        })
+    }
+
+    async fn cleanup_prefix_best_effort(&self, prefix: &str) {
+        if let Ok(keys) = self.list_objects(prefix).await {
+            for key in keys {
+                let _ = self.delete_object(&key).await;
+            }
+        }
     }
 
     // ─── Multipart Upload ───────────────────────────────────────────
 
-    /// Upload a file using multipart upload with 5 MB parts.
-    pub async fn multipart_upload(&self, key: &str, data: Vec<u8>) -> CoreResult<String> {
-        let part_size: usize = 5 * 1024 * 1024;
-        let total_parts = data.len().div_ceil(part_size);
-
-        // Initiate
-        let upload = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, key))?;
-
-        let upload_id = upload.upload_id().unwrap_or_default().to_string();
-
-        // Upload parts
-        let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> =
-            Vec::with_capacity(total_parts);
-
-        for i in 0..total_parts {
-            let start = i * part_size;
-            let end = std::cmp::min(start + part_size, data.len());
-            let chunk = data[start..end].to_vec();
-            let part_number = (i + 1) as i32;
-
-            let part_resp = self
+    /// Start a multipart upload and return its upload ID.
+    pub async fn create_multipart_upload(&self, key: &str) -> CoreResult<MultipartUpload> {
+        self.with_retry(|| async move {
+            let upload = self
                 .client
-                .upload_part()
+                .create_multipart_upload()
                 .bucket(&self.bucket)
                 .key(key)
-                .upload_id(&upload_id)
-                .part_number(part_number)
-                .body(ByteStream::from(chunk))
                 .send()
                 .await
                 .map_err(|e| classify_s3_error(e, key))?;
 
+            let upload_id = upload.upload_id().ok_or_else(|| {
+                CoreError::S3(format!(
+                    "create multipart upload for '{}' returned no upload id",
+                    key
+                ))
+            })?;
+
+            Ok(MultipartUpload {
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+            })
+        })
+        .await
+    }
+
+    /// Upload one multipart part and return its ETag.
+    pub async fn upload_multipart_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: Vec<u8>,
+    ) -> CoreResult<String> {
+        self.with_retry(|| {
+            let data = data.clone();
+            async move {
+                let part_resp = self
+                    .client
+                    .upload_part()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(data))
+                    .send()
+                    .await
+                    .map_err(|e| classify_s3_error(e, key))?;
+
+                let etag = part_resp.e_tag().ok_or_else(|| {
+                    CoreError::S3(format!(
+                        "upload part {} for '{}' returned no ETag",
+                        part_number, key
+                    ))
+                })?;
+                Ok(normalize_etag(Some(etag)))
+            }
+        })
+        .await
+    }
+
+    /// Upload a file using multipart upload with 5 MiB parts.
+    pub async fn multipart_upload(&self, key: &str, data: Vec<u8>) -> CoreResult<String> {
+        let upload = self.create_multipart_upload(key).await?;
+        let result = self
+            .complete_multipart_upload_from_bytes(key, &upload.upload_id, data)
+            .await;
+
+        if result.is_err() {
+            let _ = self.abort_multipart_upload(key, &upload.upload_id).await;
+        }
+
+        result
+    }
+
+    async fn complete_multipart_upload_from_bytes(
+        &self,
+        key: &str,
+        upload_id: &str,
+        data: Vec<u8>,
+    ) -> CoreResult<String> {
+        if data.is_empty() {
+            return Err(CoreError::S3(format!(
+                "multipart upload for '{}' requires at least one byte",
+                key
+            )));
+        }
+
+        let total_parts = data.len().div_ceil(MULTIPART_PART_SIZE);
+        let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> =
+            Vec::with_capacity(total_parts);
+
+        for i in 0..total_parts {
+            let start = i * MULTIPART_PART_SIZE;
+            let end = std::cmp::min(start + MULTIPART_PART_SIZE, data.len());
+            let chunk = data[start..end].to_vec();
+            let part_number = (i + 1) as i32;
+            let etag = self
+                .upload_multipart_part(key, upload_id, part_number, chunk)
+                .await?;
+
             completed_parts.push(
                 aws_sdk_s3::types::CompletedPart::builder()
-                    .e_tag(part_resp.e_tag().unwrap_or_default())
+                    .e_tag(quote_etag_for_condition(&etag))
                     .part_number(part_number)
                     .build(),
             );
         }
 
-        // Complete
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
             .build();
 
-        let result = self
-            .client
-            .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, key))?;
+        self.with_retry(|| {
+            let completed = completed.clone();
+            async move {
+                let result = self
+                    .client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .multipart_upload(completed)
+                    .send()
+                    .await
+                    .map_err(|e| classify_s3_error(e, key))?;
 
-        Ok(result
-            .e_tag()
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string())
+                Ok(normalize_etag(result.e_tag()))
+            }
+        })
+        .await
     }
 
     /// Abort a multipart upload (cleanup).
     pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> CoreResult<()> {
-        self.client
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .send()
-            .await
-            .map_err(|e| classify_s3_error(e, key))?;
-        Ok(())
+        self.with_retry(|| async move {
+            self.client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .map_err(|e| classify_s3_error(e, key))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Upload a metadata object (JSON) as a small blob.
@@ -379,13 +677,79 @@ impl S3Adapter {
     }
 }
 
+impl S3ObjectStore for S3Adapter {
+    fn bucket(&self) -> &str {
+        self.bucket()
+    }
+
+    fn endpoint(&self) -> &str {
+        self.endpoint()
+    }
+
+    async fn put_object(&self, key: &str, body: Vec<u8>) -> CoreResult<String> {
+        S3Adapter::put_object(self, key, body).await
+    }
+
+    async fn put_if_not_exists(&self, key: &str, body: Vec<u8>) -> CoreResult<bool> {
+        S3Adapter::put_if_not_exists(self, key, body).await
+    }
+
+    async fn put_if_match(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        expected_etag: &str,
+    ) -> CoreResult<bool> {
+        S3Adapter::put_if_match(self, key, body, expected_etag).await
+    }
+
+    async fn get_object(&self, key: &str) -> CoreResult<Vec<u8>> {
+        S3Adapter::get_object(self, key).await
+    }
+
+    async fn get_object_range(&self, key: &str, range: &str) -> CoreResult<Vec<u8>> {
+        S3Adapter::get_object_range(self, key, range).await
+    }
+
+    async fn head_object(&self, key: &str) -> CoreResult<ObjectMeta> {
+        S3Adapter::head_object(self, key).await
+    }
+
+    async fn delete_object(&self, key: &str) -> CoreResult<()> {
+        S3Adapter::delete_object(self, key).await
+    }
+
+    async fn list_objects(&self, prefix: &str) -> CoreResult<Vec<String>> {
+        S3Adapter::list_objects(self, prefix).await
+    }
+}
+
+fn normalize_etag(etag: Option<&str>) -> String {
+    etag.unwrap_or_default().trim_matches('"').to_string()
+}
+
+fn quote_etag_for_condition(etag: &str) -> String {
+    let trimmed = etag.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        trimmed.to_string()
+    } else {
+        format!("\"{}\"", trimmed.trim_matches('"'))
+    }
+}
+
+fn content_md5_base64(body: &[u8]) -> String {
+    let digest = Md5::digest(body);
+    general_purpose::STANDARD.encode(digest)
+}
+
 /// Classify S3 errors into CoreError variants.
 pub(crate) fn classify_s3_error(e: impl std::fmt::Display, context: &str) -> CoreError {
-    let msg = format!("s3 error ({}): {}", context, e);
-    let msg_lower = msg.to_lowercase();
+    let raw = e.to_string();
+    let msg = format!("s3 error ({}): {}", context, raw);
+    let msg_lower = msg.to_ascii_lowercase();
 
-    if msg_lower.contains("412") || msg_lower.contains("precondition") {
-        CoreError::S3(format!("412 PreconditionFailed: {}", context))
+    if msg_lower.contains("412") || msg_lower.contains("preconditionfailed") {
+        CoreError::Conflict(format!("412 PreconditionFailed: {}", context))
     } else if msg_lower.contains("404")
         || msg_lower.contains("not found")
         || msg_lower.contains("nosuchkey")
@@ -399,7 +763,52 @@ pub(crate) fn classify_s3_error(e: impl std::fmt::Display, context: &str) -> Cor
         CoreError::Auth(format!("access denied: {}", context))
     } else if msg_lower.contains("409") || msg_lower.contains("conflict") {
         CoreError::Conflict(format!("conflict: {}", context))
+    } else if msg_lower.contains("timeout")
+        || msg_lower.contains("dispatchfailure")
+        || msg_lower.contains("connection reset")
+    {
+        CoreError::Network(msg)
     } else {
         CoreError::S3(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn etags_are_quoted_for_if_match_headers() {
+        assert_eq!(quote_etag_for_condition("abc"), "\"abc\"");
+        assert_eq!(quote_etag_for_condition("\"abc\""), "\"abc\"");
+    }
+
+    #[test]
+    fn content_md5_is_standard_base64() {
+        assert_eq!(content_md5_base64(b"hello"), "XUFAKrxLKna5cZ2REBfFkg==");
+    }
+
+    #[test]
+    fn string_error_classifier_maps_required_statuses() {
+        assert!(matches!(
+            classify_s3_error("service error: 404 NoSuchKey", "k"),
+            CoreError::NotFound(_)
+        ));
+        assert!(matches!(
+            classify_s3_error("service error: 403 AccessDenied", "k"),
+            CoreError::Auth(_)
+        ));
+        assert!(matches!(
+            classify_s3_error("service error: 409 Conflict", "k"),
+            CoreError::Conflict(_)
+        ));
+        assert!(matches!(
+            classify_s3_error("service error: 412 PreconditionFailed", "k"),
+            CoreError::Conflict(_)
+        ));
+        assert!(matches!(
+            classify_s3_error("dispatch failure: timeout", "k"),
+            CoreError::Network(_)
+        ));
     }
 }

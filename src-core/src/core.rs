@@ -133,12 +133,16 @@ impl S4DriveCore {
         }
         self.diagnostics.log("Bucket access OK");
 
-        // 4. Create MetadataEngine
+        // 4. Verify S4Drive's minimum safe-sync guarantees.
+        s3.verify_level2_prerequisites().await?;
+        self.diagnostics.log("S3 Level 2 prerequisites OK");
+
+        // 5. Create MetadataEngine
         let device_id = uuid::Uuid::now_v7();
         let metadata = MetadataEngine::new(s3.clone(), device_id);
         self.diagnostics.log("MetadataEngine created");
 
-        // 5. Create subsystems with channel-based watcher
+        // 6. Create subsystems with channel-based watcher
         let (watcher, event_stream) = FileWatcher::with_channel(&self.config)?;
         let transfer = TransferQueue::new(&db);
         let sync = SyncEngine::new();
@@ -237,10 +241,6 @@ impl S4DriveCore {
     // ─── Bucket Operations ───────────────────────────────────────
 
     pub async fn init_bucket(&mut self, device_name: &str) -> CoreResult<()> {
-        let s3 = self
-            .s3
-            .as_ref()
-            .ok_or_else(|| CoreError::Internal("S3 not initialized".into()))?;
         let metadata = self
             .metadata
             .as_ref()
@@ -248,30 +248,6 @@ impl S4DriveCore {
 
         self.diagnostics
             .log("Initializing .s4drive/ metadata structure...");
-        let lock_key = ".s4drive/system/locks/";
-        s3.put_object(lock_key, b"".to_vec()).await?;
-
-        let device_id = uuid::Uuid::now_v7();
-        let device_reg = crate::metadata::types::Device {
-            device_id,
-            device_name: device_name.to_string(),
-            platform: std::env::consts::OS.to_string(),
-            os_version: std::env::consts::ARCH.to_string(),
-            public_key: String::new(),
-            last_seen: chrono::Utc::now().to_rfc3339(),
-            capabilities: crate::metadata::types::DeviceCapabilities {
-                cloud_files_api: true,
-                file_provider: false,
-                fuse: false,
-                background_sync: true,
-                encryption_at_rest: false,
-            },
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-        };
-        let device_json = crate::metadata::serializer::Serializer::serialize_device(&device_reg)?;
-        let device_key = format!(".s4drive/devices/{}.json", device_id);
-        s3.put_metadata(&device_key, &device_json).await?;
-
         let descriptor = metadata.init_bucket(device_name).await?;
         self.diagnostics.log(&format!(
             ".s4drive/ initialized (bucket_id={})",
@@ -281,16 +257,23 @@ impl S4DriveCore {
     }
 
     pub async fn check_initialized(&self) -> CoreResult<bool> {
-        let s3 = self
-            .s3
+        let metadata = self
+            .metadata
             .as_ref()
-            .ok_or_else(|| CoreError::Internal("S3 not initialized".into()))?;
-        let desc_key = crate::metadata::serializer::Serializer::descriptor_key();
-        match s3.head_object(&desc_key).await {
-            Ok(_) => Ok(true),
-            Err(CoreError::NotFound(_)) => Ok(false),
-            Err(e) => Err(e),
+            .ok_or_else(|| CoreError::Internal("metadata missing".into()))?;
+        let initialized = metadata.check_initialized().await?;
+        if initialized {
+            metadata.read_descriptor().await?;
         }
+        Ok(initialized)
+    }
+
+    pub async fn read_descriptor(&self) -> CoreResult<crate::metadata::types::BucketDescriptor> {
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| CoreError::Internal("metadata missing".into()))?;
+        metadata.read_descriptor().await
     }
 
     pub async fn sync_now(&self) -> CoreResult<()> {

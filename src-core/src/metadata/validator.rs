@@ -13,9 +13,6 @@ impl Validator {
         if op.device_id.is_nil() {
             return Err(CoreError::Protocol("device_id cannot be nil".into()));
         }
-        if op.base_head.is_empty() {
-            return Err(CoreError::Protocol("base_head cannot be empty".into()));
-        }
         Ok(())
     }
 
@@ -53,6 +50,13 @@ impl Validator {
         }
         if desc.schema_version == 0 {
             return Err(CoreError::Protocol("schema_version must be >= 1".into()));
+        }
+        if desc.schema_version > crate::metadata::SUPPORTED_SCHEMA_VERSION {
+            return Err(CoreError::Protocol(format!(
+                "unsupported metadata schema version {} (client supports up to {})",
+                desc.schema_version,
+                crate::metadata::SUPPORTED_SCHEMA_VERSION
+            )));
         }
         Ok(())
     }
@@ -108,6 +112,50 @@ mod tests {
     fn test_normalize_name() {
         assert_eq!(Validator::normalize_name("  hello  "), "hello");
         assert_eq!(Validator::normalize_name("file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn validate_operation_allows_empty_base_head_for_genesis_op() {
+        let op = Operation {
+            op_id: "device:1:op".into(),
+            device_id: Uuid::now_v7(),
+            actor_id: "actor".into(),
+            logical_clock: 1,
+            base_head: String::new(),
+            target_file_id: None,
+            op_type: OpType::CreateFolder,
+            preconditions: Preconditions {
+                expected_etag: None,
+                expected_version_id: None,
+                file_exists: false,
+                parent_exists: true,
+            },
+            effects: Effects {
+                new_revision_id: None,
+                new_content_ref: None,
+                new_name: None,
+                new_parent_id: None,
+                deleted: false,
+            },
+            timestamp: "2026-05-30T00:00:00Z".into(),
+            signature: None,
+        };
+
+        assert!(Validator::validate_operation(&op).is_ok());
+    }
+
+    #[test]
+    fn validate_descriptor_rejects_future_schema() {
+        let desc = BucketDescriptor {
+            bucket_id: Uuid::now_v7(),
+            schema_version: crate::metadata::SUPPORTED_SCHEMA_VERSION + 1,
+            created_at: "2026-05-30T00:00:00Z".into(),
+            owner: "test".into(),
+            capabilities: vec!["metadata_v1".into()],
+            min_client_version: "0.1.0".into(),
+        };
+
+        assert!(Validator::validate_descriptor(&desc).is_err());
     }
 
     fn create_test_entry() -> FileEntry {

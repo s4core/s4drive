@@ -70,11 +70,19 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
+        let path = shellexpand::tilde(path).to_string();
         let content = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&content)?)
     }
 
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
+        let path = shellexpand::tilde(path).to_string();
+        if let Some(parent) = std::path::Path::new(&path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
@@ -83,3 +91,27 @@ impl Config {
 
 // Re-export toml (used by config module)
 pub(crate) use toml;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_creates_parent_directories_and_loads_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("s4drive-config-{}", uuid::Uuid::now_v7()));
+        let path = dir.join("nested").join("config.toml");
+        let mut config = Config::default();
+        config.s3.endpoint = "http://127.0.0.1:9000".to_string();
+        config.s3.bucket = "s4drive-test".to_string();
+        config.sync_folder.local_path = "/tmp/s4drive-sync".to_string();
+
+        config.save(&path.to_string_lossy()).unwrap();
+        let loaded = Config::load(&path.to_string_lossy()).unwrap();
+
+        assert_eq!(loaded.s3.endpoint, config.s3.endpoint);
+        assert_eq!(loaded.s3.bucket, config.s3.bucket);
+        assert_eq!(loaded.sync_folder.local_path, config.sync_folder.local_path);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

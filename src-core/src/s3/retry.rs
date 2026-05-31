@@ -1,6 +1,7 @@
 use crate::error::CoreError;
 use crate::s3::error::is_retryable;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Retry policy with exponential backoff and jitter.
 #[derive(Debug, Clone)]
@@ -31,12 +32,22 @@ impl RetryPolicy {
     }
 
     /// Calculate the delay for attempt `n` (0-indexed).
-    /// Uses exponential backoff: base_delay * 2^n, capped at max_delay.
+    /// Uses exponential backoff: base_delay * 2^n, capped at max_delay, with jitter.
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let exp = 2u64.pow(attempt);
-        let delay = self.base_delay.as_secs().saturating_mul(exp);
-        let capped = std::cmp::min(delay, self.max_delay.as_secs());
-        Duration::from_secs(capped)
+        let base = self.base_delay_for_attempt(attempt);
+        let base_ms = base.as_millis();
+        if base_ms == 0 {
+            return base;
+        }
+
+        let max_ms = self.max_delay.as_millis();
+        let jitter_window = (base_ms / 4).max(1);
+        let lower = base_ms.saturating_sub(jitter_window);
+        let upper = base_ms.saturating_add(jitter_window).min(max_ms);
+        let span = upper.saturating_sub(lower).saturating_add(1);
+        let jitter = jitter_seed(attempt) % span;
+
+        Duration::from_millis((lower + jitter) as u64)
     }
 
     /// Determine if we should retry based on the error and attempt count.
@@ -46,6 +57,21 @@ impl RetryPolicy {
         }
         is_retryable(err)
     }
+
+    fn base_delay_for_attempt(&self, attempt: u32) -> Duration {
+        let multiplier = 1u128.checked_shl(attempt.min(63)).unwrap_or(u128::MAX);
+        let delay_ms = self.base_delay.as_millis().saturating_mul(multiplier);
+        let capped = delay_ms.min(self.max_delay.as_millis());
+        Duration::from_millis(capped as u64)
+    }
+}
+
+fn jitter_seed(attempt: u32) -> u128 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_nanos();
+    now ^ ((attempt as u128) << 32)
 }
 
 #[cfg(test)]
@@ -57,19 +83,19 @@ mod tests {
     fn test_backoff_delays() {
         let policy = RetryPolicy::new(3, 1, 60);
 
-        assert_eq!(policy.delay_for_attempt(0), Duration::from_secs(1));
-        assert_eq!(policy.delay_for_attempt(1), Duration::from_secs(2));
-        assert_eq!(policy.delay_for_attempt(2), Duration::from_secs(4));
+        assert_delay_near(policy.delay_for_attempt(0), 1_000);
+        assert_delay_near(policy.delay_for_attempt(1), 2_000);
+        assert_delay_near(policy.delay_for_attempt(2), 4_000);
     }
 
     #[test]
     fn test_backoff_capped() {
         let policy = RetryPolicy::new(5, 10, 30);
 
-        assert_eq!(policy.delay_for_attempt(0), Duration::from_secs(10));
-        assert_eq!(policy.delay_for_attempt(1), Duration::from_secs(20));
-        assert_eq!(policy.delay_for_attempt(2), Duration::from_secs(30)); // capped
-        assert_eq!(policy.delay_for_attempt(3), Duration::from_secs(30)); // capped
+        assert_delay_near(policy.delay_for_attempt(0), 10_000);
+        assert_delay_near(policy.delay_for_attempt(1), 20_000);
+        assert!(policy.delay_for_attempt(2) <= Duration::from_secs(30));
+        assert!(policy.delay_for_attempt(3) <= Duration::from_secs(30));
     }
 
     #[test]
@@ -91,5 +117,18 @@ mod tests {
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.base_delay, Duration::from_secs(1));
         assert_eq!(policy.max_delay, Duration::from_secs(60));
+    }
+
+    fn assert_delay_near(delay: Duration, expected_ms: u128) {
+        let actual = delay.as_millis();
+        let lower = expected_ms.saturating_sub(expected_ms / 4);
+        let upper = expected_ms + expected_ms / 4;
+        assert!(
+            (lower..=upper).contains(&actual),
+            "delay {}ms outside expected jitter range {}..={}ms",
+            actual,
+            lower,
+            upper
+        );
     }
 }

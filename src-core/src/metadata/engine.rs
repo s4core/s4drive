@@ -1,6 +1,7 @@
 use crate::error::{CoreError, CoreResult};
 use crate::metadata::serializer::Serializer;
 use crate::metadata::types::*;
+use crate::metadata::validator::Validator;
 use crate::s3::S3Adapter;
 
 /// Metadata Engine — высокоуровневый API для работы с `.s4drive/` в S3.
@@ -37,34 +38,19 @@ impl MetadataEngine {
     /// Проинициализировать `.s4drive/` структуру.
     /// Вызывается один раз при первом подключении к бакету.
     pub async fn init_bucket(&self, device_name: &str) -> CoreResult<BucketDescriptor> {
+        if self.check_initialized().await? {
+            return Err(CoreError::Conflict(
+                "bucket already initialized — descriptor exists".into(),
+            ));
+        }
+
         let bucket_id = uuid::Uuid::now_v7();
         let now = chrono::Utc::now().to_rfc3339();
-
-        // Device registration
-        let device = Device {
-            device_id: self.device_id,
-            device_name: device_name.to_string(),
-            platform: std::env::consts::OS.to_string(),
-            os_version: std::env::consts::ARCH.to_string(),
-            public_key: String::new(),
-            last_seen: now.clone(),
-            capabilities: DeviceCapabilities {
-                cloud_files_api: true,
-                file_provider: false,
-                fuse: false,
-                background_sync: true,
-                encryption_at_rest: false,
-            },
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-        };
-        let device_json = Serializer::serialize_device(&device)?;
-        let device_key = format!(".s4drive/devices/{}.json", self.device_id);
-        self.s3.put_metadata(&device_key, &device_json).await?;
 
         // Bucket descriptor
         let desc = BucketDescriptor {
             bucket_id,
-            schema_version: 1,
+            schema_version: crate::metadata::SUPPORTED_SCHEMA_VERSION,
             created_at: now,
             owner: device_name.to_string(),
             capabilities: vec![
@@ -74,6 +60,7 @@ impl MetadataEngine {
             ],
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
         };
+        Validator::validate_descriptor(&desc)?;
         let desc_json = Serializer::serialize_descriptor(&desc)?;
         let desc_key = Serializer::descriptor_key();
         // Use CAS (If-None-Match: *) so we don't overwrite existing
@@ -91,7 +78,80 @@ impl MetadataEngine {
             Err(e) => return Err(e),
         }
 
-        // Lock prefix marker
+        // Schema migration marker for protocol v1.
+        let migration = serde_json::json!({
+            "schema_version": crate::metadata::SUPPORTED_SCHEMA_VERSION,
+            "name": "metadata_protocol_v1",
+            "applied_at": chrono::Utc::now().to_rfc3339(),
+            "client_version": env!("CARGO_PKG_VERSION"),
+        });
+        self.s3
+            .put_if_not_exists(
+                &Serializer::schema_migration_key(crate::metadata::SUPPORTED_SCHEMA_VERSION),
+                serde_json::to_vec_pretty(&migration)
+                    .map_err(|e| CoreError::Protocol(e.to_string()))?,
+            )
+            .await?;
+
+        // Device registration.
+        let device = Device {
+            device_id: self.device_id,
+            device_name: device_name.to_string(),
+            platform: std::env::consts::OS.to_string(),
+            os_version: std::env::consts::ARCH.to_string(),
+            public_key: String::new(),
+            last_seen: chrono::Utc::now().to_rfc3339(),
+            capabilities: DeviceCapabilities {
+                cloud_files_api: true,
+                file_provider: false,
+                fuse: false,
+                background_sync: true,
+                encryption_at_rest: false,
+            },
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        let device_id = self.device_id.to_string();
+        let device_json = Serializer::serialize_device(&device)?;
+        self.s3
+            .put_if_not_exists(
+                &Serializer::device_registration_key(&device_id),
+                device_json.into_bytes(),
+            )
+            .await?;
+
+        let capabilities_json = serde_json::to_vec_pretty(&device.capabilities)
+            .map_err(|e| CoreError::Protocol(e.to_string()))?;
+        self.s3
+            .put_if_not_exists(
+                &Serializer::device_capabilities_key(&device_id),
+                capabilities_json,
+            )
+            .await?;
+
+        let registry = serde_json::json!({
+            "schema_version": crate::metadata::SUPPORTED_SCHEMA_VERSION,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "devices": [{
+                "device_id": self.device_id,
+                "device_name": device.device_name,
+                "platform": device.platform,
+                "client_version": device.client_version,
+                "last_seen": device.last_seen,
+            }],
+        });
+        self.s3
+            .put_if_not_exists(
+                &Serializer::device_registry_key(),
+                serde_json::to_vec_pretty(&registry)
+                    .map_err(|e| CoreError::Protocol(e.to_string()))?,
+            )
+            .await?;
+
+        self.s3
+            .put_if_not_exists(&Serializer::blob_manifest_key(), b"{}".to_vec())
+            .await?;
+
+        // Lock prefix marker.
         self.s3
             .put_object(".s4drive/system/locks/", b"".to_vec())
             .await?;
@@ -112,10 +172,7 @@ impl MetadataEngine {
             Ok(_) => Ok(true),
             Err(e) => match &e {
                 CoreError::NotFound(_) => Ok(false),
-                _ => {
-                    tracing::debug!("check_initialized (treating as not initialized): {}", e);
-                    Ok(false)
-                }
+                _ => Err(e),
             },
         }
     }
@@ -125,7 +182,9 @@ impl MetadataEngine {
         let data = self.s3.get_object(&Serializer::descriptor_key()).await?;
         let text =
             String::from_utf8(data).map_err(|e| CoreError::Protocol(format!("UTF-8: {}", e)))?;
-        Serializer::deserialize_descriptor(&text)
+        let desc = Serializer::deserialize_descriptor(&text)?;
+        Validator::validate_descriptor(&desc)?;
+        Ok(desc)
     }
 
     /// Получить логический clock и инкремент.

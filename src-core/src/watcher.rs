@@ -1,7 +1,10 @@
 use crate::config::Config;
 use crate::error::{CoreError, CoreResult};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use notify::{
+    event::{ModifyKind, RenameMode},
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
+use std::path::{Component, Path};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -64,6 +67,21 @@ impl FsEventStream {
         }
 
         events
+    }
+
+    /// Return true if at least one event is ready without discarding it.
+    pub fn has_pending(&mut self) -> bool {
+        if !self.pending.is_empty() {
+            return true;
+        }
+
+        if let Ok(rx) = self.rx.lock() {
+            while let Ok(event) = rx.try_recv() {
+                self.pending.push(event);
+            }
+        }
+
+        !self.pending.is_empty()
     }
 }
 
@@ -202,13 +220,28 @@ impl Drop for FileWatcher {
 
 /// Convert a notify event to S4Drive FsEvent.
 fn convert_notify_event(event: &Event) -> Option<FsEvent> {
-    let path = event.paths.first()?;
-    let path_str = path.to_string_lossy().to_string();
+    match event.kind {
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            return convert_rename_event(event);
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            let path = event.paths.first()?;
+            return visible_event(path, FsEvent::Deleted);
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            let path = event.paths.first()?;
+            return visible_event(path, FsEvent::Created);
+        }
+        _ => {}
+    }
 
-    if should_ignore(&path_str) {
+    let path = event.paths.first()?;
+
+    if should_ignore_path(path) {
         return None;
     }
 
+    let path_str = path.to_string_lossy().to_string();
     match event.kind {
         EventKind::Create(_) => Some(FsEvent::Created(path_str)),
         EventKind::Modify(_) => Some(FsEvent::Modified(path_str)),
@@ -220,9 +253,50 @@ fn convert_notify_event(event: &Event) -> Option<FsEvent> {
     }
 }
 
+fn convert_rename_event(event: &Event) -> Option<FsEvent> {
+    let from = event.paths.first()?;
+    let to = event.paths.get(1)?;
+    let from_ignored = should_ignore_path(from);
+    let to_ignored = should_ignore_path(to);
+
+    match (from_ignored, to_ignored) {
+        (true, true) => None,
+        (true, false) => Some(FsEvent::Created(to.to_string_lossy().to_string())),
+        (false, true) => Some(FsEvent::Deleted(from.to_string_lossy().to_string())),
+        (false, false) => Some(FsEvent::Renamed {
+            from: from.to_string_lossy().to_string(),
+            to: to.to_string_lossy().to_string(),
+        }),
+    }
+}
+
+fn visible_event(path: &Path, build: impl FnOnce(String) -> FsEvent) -> Option<FsEvent> {
+    if should_ignore_path(path) {
+        return None;
+    }
+    Some(build(path.to_string_lossy().to_string()))
+}
+
 /// Skip common system/temporary files.
+#[cfg(test)]
 fn should_ignore(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or("");
+    should_ignore_path(Path::new(path))
+}
+
+fn should_ignore_path(path: &Path) -> bool {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name) if name.to_string_lossy().starts_with('.')
+        )
+    }) {
+        return true;
+    }
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
     if name.starts_with('.') && !name.starts_with(".s4drive") {
         return true;
     }
@@ -247,10 +321,11 @@ mod tests {
     fn test_should_ignore_temp_files() {
         assert!(should_ignore("/tmp/test.txt~"));
         assert!(should_ignore("/tmp/.hidden"));
+        assert!(should_ignore("/tmp/dir/.hidden/file.txt"));
+        assert!(should_ignore("/tmp/.s4drive/descriptor.json"));
         assert!(should_ignore("/tmp/Thumbs.db"));
         assert!(should_ignore("/tmp/.DS_Store"));
         assert!(!should_ignore("/tmp/real-file.txt"));
-        assert!(!should_ignore("/tmp/.s4drive/descriptor.json"));
     }
 
     #[test]
@@ -269,5 +344,45 @@ mod tests {
         };
         assert_eq!(e.path(), "/tmp/b.txt");
         assert_eq!(e.event_type(), "renamed");
+    }
+
+    #[test]
+    fn test_convert_notify_rename_event() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path("/tmp/a.txt".into())
+            .add_path("/tmp/b.txt".into());
+
+        match convert_notify_event(&event).unwrap() {
+            FsEvent::Renamed { from, to } => {
+                assert_eq!(from, "/tmp/a.txt");
+                assert_eq!(to, "/tmp/b.txt");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_notify_ignores_internal_metadata() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path("/tmp/.s4drive/a.json".into())
+            .add_path("/tmp/.s4drive/b.json".into());
+
+        assert!(convert_notify_event(&event).is_none());
+    }
+
+    #[test]
+    fn test_has_pending_does_not_discard_events() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(FsEvent::Created("/tmp/file.txt".into())).unwrap();
+        let mut stream = FsEventStream {
+            rx: Arc::new(Mutex::new(rx)),
+            pending: Vec::new(),
+        };
+
+        assert!(stream.has_pending());
+        let events = stream.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path(), "/tmp/file.txt");
+        assert!(!stream.has_pending());
     }
 }

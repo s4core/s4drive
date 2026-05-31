@@ -900,12 +900,16 @@ pub fn install_context_menu(cli_path: &str) -> std::io::Result<Vec<PathBuf>> {
         Platform::Windows => {
             paths.push(install_windows_context_menu(cli_path)?);
             eprintln!("  ✓ Windows context menu .reg file generated:");
-            eprintln!("    regedit.exe /s {}", paths.last().unwrap().display());
+            if let Some(path) = paths.last() {
+                eprintln!("    regedit.exe /s {}", path.display());
+            }
         }
         Platform::Macos => {
             paths.push(install_macos_finder_integration(cli_path)?);
             eprintln!("  ✓ macOS Finder integration script:");
-            eprintln!("    chmod +x {}", paths.last().unwrap().display());
+            if let Some(path) = paths.last() {
+                eprintln!("    chmod +x {}", path.display());
+            }
         }
         Platform::Linux => {
             if let Ok(p) = install_nautilus_extension(cli_path) {

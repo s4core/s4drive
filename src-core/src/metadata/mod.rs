@@ -11,6 +11,8 @@
 /// - RevisionGraph: DAG of file revisions
 /// - Serializer: JSON serialization for all metadata types
 /// - Validator: invariant validation
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
 pub mod blobs;
 pub mod engine;
 pub mod graph;
