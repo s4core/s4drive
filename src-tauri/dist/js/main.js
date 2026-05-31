@@ -34,6 +34,8 @@
     files: [],
     fileQuery: '',
     fileView: 'list',
+    fileScrollTop: 0,
+    fileScrollFrame: null,
     selectedFileId: null,
     versions: [],
     devices: [],
@@ -41,6 +43,10 @@
     conflicts: [],
     activities: [],
   };
+
+  const FILE_ROW_HEIGHT = 42;
+  const FILE_OVERSCAN_ROWS = 8;
+  const FILE_VIRTUAL_THRESHOLD = 200;
 
   // ─── File Icons by Type ──────────────────────────────────────
   const FILE_ICONS = {
@@ -175,7 +181,8 @@
   function renderFiles() {
     const list = document.getElementById('fileList');
     const files = filteredFiles();
-    list.className = state.fileView === 'grid' ? 'file-grid' : 'file-list';
+    const isGrid = state.fileView === 'grid';
+    list.className = isGrid ? 'file-grid' : 'file-list';
 
     if (!files.length) {
       const isSearch = state.fileQuery.trim().length > 0;
@@ -188,15 +195,47 @@
       return;
     }
 
-    list.innerHTML = files.map(file => `
+    if (!isGrid && files.length > FILE_VIRTUAL_THRESHOLD) {
+      renderVirtualFileList(list, files);
+      return;
+    }
+
+    list.innerHTML = files.map(renderFileItem).join('');
+  }
+
+  function renderVirtualFileList(list, files) {
+    list.className = 'file-list is-virtualized';
+
+    const viewportHeight = list.clientHeight || 420;
+    const totalHeight = files.length * FILE_ROW_HEIGHT;
+    const maxScrollTop = Math.max(0, totalHeight - viewportHeight);
+    const scrollTop = Math.max(0, Math.min(state.fileScrollTop, maxScrollTop));
+    const firstVisible = Math.floor(scrollTop / FILE_ROW_HEIGHT);
+    const start = Math.max(0, firstVisible - FILE_OVERSCAN_ROWS);
+    const visibleRows = Math.ceil(viewportHeight / FILE_ROW_HEIGHT) + FILE_OVERSCAN_ROWS * 2;
+    const end = Math.min(files.length, start + visibleRows);
+    const topSpacer = start * FILE_ROW_HEIGHT;
+    const bottomSpacer = Math.max(0, totalHeight - topSpacer - (end - start) * FILE_ROW_HEIGHT);
+
+    list.innerHTML = `
+      <div class="file-virtual-spacer" style="height:${topSpacer}px"></div>
+      ${files.slice(start, end).map(renderFileItem).join('')}
+      <div class="file-virtual-spacer" style="height:${bottomSpacer}px"></div>`;
+
+    if (Math.abs(list.scrollTop - scrollTop) > 1) {
+      list.scrollTop = scrollTop;
+    }
+  }
+
+  function renderFileItem(file) {
+    return `
       <button class="file-item ${file.file_id === state.selectedFileId ? 'selected' : ''}" data-file-id="${escapeAttr(file.file_id)}">
         <span class="file-icon">${getFileIcon(file.kind === 'folder' ? 'folder' : file.name)}</span>
         <span class="file-name">${escapeHtml(file.name || file.path)}</span>
         <span class="file-size">${formatBytes(file.size_bytes)}</span>
         <span class="file-date">${formatDate(file.modified_at)}</span>
         <span class="file-status"><span class="sync-badge ${escapeAttr(file.sync_state || 'synced')}">${formatStatus(file.sync_state)}</span></span>
-      </button>
-    `).join('');
+      </button>`;
   }
 
   function filteredFiles() {
@@ -662,8 +701,22 @@
     const currentIndex = files.findIndex(file => file.file_id === state.selectedFileId);
     const nextIndex = currentIndex < 0 ? 0 : Math.max(0, Math.min(files.length - 1, currentIndex + delta));
     state.selectedFileId = files[nextIndex].file_id;
+    keepFileIndexVisible(nextIndex);
     renderFiles();
     renderFileDetails();
+  }
+
+  function keepFileIndexVisible(index) {
+    if (state.fileView !== 'list') return;
+    const list = document.getElementById('fileList');
+    const viewportHeight = list?.clientHeight || 420;
+    const rowTop = index * FILE_ROW_HEIGHT;
+    const rowBottom = rowTop + FILE_ROW_HEIGHT;
+    if (rowTop < state.fileScrollTop) {
+      state.fileScrollTop = rowTop;
+    } else if (rowBottom > state.fileScrollTop + viewportHeight) {
+      state.fileScrollTop = rowBottom - viewportHeight;
+    }
   }
 
   // ─── Init ────────────────────────────────────────────────────
@@ -734,15 +787,27 @@
         document.querySelectorAll('[data-view]').forEach(b => b.classList.remove('active'));
         this.classList.add('active');
         state.fileView = this.dataset.view === 'grid' ? 'grid' : 'list';
+        state.fileScrollTop = 0;
         renderFiles();
       });
     });
 
     document.getElementById('fileSearch').addEventListener('input', (event) => {
       state.fileQuery = event.target.value;
+      state.fileScrollTop = 0;
       renderFiles();
     });
-    document.getElementById('fileList').addEventListener('click', (event) => {
+    const fileList = document.getElementById('fileList');
+    fileList.addEventListener('scroll', () => {
+      if (state.fileView !== 'list') return;
+      state.fileScrollTop = fileList.scrollTop;
+      if (state.fileScrollFrame) return;
+      state.fileScrollFrame = requestAnimationFrame(() => {
+        state.fileScrollFrame = null;
+        renderFiles();
+      });
+    });
+    fileList.addEventListener('click', (event) => {
       const item = event.target.closest('[data-file-id]');
       if (!item) return;
       state.selectedFileId = item.dataset.fileId;

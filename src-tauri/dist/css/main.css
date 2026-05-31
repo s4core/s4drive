@@ -529,6 +529,22 @@ body {
   overflow: hidden;
 }
 
+.file-list {
+  min-height: 320px;
+  max-height: calc(100dvh - 230px);
+  overflow-y: auto;
+}
+
+.file-list.is-virtualized {
+  contain: strict;
+  overflow-anchor: none;
+}
+
+.file-virtual-spacer {
+  width: 100%;
+  flex: 0 0 auto;
+}
+
 .file-header-row {
   display: grid;
   grid-template-columns: minmax(160px, 1fr) 72px 110px 82px;
@@ -560,6 +576,12 @@ body {
 }
 .file-item:hover { background: var(--bg-hover); }
 .file-item.selected { background: var(--accent-soft); }
+.file-list .file-item {
+  min-height: 42px;
+}
+.file-list.is-virtualized .file-item {
+  height: 42px;
+}
 
 .file-icon { font-size: 20px; width: 28px; text-align: center; flex-shrink: 0; }
 .file-name { flex: 1; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

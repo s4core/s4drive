@@ -1,13 +1,17 @@
 use crate::config::Config;
 use crate::error::{CoreError, CoreResult};
 use crate::s3::retry::RetryPolicy;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::Client as S3Client;
 use base64::{engine::general_purpose, Engine as _};
 use md5::{Digest, Md5};
 use std::future::Future;
+use std::path::Path;
+use tokio::io::AsyncWriteExt;
 
 const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+const MAX_MULTIPART_PARTS: u64 = 10_000;
+const FILE_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Async object-store abstraction used by S4Drive's sync and metadata layers.
 #[allow(async_fn_in_trait)]
@@ -212,6 +216,44 @@ impl S3Adapter {
         .await
     }
 
+    /// PUT a local file via a retryable filesystem-backed stream with If-None-Match.
+    pub async fn put_file_if_not_exists(
+        &self,
+        key: &str,
+        path: &Path,
+        size: u64,
+    ) -> CoreResult<bool> {
+        let path = path.to_path_buf();
+        self.with_retry(|| {
+            let path = path.clone();
+            async move {
+                let body = file_byte_stream(&path, 0, size).await?;
+                let result = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(body)
+                    .if_none_match("*")
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(err) => {
+                        let service_err = err.into_service_error();
+                        if service_err.meta().code() == Some("PreconditionFailed") {
+                            Ok(false)
+                        } else {
+                            Err(classify_s3_error(service_err, key))
+                        }
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     /// PUT with conditional If-Match (CAS).
     /// Returns Ok(true) if updated, Ok(false) if precondition failed (412).
     pub async fn put_if_match(
@@ -298,6 +340,38 @@ impl S3Adapter {
                 .to_vec();
 
             Ok(data)
+        })
+        .await
+    }
+
+    /// Stream an object directly to a local path.
+    pub async fn download_object_to_file(&self, key: &str, path: &Path) -> CoreResult<u64> {
+        let path = path.to_path_buf();
+        self.with_retry(|| {
+            let path = path.clone();
+            async move {
+                let resp = self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|e| classify_s3_error(e, key))?;
+
+                let mut reader = resp.body.into_async_read();
+                let mut file = tokio::fs::File::create(&path).await.map_err(|e| {
+                    CoreError::FileSystem(format!("create {}: {}", path.display(), e))
+                })?;
+                let bytes = tokio::io::copy(&mut reader, &mut file).await.map_err(|e| {
+                    CoreError::FileSystem(format!("write {}: {}", path.display(), e))
+                })?;
+                file.flush().await.map_err(|e| {
+                    CoreError::FileSystem(format!("flush {}: {}", path.display(), e))
+                })?;
+
+                Ok(bytes)
+            }
         })
         .await
     }
@@ -582,6 +656,52 @@ impl S3Adapter {
         .await
     }
 
+    /// Upload one multipart part from a local file range.
+    pub async fn upload_multipart_file_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        path: &Path,
+        offset: u64,
+        size: u64,
+    ) -> CoreResult<String> {
+        if size == 0 {
+            return Err(CoreError::S3(format!(
+                "multipart part {} for '{}' is empty",
+                part_number, key
+            )));
+        }
+
+        let path = path.to_path_buf();
+        self.with_retry(|| {
+            let path = path.clone();
+            async move {
+                let body = file_byte_stream(&path, offset, size).await?;
+                let part_resp = self
+                    .client
+                    .upload_part()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| classify_s3_error(e, key))?;
+
+                let etag = part_resp.e_tag().ok_or_else(|| {
+                    CoreError::S3(format!(
+                        "upload file part {} for '{}' returned no ETag",
+                        part_number, key
+                    ))
+                })?;
+                Ok(normalize_etag(Some(etag)))
+            }
+        })
+        .await
+    }
+
     /// Upload a file using multipart upload with 5 MiB parts.
     pub async fn multipart_upload(&self, key: &str, data: Vec<u8>) -> CoreResult<String> {
         let upload = self.create_multipart_upload(key).await?;
@@ -594,6 +714,35 @@ impl S3Adapter {
         }
 
         result
+    }
+
+    /// Upload a local file using multipart upload with no full-file allocation.
+    pub async fn multipart_upload_file_if_not_exists(
+        &self,
+        key: &str,
+        path: &Path,
+        size: u64,
+    ) -> CoreResult<bool> {
+        if size == 0 {
+            return self.put_file_if_not_exists(key, path, size).await;
+        }
+
+        let upload = self.create_multipart_upload(key).await?;
+        let result = self
+            .complete_multipart_upload_from_file_if_not_exists(key, &upload.upload_id, path, size)
+            .await;
+
+        match result {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                let _ = self.abort_multipart_upload(key, &upload.upload_id).await;
+                Ok(false)
+            }
+            Err(err) => {
+                let _ = self.abort_multipart_upload(key, &upload.upload_id).await;
+                Err(err)
+            }
+        }
     }
 
     async fn complete_multipart_upload_from_bytes(
@@ -609,7 +758,7 @@ impl S3Adapter {
             )));
         }
 
-        let total_parts = data.len().div_ceil(MULTIPART_PART_SIZE);
+        let total_parts = multipart_part_count(data.len() as u64)? as usize;
         let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> =
             Vec::with_capacity(total_parts);
 
@@ -649,6 +798,67 @@ impl S3Adapter {
                     .map_err(|e| classify_s3_error(e, key))?;
 
                 Ok(normalize_etag(result.e_tag()))
+            }
+        })
+        .await
+    }
+
+    async fn complete_multipart_upload_from_file_if_not_exists(
+        &self,
+        key: &str,
+        upload_id: &str,
+        path: &Path,
+        size: u64,
+    ) -> CoreResult<bool> {
+        let total_parts = multipart_part_count(size)?;
+        let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> =
+            Vec::with_capacity(total_parts as usize);
+
+        for index in 0..total_parts {
+            let offset = u64::from(index) * MULTIPART_PART_SIZE as u64;
+            let part_size = (size - offset).min(MULTIPART_PART_SIZE as u64);
+            let part_number = (index + 1) as i32;
+            let etag = self
+                .upload_multipart_file_part(key, upload_id, part_number, path, offset, part_size)
+                .await?;
+
+            completed_parts.push(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .e_tag(quote_etag_for_condition(&etag))
+                    .part_number(part_number)
+                    .build(),
+            );
+        }
+
+        let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+
+        self.with_retry(|| {
+            let completed = completed.clone();
+            async move {
+                let result = self
+                    .client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .multipart_upload(completed)
+                    .if_none_match("*")
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(err) => {
+                        let service_err = err.into_service_error();
+                        if service_err.meta().code() == Some("PreconditionFailed") {
+                            Ok(false)
+                        } else {
+                            Err(classify_s3_error(service_err, key))
+                        }
+                    }
+                }
             }
         })
         .await
@@ -724,6 +934,35 @@ impl S3ObjectStore for S3Adapter {
     }
 }
 
+async fn file_byte_stream(path: &Path, offset: u64, size: u64) -> CoreResult<ByteStream> {
+    ByteStream::read_from()
+        .path(path)
+        .offset(offset)
+        .length(Length::Exact(size))
+        .buffer_size(FILE_STREAM_BUFFER_SIZE)
+        .build()
+        .await
+        .map_err(|e| CoreError::FileSystem(format!("stream {}: {}", path.display(), e)))
+}
+
+pub(crate) fn multipart_part_count(size: u64) -> CoreResult<u32> {
+    if size == 0 {
+        return Err(CoreError::S3(
+            "multipart upload requires at least one byte".into(),
+        ));
+    }
+
+    let parts = size.div_ceil(MULTIPART_PART_SIZE as u64);
+    if parts > MAX_MULTIPART_PARTS {
+        return Err(CoreError::S3(format!(
+            "multipart upload requires {} parts, above the S3 limit of {}",
+            parts, MAX_MULTIPART_PARTS
+        )));
+    }
+
+    Ok(parts as u32)
+}
+
 fn normalize_etag(etag: Option<&str>) -> String {
     etag.unwrap_or_default().trim_matches('"').to_string()
 }
@@ -786,6 +1025,22 @@ mod tests {
     #[test]
     fn content_md5_is_standard_base64() {
         assert_eq!(content_md5_base64(b"hello"), "XUFAKrxLKna5cZ2REBfFkg==");
+    }
+
+    #[test]
+    fn multipart_part_count_enforces_s3_boundaries() {
+        assert!(multipart_part_count(0).is_err());
+        assert_eq!(
+            multipart_part_count(MULTIPART_PART_SIZE as u64).expect("one full part"),
+            1
+        );
+        assert_eq!(
+            multipart_part_count(MULTIPART_PART_SIZE as u64 + 1).expect("two parts"),
+            2
+        );
+
+        let too_large = (MAX_MULTIPART_PARTS * MULTIPART_PART_SIZE as u64) + 1;
+        assert!(multipart_part_count(too_large).is_err());
     }
 
     #[test]

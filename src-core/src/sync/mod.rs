@@ -21,7 +21,7 @@ pub use versions::{VersionApi, VersionHistory, VersionInfo};
 
 use crate::db::LocalDatabase;
 use crate::error::{CoreError, CoreResult};
-use crate::metadata::blobs::BlobStore;
+use crate::metadata::blobs::{hash_file_blake3, BlobStore};
 use crate::metadata::engine::MetadataEngine;
 use crate::metadata::ops::OperationLog;
 use crate::metadata::tree::{FileTree, TombstoneManager};
@@ -29,6 +29,7 @@ use crate::metadata::types::{
     ContentRef, Effects, EntryType, FileEntry, OpType, Operation, Preconditions,
 };
 use crate::metadata::validator::Validator;
+use crate::optimization::{clamp_concurrency, AdaptiveConcurrency, IdleBackoff};
 use crate::s3::S3Adapter;
 use crate::transfer::TransferQueue;
 use crate::watcher::{FsEvent, FsEventStream};
@@ -36,7 +37,9 @@ use crate::watcher::{FsEvent, FsEventStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const TEXT_AUTO_MERGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The sync engine orchestrates two-way synchronization.
 #[allow(clippy::too_many_arguments)]
@@ -47,6 +50,8 @@ pub struct SyncEngine {
     polling_interval: Arc<Mutex<Duration>>,
     task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     max_retries: u32,
+    max_concurrent_uploads: u32,
+    max_concurrent_downloads: u32,
 
     configured: bool,
     sync_folder: String,
@@ -76,6 +81,8 @@ impl SyncEngine {
             polling_interval: Arc::new(Mutex::new(Duration::from_secs(30))),
             task_handle: Arc::new(Mutex::new(None)),
             max_retries: 3,
+            max_concurrent_uploads: crate::optimization::DEFAULT_MAX_CONCURRENT,
+            max_concurrent_downloads: crate::optimization::DEFAULT_MAX_CONCURRENT,
             configured: false,
             sync_folder: String::new(),
             event_stream: None,
@@ -101,6 +108,8 @@ impl SyncEngine {
         s3: S3Adapter,
         sync_folder: &str,
         max_retries: u32,
+        max_concurrent_uploads: u32,
+        max_concurrent_downloads: u32,
     ) {
         self.event_stream = Some(Arc::new(Mutex::new(event_stream)));
         self.metadata = Some(metadata);
@@ -121,6 +130,8 @@ impl SyncEngine {
         let sync_folder = shellexpand::tilde(sync_folder).to_string();
         self.sync_folder = sync_folder.clone();
         self.max_retries = max_retries;
+        self.max_concurrent_uploads = clamp_concurrency(max_concurrent_uploads);
+        self.max_concurrent_downloads = clamp_concurrency(max_concurrent_downloads);
         self.conflict = Some(ConflictHandler::new());
         self.conflict_engine = Some(ConflictEngine::new(
             Some(db.clone()),
@@ -212,11 +223,10 @@ impl SyncEngine {
             .ok_or_else(|| CoreError::Internal("activity log missing".into()))?;
         let sync_folder = self.sync_folder.clone();
         let max_retries = self.max_retries;
-        let base_interval = Duration::from_secs(30);
-        let max_interval = Duration::from_secs(300);
-
+        let max_concurrent_uploads = self.max_concurrent_uploads;
+        let max_concurrent_downloads = self.max_concurrent_downloads;
         let handle = tokio::spawn(async move {
-            let mut consecutive_idle = 0u32;
+            let mut idle_backoff = IdleBackoff::new();
             tracing::info!("Sync loop started");
             set_state(&state, SyncState::Idle);
 
@@ -233,6 +243,8 @@ impl SyncEngine {
                 &state,
                 &paused,
                 max_retries,
+                max_concurrent_uploads,
+                max_concurrent_downloads,
             )
             .await
             {
@@ -266,6 +278,8 @@ impl SyncEngine {
                     &state,
                     &sync_folder,
                     max_retries,
+                    max_concurrent_uploads,
+                    max_concurrent_downloads,
                 )
                 .await
                 {
@@ -277,46 +291,34 @@ impl SyncEngine {
                                 result.files_downloaded,
                                 result.conflicts_detected,
                             );
-                            consecutive_idle = 0;
+                            idle_backoff.reset();
                             if let Ok(mut iv) = interval.lock() {
-                                *iv = base_interval;
+                                *iv = idle_backoff.current_delay();
                             }
                         } else {
-                            consecutive_idle += 1;
+                            let delay = idle_backoff.next_idle_delay();
+                            if let Ok(mut iv) = interval.lock() {
+                                *iv = delay;
+                            }
                         }
                     }
                     Err(e) => {
                         tracing::error!("Sync cycle error: {}", e);
                         set_state(&state, SyncState::Error(format!("sync error: {}", e)));
-                        consecutive_idle += 1;
+                        let delay = idle_backoff.next_idle_delay();
+                        if let Ok(mut iv) = interval.lock() {
+                            *iv = delay;
+                        }
                     }
                 }
 
                 let current_interval = {
-                    if consecutive_idle >= 3 {
-                        // Adaptive backoff: double each idle cycle, cap at max_interval
-                        let shift = consecutive_idle.saturating_sub(3).min(10);
-                        let factor = 1u32 << shift; // 1, 2, 4, 8, 16...
-                        let backoff = base_interval
-                            .checked_mul(factor)
-                            .unwrap_or(base_interval)
-                            .min(max_interval);
-                        if let Ok(mut iv) = interval.lock() {
-                            *iv = backoff;
-                        }
-                        tracing::debug!(
-                            "Idle backoff: consecutive={}, interval={}s",
-                            consecutive_idle,
-                            backoff.as_secs()
-                        );
-                        backoff.as_millis() as u64
-                    } else {
-                        interval
-                            .lock()
-                            .map(|i| i.as_millis() as u64)
-                            .unwrap_or(30_000)
-                    }
+                    interval
+                        .lock()
+                        .map(|i| i.as_millis() as u64)
+                        .unwrap_or(30_000)
                 };
+                tracing::debug!("Idle polling interval={}ms", current_interval);
 
                 if running.load(Ordering::Relaxed) {
                     set_state(&state, SyncState::Idle);
@@ -393,6 +395,8 @@ impl Clone for SyncEngine {
             polling_interval: self.polling_interval.clone(),
             task_handle: self.task_handle.clone(),
             max_retries: self.max_retries,
+            max_concurrent_uploads: self.max_concurrent_uploads,
+            max_concurrent_downloads: self.max_concurrent_downloads,
             configured: self.configured,
             sync_folder: self.sync_folder.clone(),
             event_stream: self.event_stream.clone(),
@@ -485,6 +489,8 @@ async fn run_initial_sync(
     state: &Arc<Mutex<SyncState>>,
     paused: &AtomicBool,
     max_retries: u32,
+    max_concurrent_uploads: u32,
+    max_concurrent_downloads: u32,
 ) -> CoreResult<SyncResult> {
     let mut result = SyncResult::empty();
     let sync_path = Path::new(sync_folder);
@@ -581,6 +587,7 @@ async fn run_initial_sync(
             versions,
             sync_folder,
             max_retries,
+            max_concurrent_uploads,
         )
         .await?;
         result.files_uploaded = up;
@@ -639,8 +646,15 @@ async fn run_initial_sync(
     let (_, download_count) = transfer.pending_count()?;
     if download_count > 0 {
         set_state(state, SyncState::Downloading);
-        let (down, bytes) =
-            process_download_queue(transfer, download, db, activity, max_retries).await?;
+        let (down, bytes) = process_download_queue(
+            transfer,
+            download,
+            db,
+            activity,
+            max_retries,
+            max_concurrent_downloads,
+        )
+        .await?;
         result.files_downloaded = down;
         result.bytes_downloaded = bytes;
     }
@@ -664,6 +678,8 @@ async fn run_sync_cycle(
     state: &Arc<Mutex<SyncState>>,
     _sync_folder: &str,
     max_retries: u32,
+    max_concurrent_uploads: u32,
+    max_concurrent_downloads: u32,
 ) -> CoreResult<SyncResult> {
     let mut result = SyncResult::empty();
 
@@ -783,6 +799,7 @@ async fn run_sync_cycle(
             versions,
             _sync_folder,
             max_retries,
+            max_concurrent_uploads,
         )
         .await?;
         result.files_uploaded = up;
@@ -809,8 +826,15 @@ async fn run_sync_cycle(
     let (_, pending_downloads) = transfer.pending_count()?;
     if download_jobs > 0 || pending_downloads > 0 {
         set_state(state, SyncState::Downloading);
-        let (down, bytes) =
-            process_download_queue(transfer, download, db, activity, max_retries).await?;
+        let (down, bytes) = process_download_queue(
+            transfer,
+            download,
+            db,
+            activity,
+            max_retries,
+            max_concurrent_downloads,
+        )
+        .await?;
         result.files_downloaded += down;
         result.bytes_downloaded += bytes;
     }
@@ -832,45 +856,39 @@ async fn process_upload_queue(
     versions: &VersionApi,
     sync_folder: &str,
     max_retries: u32,
+    max_concurrent_uploads: u32,
 ) -> CoreResult<(u32, u64, u32)> {
     let mut uploaded = 0u32;
     let mut total_bytes = 0u64;
     let mut conflicts = 0u32;
+    let mut concurrency = AdaptiveConcurrency::new(max_concurrent_uploads);
 
     loop {
-        let jobs = transfer.pending_uploads(4)?;
+        let jobs = transfer.pending_uploads(concurrency.current())?;
         if jobs.is_empty() {
             break;
         }
 
         for job in &jobs {
+            let started = Instant::now();
             let file_id = job.file_id.clone();
             let local_path = job.local_path.clone();
             let s3_key = job.s3_key.clone();
 
             transfer.mark_in_progress(job.id)?;
 
-            let data = match tokio::fs::read(&local_path).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Upload failed (file not readable): {}: {}", local_path, e);
-                    transfer.mark_failed(job.id, &format!("file not readable: {}", e))?;
-                    continue;
-                }
-            };
-
-            let data_len = data.len() as u64;
             let blob_store = BlobStore::new(s3);
             let content_ref = match blob_store
-                .store_blob(&data, "application/octet-stream")
+                .store_file(Path::new(&local_path), "application/octet-stream")
                 .await
             {
                 Ok((_blob_id, content_ref)) => {
-                    total_bytes += data_len;
+                    total_bytes += content_ref.size;
                     content_ref
                 }
                 Err(e) => {
                     tracing::warn!("Blob upload failed: {}", e);
+                    concurrency.record_failure();
                     let retry = transfer.increment_retry(job.id)?;
                     if retry >= max_retries {
                         transfer.mark_failed(job.id, &format!("max retries: {}", e))?;
@@ -880,11 +898,13 @@ async fn process_upload_queue(
                     continue;
                 }
             };
+            let data_len = content_ref.size;
 
             let parsed_file_id = match uuid::Uuid::parse_str(&file_id) {
                 Ok(id) => id,
                 Err(e) => {
                     transfer.mark_failed(job.id, &format!("invalid file_id: {}", e))?;
+                    concurrency.record_failure();
                     continue;
                 }
             };
@@ -935,6 +955,7 @@ async fn process_upload_queue(
                     if has_open_conflict(db, &parsed_file_id, ConflictType::EditEdit.as_str())? {
                         transfer.mark_failed(job.id, "conflict: remote revision diverged")?;
                         conflicts += 1;
+                        concurrency.record_failure();
                         continue;
                     }
                     let now = chrono::Utc::now().to_rfc3339();
@@ -970,6 +991,7 @@ async fn process_upload_queue(
                     transfer.mark_failed(job.id, "conflict: remote revision diverged")?;
                     activity.log("upload_conflict", &file_id, &s3_key, &reason)?;
                     conflicts += 1;
+                    concurrency.record_failure();
                     continue;
                 }
             }
@@ -1017,6 +1039,7 @@ async fn process_upload_queue(
                     db.register_file_at_path_with_state(&entry, &local_path, &s3_key, "synced")?;
                     transfer.mark_completed(job.id)?;
                     uploaded += 1;
+                    concurrency.record_success(started.elapsed());
                     activity.log("upload_complete", &file_id, &s3_key, "success")?;
                 }
                 Err(e) => {
@@ -1025,8 +1048,10 @@ async fn process_upload_queue(
                         conflicts += 1;
                         transfer.mark_failed(job.id, &format!("conflict: {}", e))?;
                         activity.log("upload_conflict", &file_id, &s3_key, &e.to_string())?;
+                        concurrency.record_failure();
                     } else {
                         tracing::warn!("Metadata commit failed: {}", e);
+                        concurrency.record_failure();
                         let retry = transfer.increment_retry(job.id)?;
                         if retry >= max_retries {
                             transfer.mark_failed(job.id, &format!("max retries: {}", e))?;
@@ -1050,17 +1075,20 @@ async fn process_download_queue(
     db: &LocalDatabase,
     activity: &ActivityLog,
     max_retries: u32,
+    max_concurrent_downloads: u32,
 ) -> CoreResult<(u32, u64)> {
     let mut downloaded = 0u32;
     let mut total_bytes = 0u64;
+    let mut concurrency = AdaptiveConcurrency::new(max_concurrent_downloads);
 
     loop {
-        let jobs = transfer.pending_downloads(4)?;
+        let jobs = transfer.pending_downloads(concurrency.current())?;
         if jobs.is_empty() {
             break;
         }
 
         for job in &jobs {
+            let started = Instant::now();
             transfer.mark_in_progress(job.id)?;
 
             match download.download_file(&job.s3_key, &job.local_path).await {
@@ -1079,10 +1107,12 @@ async fn process_download_queue(
                     transfer.mark_completed(job.id)?;
                     downloaded += 1;
                     total_bytes += bytes;
+                    concurrency.record_success(started.elapsed());
                     activity.log("download_complete", &job.file_id, &job.s3_key, "success")?;
                 }
                 Err(e) => {
                     tracing::warn!("Download failed: {}", e);
+                    concurrency.record_failure();
                     let retry = transfer.increment_retry(job.id)?;
                     if retry >= max_retries {
                         transfer.mark_failed(job.id, &format!("max retries: {}", e))?;
@@ -1774,6 +1804,23 @@ async fn try_text_auto_merge(
         return Ok(None);
     };
 
+    let local_size = tokio::fs::metadata(local_path)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(local_entry.size);
+    if base_revision.size > TEXT_AUTO_MERGE_MAX_BYTES
+        || local_size > TEXT_AUTO_MERGE_MAX_BYTES
+        || remote_content.size > TEXT_AUTO_MERGE_MAX_BYTES
+    {
+        tracing::debug!(
+            "Auto-merge skipped: file too large for in-memory text merge (base={}, local={}, remote={})",
+            base_revision.size,
+            local_size,
+            remote_content.size
+        );
+        return Ok(None);
+    }
+
     let blob_store = BlobStore::new(s3);
     let base_bytes = match blob_store
         .get_blob(base_hash.trim_start_matches("blake3:"))
@@ -1949,11 +1996,8 @@ fn move_local_file_to_trash(
 // ─── Helpers ────────────────────────────────────────────────────
 
 async fn blake3_file_hash(path: &Path) -> CoreResult<(String, u64)> {
-    let data = tokio::fs::read(path)
-        .await
-        .map_err(|e| CoreError::FileSystem(format!("read {}: {}", path.display(), e)))?;
-    let size = data.len() as u64;
-    Ok((blake3::hash(&data).to_hex().to_string(), size))
+    let (_digest, hash, size) = hash_file_blake3(path).await?;
+    Ok((hash, size))
 }
 
 fn blake3_local_hash(hash: &str) -> String {

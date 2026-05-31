@@ -1,7 +1,12 @@
 use crate::error::{CoreError, CoreResult};
 use crate::metadata::serializer::Serializer;
 use crate::metadata::types::{BlobId, ContentRef};
+use crate::optimization::should_stream;
 use crate::s3::S3Adapter;
+use std::path::Path;
+use tokio::io::AsyncReadExt;
+
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Content-addressable blob storage.
 ///
@@ -73,6 +78,75 @@ impl<'a> BlobStore<'a> {
         ))
     }
 
+    /// Stream a file into content-addressable blob storage.
+    ///
+    /// The file is hashed with a bounded buffer, then uploaded through S3's
+    /// filesystem-backed stream/multipart path. A post-upload hash check rejects
+    /// files that changed while being uploaded so the content key cannot point at
+    /// different bytes.
+    pub async fn store_file(&self, path: &Path, mime: &str) -> CoreResult<(BlobId, ContentRef)> {
+        let (digest, hash, size) = hash_file_blake3(path).await?;
+        let blob_id = blob_id_from_digest(&digest);
+        let storage_key = Serializer::blob_key(&hash);
+
+        match self.s3.head_object(&storage_key).await {
+            Ok(_meta) => {
+                tracing::debug!("Blob already exists (dedup): {}", &hash[..16]);
+                return Ok((
+                    blob_id,
+                    ContentRef {
+                        blob_id,
+                        hash,
+                        size,
+                        mime: mime.to_string(),
+                        storage_key,
+                    },
+                ));
+            }
+            Err(CoreError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+
+        let created = if should_stream(size) {
+            self.s3
+                .multipart_upload_file_if_not_exists(&storage_key, path, size)
+                .await?
+        } else {
+            self.s3
+                .put_file_if_not_exists(&storage_key, path, size)
+                .await?
+        };
+
+        if created {
+            let (_after_digest, after_hash, after_size) = hash_file_blake3(path).await?;
+            if after_hash != hash || after_size != size {
+                let _ = self.s3.delete_object(&storage_key).await;
+                return Err(CoreError::FileSystem(format!(
+                    "file changed during upload: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        tracing::debug!(
+            "Blob stored from file: {} bytes, hash={}, key={}",
+            size,
+            &hash[..16],
+            storage_key
+        );
+
+        Ok((
+            blob_id,
+            ContentRef {
+                blob_id,
+                hash,
+                size,
+                mime: mime.to_string(),
+                storage_key,
+            },
+        ))
+    }
+
     /// Прочитать blob по hash.
     pub async fn get_blob(&self, hash: &str) -> CoreResult<Vec<u8>> {
         let storage_key = Serializer::blob_key(hash);
@@ -118,6 +192,31 @@ fn blob_id_from_digest(digest: &blake3::Hash) -> BlobId {
     uuid::Uuid::from_bytes(blob_id_bytes)
 }
 
+pub(crate) async fn hash_file_blake3(path: &Path) -> CoreResult<(blake3::Hash, String, u64)> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| CoreError::FileSystem(format!("open {}: {}", path.display(), e)))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| CoreError::FileSystem(format!("read {}: {}", path.display(), e)))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size.saturating_add(read as u64);
+    }
+
+    let digest = hasher.finalize();
+    let hash = digest.to_hex().to_string();
+    Ok((digest, hash, size))
+}
+
 /// Статистика по blobs.
 #[derive(Debug, Clone)]
 pub struct BlobStats {
@@ -156,5 +255,18 @@ mod tests {
     #[test]
     fn blob_key_does_not_panic_on_short_hash() {
         assert_eq!(Serializer::blob_key("a"), ".s4drive/content/blobs/a/a");
+    }
+
+    #[tokio::test]
+    async fn hash_file_blake3_uses_same_digest_as_memory_hash() {
+        let path = std::env::temp_dir().join(format!("s4drive-blob-hash-{}", uuid::Uuid::now_v7()));
+        std::fs::write(&path, b"streamed hash").unwrap();
+
+        let (_digest, hash, size) = hash_file_blake3(&path).await.unwrap();
+
+        assert_eq!(hash, blake3::hash(b"streamed hash").to_hex().to_string());
+        assert_eq!(size, 13);
+
+        let _ = std::fs::remove_file(path);
     }
 }

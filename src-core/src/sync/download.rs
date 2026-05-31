@@ -42,17 +42,11 @@ impl DownloadEngine {
 
         let _ = tokio::fs::remove_file(&staging_path).await;
 
-        let data = self
+        let size = self
             .s3
-            .get_object(s3_key)
+            .download_object_to_file(s3_key, &staging_path)
             .await
             .map_err(|e| CoreError::S3(format!("download failed ({}): {}", s3_key, e)))?;
-
-        let size = data.len() as u64;
-
-        tokio::fs::write(&staging_path, &data)
-            .await
-            .map_err(|e| CoreError::FileSystem(format!("staging write: {}", e)))?;
 
         tokio::fs::rename(&staging_path, final_path)
             .await
@@ -63,9 +57,5 @@ impl DownloadEngine {
 
         tracing::debug!("Downloaded: {} -> {} ({} bytes)", s3_key, local_path, size);
         Ok(size)
-    }
-
-    pub async fn download_to_memory(&self, s3_key: &str) -> CoreResult<Vec<u8>> {
-        self.s3.get_object(s3_key).await
     }
 }

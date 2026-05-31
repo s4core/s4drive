@@ -1,8 +1,9 @@
-//! Resource optimization helpers: rate limiter, streaming, bounded concurrency.
+//! Resource optimization helpers: rate limiter, streaming, bounded concurrency,
+//! idle polling backoff, and bounded LRU cache policy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Token bucket rate limiter for bandwidth control.
 ///
@@ -119,6 +120,125 @@ pub fn clamp_concurrency(val: u32) -> u32 {
     val.clamp(1, MAX_CONCURRENT_LIMIT)
 }
 
+/// Idle polling backoff for remote reconciliation.
+///
+/// Phase 8 requires the exact sequence 30s -> 60s -> 120s -> 300s while the
+/// sync loop is idle, and a reset as soon as any local or remote work happens.
+#[derive(Debug, Clone)]
+pub struct IdleBackoff {
+    steps: [Duration; 4],
+    idle_cycles: usize,
+}
+
+impl Default for IdleBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IdleBackoff {
+    pub fn new() -> Self {
+        Self {
+            steps: [
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(300),
+            ],
+            idle_cycles: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.idle_cycles = 0;
+    }
+
+    pub fn current_delay(&self) -> Duration {
+        self.steps[self.idle_cycles.min(self.steps.len() - 1)]
+    }
+
+    pub fn next_idle_delay(&mut self) -> Duration {
+        let delay = self.current_delay();
+        self.idle_cycles = self.idle_cycles.saturating_add(1);
+        delay
+    }
+}
+
+/// Simple adaptive concurrency controller for transfer workers.
+#[derive(Debug, Clone)]
+pub struct AdaptiveConcurrency {
+    current: u32,
+    min: u32,
+    max: u32,
+    target_latency: Duration,
+}
+
+impl AdaptiveConcurrency {
+    pub fn new(configured: u32) -> Self {
+        Self {
+            current: clamp_concurrency(configured),
+            min: 1,
+            max: MAX_CONCURRENT_LIMIT,
+            target_latency: Duration::from_secs(2),
+        }
+    }
+
+    pub fn current(&self) -> u32 {
+        self.current
+    }
+
+    pub fn record_success(&mut self, latency: Duration) {
+        if latency <= self.target_latency && self.current < self.max {
+            self.current += 1;
+        } else if latency > self.target_latency.saturating_mul(3) {
+            self.current = self.current.saturating_sub(1).max(self.min);
+        }
+    }
+
+    pub fn record_failure(&mut self) {
+        self.current = (self.current / 2).max(self.min);
+    }
+}
+
+/// Metadata for an item in a bounded local cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub key: String,
+    pub size_bytes: u64,
+    pub last_access_unix_ms: i64,
+}
+
+/// Return keys that should be evicted to satisfy both item and byte budgets.
+pub fn lru_eviction_candidates(
+    entries: &[CacheEntry],
+    max_items: usize,
+    max_bytes: u64,
+) -> Vec<String> {
+    let mut newest_first = entries.to_vec();
+    newest_first.sort_by(|a, b| {
+        b.last_access_unix_ms
+            .cmp(&a.last_access_unix_ms)
+            .then_with(|| a.key.cmp(&b.key))
+    });
+
+    let mut kept_items = 0usize;
+    let mut kept_bytes = 0u64;
+    let mut evicted = Vec::new();
+
+    for entry in newest_first {
+        let fits_items = kept_items < max_items;
+        let fits_bytes = kept_bytes.saturating_add(entry.size_bytes) <= max_bytes;
+        if fits_items && fits_bytes {
+            kept_items += 1;
+            kept_bytes = kept_bytes.saturating_add(entry.size_bytes);
+        } else {
+            evicted.push(entry.key);
+        }
+    }
+
+    evicted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +282,59 @@ mod tests {
         // unlimited — no need to wait
         let rate = limiter.rate.load(Ordering::Relaxed);
         assert_eq!(rate, 0);
+    }
+
+    #[test]
+    fn idle_backoff_uses_required_phase8_sequence() {
+        let mut backoff = IdleBackoff::new();
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(30));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(60));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(120));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(300));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(300));
+
+        backoff.reset();
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn adaptive_concurrency_grows_and_backs_off() {
+        let mut controller = AdaptiveConcurrency::new(4);
+        controller.record_success(Duration::from_millis(200));
+        assert_eq!(controller.current(), 5);
+
+        controller.record_failure();
+        assert_eq!(controller.current(), 2);
+
+        controller.record_failure();
+        controller.record_failure();
+        assert_eq!(controller.current(), 1);
+    }
+
+    #[test]
+    fn lru_eviction_respects_item_and_byte_budgets() {
+        let entries = vec![
+            CacheEntry {
+                key: "old".into(),
+                size_bytes: 10,
+                last_access_unix_ms: 1,
+            },
+            CacheEntry {
+                key: "new".into(),
+                size_bytes: 10,
+                last_access_unix_ms: 3,
+            },
+            CacheEntry {
+                key: "middle".into(),
+                size_bytes: 10,
+                last_access_unix_ms: 2,
+            },
+        ];
+
+        let evicted = lru_eviction_candidates(&entries, 2, 20);
+        assert_eq!(evicted, vec!["old"]);
+
+        let evicted = lru_eviction_candidates(&entries, 3, 15);
+        assert_eq!(evicted, vec!["middle", "old"]);
     }
 }
