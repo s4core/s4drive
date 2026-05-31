@@ -6,7 +6,11 @@ set -ex
 WORKSPACE="${1:-/workspace}"
 cd "$WORKSPACE"
 
-# System deps
+# System deps — noninteractive for tzdata
+export DEBIAN_FRONTEND=noninteractive
+export TZ=UTC
+ln -fs /usr/share/zoneinfo/UTC /etc/localtime 2>/dev/null || true
+
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
     curl ca-certificates build-essential pkg-config libssl-dev \
