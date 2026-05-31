@@ -43,6 +43,7 @@ pub struct DesktopSettings {
     pub proxy: Option<String>,
     pub autostart: bool,
     pub dark_mode: bool,
+    pub use_system_theme: bool,
     pub use_tls: bool,
 }
 
@@ -64,6 +65,7 @@ impl Default for DesktopSettings {
             proxy: None,
             autostart: false,
             dark_mode: true,
+            use_system_theme: true,
             use_tls: core_defaults.s3.use_tls,
         }
     }
@@ -161,6 +163,17 @@ struct ActivityItem {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct FileItem {
+    file_id: String,
+    name: String,
+    path: String,
+    kind: String,
+    size_bytes: u64,
+    modified_at: Option<String>,
+    sync_state: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct TransferItem {
     id: String,
     direction: String,
@@ -177,6 +190,26 @@ struct ConflictItem {
     conflict_type: String,
     human_reason: String,
     created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VersionItem {
+    revision_id: String,
+    file_id: String,
+    label: String,
+    author: String,
+    created_at: String,
+    size_bytes: Option<u64>,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeviceItem {
+    device_id: String,
+    name: String,
+    role: String,
+    last_seen: Option<String>,
+    trusted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -230,9 +263,12 @@ pub fn run() {
             sync_now,
             open_window,
             take_pending_route,
+            get_files,
             get_activity,
             get_transfers,
             get_conflicts,
+            get_versions,
+            get_devices,
             resolve_conflict,
             run_diagnostics,
             check_for_updates,
@@ -682,13 +718,40 @@ async fn test_connection(
             }),
             Err(error) => Ok(ConnectionTestResult {
                 ok: false,
-                message: format!("Bucket check failed: {}", error),
+                message: humanize_connection_error(&error.to_string()),
             }),
         },
         Err(error) => Ok(ConnectionTestResult {
             ok: false,
-            message: format!("S3 client initialization failed: {}", error),
+            message: humanize_connection_error(&error.to_string()),
         }),
+    }
+}
+
+fn humanize_connection_error(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("connection refused")
+        || lower.contains("dns")
+        || lower.contains("could not resolve")
+    {
+        "Cannot reach the storage server. Check the endpoint URL and network connection."
+            .to_string()
+    } else if lower.contains("accessdenied")
+        || lower.contains("forbidden")
+        || lower.contains("unauthorized")
+        || lower.contains("invalidaccesskey")
+        || lower.contains("signature")
+    {
+        "The credentials were rejected. Check the access key, secret key, and region.".to_string()
+    } else if lower.contains("nosuchbucket") || lower.contains("not found") {
+        "The bucket was not found. Check the bucket name or create it first.".to_string()
+    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("ssl") {
+        "TLS verification failed. Check the endpoint protocol and certificate.".to_string()
+    } else {
+        "Connection failed. Check the endpoint, bucket, credentials, and storage permissions."
+            .to_string()
     }
 }
 
@@ -725,6 +788,11 @@ fn take_pending_route(state: tauri::State<'_, AppState>) -> Result<Option<String
 }
 
 #[tauri::command]
+fn get_files() -> Result<Vec<FileItem>, String> {
+    Ok(Vec::new())
+}
+
+#[tauri::command]
 fn get_activity(state: tauri::State<'_, AppState>) -> Result<Vec<ActivityItem>, String> {
     let status = current_sync_status(state.inner())?;
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -745,6 +813,22 @@ fn get_transfers() -> Result<Vec<TransferItem>, String> {
 #[tauri::command]
 fn get_conflicts() -> Result<Vec<ConflictItem>, String> {
     Ok(Vec::new())
+}
+
+#[tauri::command]
+fn get_versions() -> Result<Vec<VersionItem>, String> {
+    Ok(Vec::new())
+}
+
+#[tauri::command]
+fn get_devices(state: tauri::State<'_, AppState>) -> Result<Vec<DeviceItem>, String> {
+    Ok(vec![DeviceItem {
+        device_id: state.device_id.clone(),
+        name: "This device".to_string(),
+        role: "Desktop client".to_string(),
+        last_seen: Some(chrono::Utc::now().to_rfc3339()),
+        trusted: true,
+    }])
 }
 
 #[tauri::command]
@@ -839,5 +923,14 @@ mod tests {
 
         settings.bucket.clear();
         assert!(!settings.account_is_complete());
+    }
+
+    #[test]
+    fn connection_errors_are_human_readable() {
+        let auth = humanize_connection_error("service error: AccessDenied");
+        assert!(auth.contains("credentials"));
+
+        let network = humanize_connection_error("request timeout");
+        assert!(network.contains("storage server"));
     }
 }

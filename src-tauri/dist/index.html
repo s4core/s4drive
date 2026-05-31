@@ -25,20 +25,25 @@
       </div>
     </header>
 
-    <!-- Navigation -->
-    <nav class="app-nav" id="appNav" role="tablist">
-      <button class="nav-btn active" data-route="overview" role="tab" aria-selected="true">Dashboard</button>
-      <button class="nav-btn" data-route="files" role="tab" aria-selected="false">Files</button>
-      <button class="nav-btn" data-route="transfers" role="tab" aria-selected="false">Transfers</button>
-      <button class="nav-btn" data-route="conflicts" role="tab" aria-selected="false">Conflicts</button>
-      <button class="nav-btn" data-route="activity" role="tab" aria-selected="false">Activity</button>
-      <button class="nav-btn" data-route="settings" role="tab" aria-selected="false">Settings</button>
-      <button class="nav-btn" data-route="diagnostics" role="tab" aria-selected="false">Diagnostics</button>
-      <button class="nav-btn" data-route="about" role="tab" aria-selected="false">About</button>
-    </nav>
+    <div class="app-shell">
+      <!-- Navigation -->
+      <aside class="app-sidebar" aria-label="Primary">
+        <nav class="app-nav" id="appNav" role="tablist">
+          <button class="nav-btn active" data-route="overview" role="tab" aria-selected="true"><span class="nav-icon">⌘</span><span>Dashboard</span></button>
+          <button class="nav-btn" data-route="files" role="tab" aria-selected="false"><span class="nav-icon">▦</span><span>Files</span></button>
+          <button class="nav-btn" data-route="transfers" role="tab" aria-selected="false"><span class="nav-icon">⇅</span><span>Transfers</span></button>
+          <button class="nav-btn" data-route="conflicts" role="tab" aria-selected="false"><span class="nav-icon">!</span><span>Conflicts</span></button>
+          <button class="nav-btn" data-route="versions" role="tab" aria-selected="false"><span class="nav-icon">↺</span><span>Versions</span></button>
+          <button class="nav-btn" data-route="activity" role="tab" aria-selected="false"><span class="nav-icon">≡</span><span>Activity</span></button>
+          <button class="nav-btn" data-route="account" role="tab" aria-selected="false"><span class="nav-icon">●</span><span>Account</span></button>
+          <button class="nav-btn" data-route="settings" role="tab" aria-selected="false"><span class="nav-icon">⚙</span><span>Settings</span></button>
+          <button class="nav-btn" data-route="diagnostics" role="tab" aria-selected="false"><span class="nav-icon">?</span><span>Diagnostics</span></button>
+          <button class="nav-btn" data-route="about" role="tab" aria-selected="false"><span class="nav-icon">i</span><span>About</span></button>
+        </nav>
+      </aside>
 
-    <!-- Content area -->
-    <main class="app-content" id="appContent">
+      <!-- Content area -->
+      <main class="app-content" id="appContent">
       <!-- ===== DASHBOARD ===== -->
       <section class="screen active" id="screen-overview" role="tabpanel">
         <div class="stats-grid">
@@ -58,6 +63,11 @@
             <div class="stat-label">Transfers</div>
             <div class="stat-value" id="transferCount">0</div>
           </div>
+        </div>
+        <div class="quick-actions">
+          <button class="btn btn-primary" id="btnSyncNow">Sync Now</button>
+          <button class="btn btn-outline" id="btnPauseSync">Pause Sync</button>
+          <button class="btn btn-outline" id="btnOpenAccount">Connect Storage</button>
         </div>
         <div class="section-title">Recent Activity</div>
         <div class="card" id="activityList">
@@ -84,20 +94,52 @@
       <!-- ===== FILES ===== -->
       <section class="screen" id="screen-files" role="tabpanel">
         <div class="toolbar">
+          <div class="breadcrumb" id="fileBreadcrumb">
+            <button class="breadcrumb-item" data-path="/">S4Drive</button>
+          </div>
           <div class="view-toggle">
             <button class="icon-btn active" data-view="list" title="List view">📋</button>
             <button class="icon-btn" data-view="grid" title="Grid view">🔲</button>
           </div>
           <div class="search-box">
             <span class="search-icon">🔍</span>
-            <input type="text" class="search-input" placeholder="Search files..." aria-label="Search files" />
+            <input type="text" class="search-input" id="fileSearch" placeholder="Search files..." aria-label="Search files" />
           </div>
         </div>
-        <div class="card" id="fileList">
+        <div class="explorer-layout">
+          <div class="card file-browser">
+            <div class="file-header-row">
+              <span>Name</span>
+              <span>Size</span>
+              <span>Modified</span>
+              <span>Status</span>
+            </div>
+            <div id="fileList" class="file-list">
+              <div class="empty-state">
+                <div class="empty-icon">📁</div>
+                <div class="empty-title">No Files Synced</div>
+                <div class="empty-desc">Connect storage and choose a sync folder to populate this explorer.</div>
+              </div>
+            </div>
+          </div>
+          <aside class="details-panel" id="fileDetailsPanel">
+            <div class="details-empty">
+              <div class="empty-icon">⌁</div>
+              <div class="empty-title">Select a File</div>
+              <div class="empty-desc">Size, dates, sync state, versions, and tags appear here.</div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ===== VERSION HISTORY ===== -->
+      <section class="screen" id="screen-versions" role="tabpanel">
+        <div class="section-title">Version History</div>
+        <div class="card" id="versionTimeline">
           <div class="empty-state">
-            <div class="empty-icon">📁</div>
-            <div class="empty-title">No Files Synced</div>
-            <div class="empty-desc">Files will appear here once sync is running.</div>
+            <div class="empty-icon">↺</div>
+            <div class="empty-title">No Versions Yet</div>
+            <div class="empty-desc">Synced file revisions will appear in this timeline.</div>
           </div>
         </div>
       </section>
@@ -136,15 +178,15 @@
         </div>
       </section>
 
-      <!-- ===== SETTINGS ===== -->
-      <section class="screen" id="screen-settings" role="tabpanel">
+      <!-- ===== ACCOUNT ===== -->
+      <section class="screen" id="screen-account" role="tabpanel">
         <div class="settings-group">
-          <div class="settings-group-title">Account</div>
+          <div class="settings-group-title">Storage Account</div>
           <div class="card settings-card">
             <div class="setting-row">
               <div class="setting-label">
-                <div class="setting-name">Endpoint</div>
-                <div class="setting-desc">S3-compatible storage URL</div>
+                <div class="setting-name">Storage URL</div>
+                <div class="setting-desc">Example: http://127.0.0.1:9000</div>
               </div>
               <input type="text" class="setting-input" id="inputEndpoint" placeholder="http://127.0.0.1:9000" value="" />
             </div>
@@ -190,6 +232,19 @@
           </div>
         </div>
 
+        <div class="settings-group">
+          <div class="settings-group-title">Devices</div>
+          <div class="card" id="deviceList">
+            <div class="empty-state">
+              <div class="empty-icon">●</div>
+              <div class="empty-title">No Devices Loaded</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== SETTINGS ===== -->
+      <section class="screen" id="screen-settings" role="tabpanel">
         <div class="settings-group">
           <div class="settings-group-title">Sync</div>
           <div class="card settings-card">
@@ -242,6 +297,13 @@
               <label class="setting-toggle">
                 <span>Auto-start on login</span>
                 <input type="checkbox" id="inputAutostart" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="setting-row">
+              <label class="setting-toggle">
+                <span>Use system theme</span>
+                <input type="checkbox" id="inputUseSystemTheme" checked />
                 <span class="toggle-slider"></span>
               </label>
             </div>
@@ -325,7 +387,8 @@
           </div>
         </div>
       </section>
-    </main>
+      </main>
+    </div>
 
     <!-- Toast container -->
     <div class="toast-container" id="toastContainer" aria-live="polite"></div>

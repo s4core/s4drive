@@ -26,10 +26,17 @@
       excludes: [],
       proxy: null,
       dark_mode: true,
+      use_system_theme: true,
       autostart: false,
       use_tls: true,
     },
     sync: { running: false, paused: false, state: 'idle', conflicts: 0, lastSync: null },
+    files: [],
+    fileQuery: '',
+    fileView: 'list',
+    selectedFileId: null,
+    versions: [],
+    devices: [],
     transfers: [],
     conflicts: [],
     activities: [],
@@ -70,14 +77,22 @@
   }
 
   // ─── Theme ───────────────────────────────────────────────────
-  function setTheme(dark) {
+  function setTheme(dark, persist = true) {
     document.documentElement.classList.toggle('theme-light', !dark);
     document.getElementById('themeToggle').textContent = dark ? '🌙' : '☀️';
     document.getElementById('inputDarkMode').checked = dark;
-    state.settings.dark_mode = dark;
+    if (persist) state.settings.dark_mode = dark;
+  }
+
+  function applyThemeSettings() {
+    const systemDark = window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? true;
+    setTheme(state.settings.use_system_theme ? systemDark : state.settings.dark_mode, false);
+    document.getElementById('inputUseSystemTheme').checked = Boolean(state.settings.use_system_theme);
   }
 
   function toggleTheme() {
+    state.settings.use_system_theme = false;
+    document.getElementById('inputUseSystemTheme').checked = false;
     setTheme(!state.settings.dark_mode);
     showToast(state.settings.dark_mode ? 'Dark mode enabled' : 'Light mode enabled', 'info');
   }
@@ -91,6 +106,10 @@
     document.querySelectorAll('.screen').forEach(s => {
       s.classList.toggle('active', s.id === 'screen-' + route);
     });
+    if (route === 'files') refreshFiles();
+    if (route === 'versions') refreshVersions();
+    if (route === 'account') refreshDevices();
+    if (route === 'diagnostics') runDiagnostics();
   }
 
   // ─── Toast ───────────────────────────────────────────────────
@@ -128,13 +147,107 @@
       state.sync = sync;
       document.getElementById('syncState').textContent = sync.state || '—';
       document.getElementById('conflictCount').textContent = sync.conflicts ?? 0;
-      document.getElementById('totalFiles').textContent = '—';
+      document.getElementById('totalFiles').textContent = String(state.files.length || 0);
       document.getElementById('transferCount').textContent = String(state.transfers.length || 0);
+      document.getElementById('btnPauseSync').textContent = sync.paused ? 'Resume Sync' : 'Pause Sync';
       updateStatusBadge(sync);
     } catch(e) {
       document.getElementById('syncState').textContent = 'Offline';
       console.warn('Dashboard refresh:', e);
     }
+  }
+
+  // ─── Files ───────────────────────────────────────────────────
+  async function refreshFiles() {
+    try {
+      state.files = await invoke('get_files') || [];
+      if (state.selectedFileId && !state.files.some(file => file.file_id === state.selectedFileId)) {
+        state.selectedFileId = null;
+      }
+      renderFiles();
+      renderFileDetails();
+      document.getElementById('totalFiles').textContent = String(state.files.length || 0);
+    } catch(e) {
+      renderFileError(humanizeError(e));
+    }
+  }
+
+  function renderFiles() {
+    const list = document.getElementById('fileList');
+    const files = filteredFiles();
+    list.className = state.fileView === 'grid' ? 'file-grid' : 'file-list';
+
+    if (!files.length) {
+      const isSearch = state.fileQuery.trim().length > 0;
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">📁</div>
+          <div class="empty-title">${isSearch ? 'No Matching Files' : 'No Files Synced'}</div>
+          <div class="empty-desc">${isSearch ? 'Try a different search term.' : 'Connect storage and choose a sync folder to populate this explorer.'}</div>
+        </div>`;
+      return;
+    }
+
+    list.innerHTML = files.map(file => `
+      <button class="file-item ${file.file_id === state.selectedFileId ? 'selected' : ''}" data-file-id="${escapeAttr(file.file_id)}">
+        <span class="file-icon">${getFileIcon(file.kind === 'folder' ? 'folder' : file.name)}</span>
+        <span class="file-name">${escapeHtml(file.name || file.path)}</span>
+        <span class="file-size">${formatBytes(file.size_bytes)}</span>
+        <span class="file-date">${formatDate(file.modified_at)}</span>
+        <span class="file-status"><span class="sync-badge ${escapeAttr(file.sync_state || 'synced')}">${formatStatus(file.sync_state)}</span></span>
+      </button>
+    `).join('');
+  }
+
+  function filteredFiles() {
+    const query = state.fileQuery.trim().toLowerCase();
+    if (!query) return state.files;
+    return state.files.filter(file => [file.name, file.path, file.kind, file.sync_state]
+      .filter(Boolean)
+      .some(value => String(value).toLowerCase().includes(query)));
+  }
+
+  function renderFileDetails() {
+    const panel = document.getElementById('fileDetailsPanel');
+    const file = state.files.find(item => item.file_id === state.selectedFileId);
+
+    if (!file) {
+      panel.innerHTML = `
+        <div class="details-empty">
+          <div class="empty-icon">⌁</div>
+          <div class="empty-title">Select a File</div>
+          <div class="empty-desc">Size, dates, sync state, versions, and tags appear here.</div>
+        </div>`;
+      return;
+    }
+
+    panel.innerHTML = `
+      <div class="details-header">
+        <div class="details-icon">${getFileIcon(file.kind === 'folder' ? 'folder' : file.name)}</div>
+        <div>
+          <div class="details-title">${escapeHtml(file.name || file.path)}</div>
+          <div class="details-subtitle">${escapeHtml(file.path || '')}</div>
+        </div>
+      </div>
+      <div class="details-list">
+        <div><span>Size</span><strong>${formatBytes(file.size_bytes)}</strong></div>
+        <div><span>Modified</span><strong>${formatDate(file.modified_at) || 'Unknown'}</strong></div>
+        <div><span>Status</span><strong>${formatStatus(file.sync_state)}</strong></div>
+        <div><span>File ID</span><strong class="mono">${escapeHtml(file.file_id)}</strong></div>
+      </div>
+      <div class="details-actions">
+        <button class="btn btn-outline btn-sm" data-route-target="versions">Versions</button>
+        <button class="btn btn-outline btn-sm" disabled>Restore</button>
+      </div>`;
+  }
+
+  function renderFileError(message) {
+    document.getElementById('fileList').innerHTML = `
+      <div class="error-state">
+        <div class="error-icon">!</div>
+        <div class="error-title">Cannot Load Files</div>
+        <div class="error-desc">${escapeHtml(message)}</div>
+      </div>`;
   }
 
   // ─── Activity ────────────────────────────────────────────────
@@ -272,6 +385,87 @@
     `).join('');
   }
 
+  // ─── Versions / Devices ──────────────────────────────────────
+  async function refreshVersions() {
+    try {
+      state.versions = await invoke('get_versions') || [];
+      renderVersions();
+    } catch(e) {
+      renderTimelineError(humanizeError(e));
+    }
+  }
+
+  function renderVersions() {
+    const timeline = document.getElementById('versionTimeline');
+    if (!state.versions.length) {
+      timeline.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">↺</div>
+          <div class="empty-title">No Versions Yet</div>
+          <div class="empty-desc">Synced file revisions will appear in this timeline.</div>
+        </div>`;
+      return;
+    }
+
+    timeline.innerHTML = state.versions.map(version => `
+      <div class="timeline-item">
+        <div class="timeline-dot"></div>
+        <div class="timeline-content">
+          <div class="timeline-title">${escapeHtml(version.label || version.revision_id)}</div>
+          <div class="timeline-meta">${escapeHtml(version.author || 'Unknown device')} · ${formatDate(version.created_at)}</div>
+          <div class="timeline-detail">${formatBytes(version.size_bytes)} · ${escapeHtml(version.status || 'saved')}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function renderTimelineError(message) {
+    document.getElementById('versionTimeline').innerHTML = `
+      <div class="error-state">
+        <div class="error-icon">!</div>
+        <div class="error-title">Cannot Load Versions</div>
+        <div class="error-desc">${escapeHtml(message)}</div>
+      </div>`;
+  }
+
+  async function refreshDevices() {
+    try {
+      state.devices = await invoke('get_devices') || [];
+      renderDevices();
+    } catch(e) {
+      document.getElementById('deviceList').innerHTML = `
+        <div class="error-state">
+          <div class="error-icon">!</div>
+          <div class="error-title">Cannot Load Devices</div>
+          <div class="error-desc">${escapeHtml(humanizeError(e))}</div>
+        </div>`;
+    }
+  }
+
+  function renderDevices() {
+    const list = document.getElementById('deviceList');
+    if (!state.devices.length) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">●</div>
+          <div class="empty-title">No Devices Loaded</div>
+        </div>`;
+      return;
+    }
+
+    list.innerHTML = state.devices.map(device => `
+      <div class="device-item">
+        <div class="device-avatar">${device.trusted ? '✓' : '?'}</div>
+        <div class="device-content">
+          <div class="device-name">${escapeHtml(device.name || 'Device')}</div>
+          <div class="device-meta">${escapeHtml(device.role || '')} · ${formatDate(device.last_seen) || 'Never seen'}</div>
+          <div class="device-id mono">${escapeHtml(device.device_id || '')}</div>
+        </div>
+        <span class="sync-badge ${device.trusted ? 'synced' : 'pending'}">${device.trusted ? 'Trusted' : 'Review'}</span>
+      </div>
+    `).join('');
+  }
+
   // ─── Settings ────────────────────────────────────────────────
   async function loadSettings() {
     try {
@@ -293,8 +487,9 @@
     document.getElementById('inputProxy').value = s.proxy || '';
     document.getElementById('inputAutostart').checked = Boolean(s.autostart);
     document.getElementById('inputDarkMode').checked = Boolean(s.dark_mode);
+    document.getElementById('inputUseSystemTheme').checked = Boolean(s.use_system_theme);
     document.getElementById('inputUseTls').checked = Boolean(s.use_tls);
-    setTheme(Boolean(s.dark_mode));
+    applyThemeSettings();
   }
 
   async function refreshSettings() {
@@ -354,6 +549,7 @@
       proxy: proxy || null,
       autostart: document.getElementById('inputAutostart').checked,
       dark_mode: document.getElementById('inputDarkMode').checked,
+      use_system_theme: document.getElementById('inputUseSystemTheme').checked,
       use_tls: document.getElementById('inputUseTls').checked,
     };
   }
@@ -413,11 +609,61 @@
     return escapeHtml(str);
   }
 
+  function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (!bytes) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit += 1;
+    }
+    return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+  }
+
+  function formatDate(ts) {
+    if (!ts) return '';
+    try {
+      return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    } catch(e) { return ''; }
+  }
+
+  function formatStatus(status) {
+    const value = String(status || 'synced').replace(/_/g, ' ');
+    return value.charAt(0).toUpperCase() + value.slice(1);
+  }
+
   function formatTime(ts) {
     if (!ts) return '';
     try {
       return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     } catch(e) { return ''; }
+  }
+
+  function humanizeError(error) {
+    const message = String(error || '');
+    const lower = message.toLowerCase();
+    if (lower.includes('timeout') || lower.includes('network') || lower.includes('could not resolve')) {
+      return 'Cannot reach the storage server. Check your network and storage URL.';
+    }
+    if (lower.includes('auth') || lower.includes('access') || lower.includes('credential')) {
+      return 'The credentials were rejected. Check the access key, secret key, and region.';
+    }
+    if (lower.includes('bucket') || lower.includes('not found')) {
+      return 'The bucket was not found or is not accessible.';
+    }
+    return message || 'The operation failed.';
+  }
+
+  function moveFileSelection(delta) {
+    const files = filteredFiles();
+    if (!files.length) return;
+    const currentIndex = files.findIndex(file => file.file_id === state.selectedFileId);
+    const nextIndex = currentIndex < 0 ? 0 : Math.max(0, Math.min(files.length - 1, currentIndex + delta));
+    state.selectedFileId = files[nextIndex].file_id;
+    renderFiles();
+    renderFileDetails();
   }
 
   // ─── Init ────────────────────────────────────────────────────
@@ -434,6 +680,31 @@
     document.querySelectorAll('.nav-btn').forEach(btn => {
       btn.addEventListener('click', () => navigate(btn.dataset.route));
     });
+    document.body.addEventListener('click', (event) => {
+      const target = event.target.closest('[data-route-target]');
+      if (target) navigate(target.dataset.routeTarget);
+    });
+
+    // Wire dashboard actions
+    document.getElementById('btnSyncNow').addEventListener('click', async () => {
+      try {
+        await invoke('sync_now');
+        showToast('Sync requested', 'info');
+        refreshDashboard();
+      } catch(e) {
+        showToast(`Sync failed: ${humanizeError(e)}`, 'error');
+      }
+    });
+    document.getElementById('btnPauseSync').addEventListener('click', async () => {
+      try {
+        const paused = await invoke('toggle_pause');
+        showToast(paused ? 'Sync paused' : 'Sync resumed', 'info');
+        refreshDashboard();
+      } catch(e) {
+        showToast(`Pause failed: ${humanizeError(e)}`, 'error');
+      }
+    });
+    document.getElementById('btnOpenAccount').addEventListener('click', () => navigate('account'));
 
     // Wire settings buttons
     document.getElementById('btnSaveAccount').addEventListener('click', saveSettings);
@@ -444,8 +715,17 @@
     });
     document.getElementById('btnCheckUpdates').addEventListener('click', checkUpdates);
     document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+    document.getElementById('inputUseSystemTheme').addEventListener('change', function() {
+      state.settings.use_system_theme = this.checked;
+      applyThemeSettings();
+    });
     document.getElementById('inputDarkMode').addEventListener('change', function() {
+      state.settings.use_system_theme = false;
+      document.getElementById('inputUseSystemTheme').checked = false;
       setTheme(this.checked);
+    });
+    window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener?.('change', () => {
+      if (state.settings.use_system_theme) applyThemeSettings();
     });
 
     // Wire view toggle
@@ -453,8 +733,21 @@
       btn.addEventListener('click', function() {
         document.querySelectorAll('[data-view]').forEach(b => b.classList.remove('active'));
         this.classList.add('active');
-        document.getElementById('fileList').className = 'card ' + (this.dataset.view === 'grid' ? 'file-grid' : 'file-list');
+        state.fileView = this.dataset.view === 'grid' ? 'grid' : 'list';
+        renderFiles();
       });
+    });
+
+    document.getElementById('fileSearch').addEventListener('input', (event) => {
+      state.fileQuery = event.target.value;
+      renderFiles();
+    });
+    document.getElementById('fileList').addEventListener('click', (event) => {
+      const item = event.target.closest('[data-file-id]');
+      if (!item) return;
+      state.selectedFileId = item.dataset.fileId;
+      renderFiles();
+      renderFileDetails();
     });
 
     document.getElementById('conflictList').addEventListener('click', (event) => {
@@ -466,12 +759,15 @@
     // Wire keyboard navigation
     document.addEventListener('keydown', (e) => {
       if (e.altKey) {
-        const routes = ['overview', 'files', 'transfers', 'conflicts', 'activity', 'settings', 'diagnostics', 'about'];
-        const idx = '12345678'.indexOf(e.key);
+        const routes = ['overview', 'files', 'transfers', 'conflicts', 'versions', 'activity', 'account', 'settings', 'diagnostics', 'about'];
+        const idx = '1234567890'.indexOf(e.key);
         if (idx >= 0) navigate(routes[idx]);
       }
       if (e.key === 'Escape') {
         document.querySelectorAll('.toast').forEach(t => t.remove());
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        moveFileSelection(e.key === 'ArrowDown' ? 1 : -1);
       }
     });
 
@@ -498,10 +794,13 @@
     // Initial data load
     await loadSettings();
     await Promise.all([
+      refreshFiles(),
       refreshDashboard(),
       refreshActivity(),
       refreshTransfers(),
       refreshConflicts(),
+      refreshVersions(),
+      refreshDevices(),
       refreshSettings(),
     ]);
 
@@ -513,6 +812,7 @@
 
     // Auto-refresh
     setInterval(refreshDashboard, 5000);
+    setInterval(refreshFiles, 15000);
     setInterval(refreshActivity, 10000);
     setInterval(refreshTransfers, 10000);
     setInterval(refreshConflicts, 30000);
@@ -521,7 +821,7 @@
     document.body.classList.add('ready');
   }
 
-  // Expose for inline onclick
+  // Conflict actions are delegated from the conflict list.
   window.__resolveConflict = async (conflictId, resolution) => {
     try {
       await invoke('resolve_conflict', { conflictId, resolution });
