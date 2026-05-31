@@ -18,8 +18,8 @@
     "fs:allow-remove",
     "fs:allow-rename",
     "fs:allow-stat",
-    "fs:scope-app-data",
-    "fs:scope-app-cache",
+    "fs:scope-appdata",
+    "fs:scope-appcache",
     "fs:scope-temp"
   ]
 }
