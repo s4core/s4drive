@@ -63,6 +63,10 @@ HERE="$(dirname "$(readlink -f "$0")")"
 export GIO_USE_VFS=local
 export GIO_MODULE_DIR="${GIO_MODULE_DIR:-$HERE/usr/lib/gio/modules-disabled}"
 unset GIO_EXTRA_MODULES
+export WEBKIT_DISABLE_COMPOSITING_MODE="${WEBKIT_DISABLE_COMPOSITING_MODE:-1}"
+export WEBKIT_DISABLE_DMABUF_RENDERER="${WEBKIT_DISABLE_DMABUF_RENDERER:-1}"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
 exec "$HERE/AppRun.wrapped" "$@"
 EOF
     chmod +x "$appdir/AppRun"

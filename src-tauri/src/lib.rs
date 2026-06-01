@@ -243,6 +243,8 @@ struct UpdateInfo {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    configure_linux_appimage_env();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
@@ -311,6 +313,38 @@ pub fn run() {
         Err(error) => eprintln!("failed to build S4Drive Tauri application: {}", error),
     }
 }
+
+#[cfg(target_os = "linux")]
+fn configure_linux_appimage_env() {
+    let is_appimage =
+        std::env::var_os("APPIMAGE").is_some() || std::env::var_os("APPDIR").is_some();
+    if !is_appimage {
+        return;
+    }
+
+    set_default_env("GIO_USE_VFS", "local");
+    let gio_modules_dir = std::env::var_os("APPDIR")
+        .map(PathBuf::from)
+        .map(|path| path.join("usr/lib/gio/modules-disabled"))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/s4drive-gio-modules"));
+    set_default_env("GIO_MODULE_DIR", gio_modules_dir.as_os_str());
+    std::env::remove_var("GIO_EXTRA_MODULES");
+
+    set_default_env("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    set_default_env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    set_default_env("LIBGL_ALWAYS_SOFTWARE", "1");
+    set_default_env("GDK_BACKEND", "x11");
+}
+
+#[cfg(target_os = "linux")]
+fn set_default_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_appimage_env() {}
 
 // Tray Setup
 
