@@ -96,6 +96,8 @@ jobs:
             -e APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND}" \
             -e NEEDRESTART_MODE="${NEEDRESTART_MODE}" \
             -e TAURI_CLI_VERSION="${TAURI_CLI_VERSION}" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
             ubuntu:22.04 \
             bash /workspace/scripts/build-linux-docker.sh
 
@@ -103,9 +105,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: s4drive-linux
-          path: |
-            target/release/bundle/
-            src-tauri/target/release/bundle/
+          path: dist/linux/*
+          if-no-files-found: error
           retention-days: 14
           compression-level: 0
 

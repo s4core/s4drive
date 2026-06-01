@@ -49,7 +49,20 @@ cd "$WORKSPACE/src-tauri"
 # Build all bundles
 cargo tauri build --bundles deb,rpm,appimage --ci
 
+# Copy only final distributable files. Uploading the whole bundle directory also
+# includes AppImage staging files such as AppRun.wrapped, which may be unreadable
+# outside the root-owned Docker build.
+DIST_DIR="$WORKSPACE/dist/linux"
+rm -rf "$DIST_DIR"
+mkdir -p "$DIST_DIR"
+find "$WORKSPACE/target/release/bundle" "$WORKSPACE/src-tauri/target/release/bundle" \
+    -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+    -exec cp -f {} "$DIST_DIR/" \; 2>/dev/null || true
+
+if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+    chown -R "$HOST_UID:$HOST_GID" "$DIST_DIR"
+fi
+
 # Show results
-echo "=== Bundles ==="
-find "$WORKSPACE/target/release/bundle" -type f -ls 2>/dev/null || \
-    find "$WORKSPACE/src-tauri/target/release/bundle" -type f -ls 2>/dev/null
+echo "=== Linux artifacts ==="
+find "$DIST_DIR" -type f -ls
