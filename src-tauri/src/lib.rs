@@ -6,7 +6,7 @@ use s4drive_core::{
     db::LocalDatabase,
     metadata::engine::MetadataEngine,
     s3::S3Adapter,
-    sync::{scan_folder_recursive_bounded, ActivityLog, SyncEngine},
+    sync::{scan_folder_recursive_bounded, ActivityLog, SyncEngine, SyncState},
     transfer::TransferQueue,
     watcher::FileWatcher,
 };
@@ -35,6 +35,7 @@ const MIN_REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TRAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(350);
 const DESKTOP_FILE_LIST_LIMIT: usize = 5_000;
 const DESKTOP_SYNC_SCAN_LIMIT: usize = 100_000;
+const LARGE_SYNC_CONFIRM_THRESHOLD: usize = 50_000;
 
 // Application State
 
@@ -58,6 +59,8 @@ pub struct DesktopSettings {
     pub dark_mode: bool,
     pub use_system_theme: bool,
     pub use_tls: bool,
+    #[serde(default)]
+    pub large_sync_confirmed: bool,
 }
 
 impl Default for DesktopSettings {
@@ -80,6 +83,7 @@ impl Default for DesktopSettings {
             dark_mode: true,
             use_system_theme: true,
             use_tls: core_defaults.s3.use_tls,
+            large_sync_confirmed: false,
         }
     }
 }
@@ -122,6 +126,8 @@ pub struct AppState {
     exit_started: AtomicBool,
     last_sync: Mutex<Option<String>>,
     last_sync_summary: Mutex<Option<String>>,
+    sync_detail: Mutex<String>,
+    tray_status_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     pending_route: Mutex<Option<String>>,
     device_id: String,
     settings: Mutex<DesktopSettings>,
@@ -139,6 +145,8 @@ impl Default for AppState {
             exit_started: AtomicBool::new(false),
             last_sync: Mutex::new(None),
             last_sync_summary: Mutex::new(None),
+            sync_detail: Mutex::new("Idle".to_string()),
+            tray_status_item: Mutex::new(None),
             pending_route: Mutex::new(None),
             device_id: uuid::Uuid::now_v7().to_string(),
             settings: Mutex::new(DesktopSettings::default()),
@@ -156,6 +164,7 @@ pub struct SyncStatus {
     pub conflicts: u32,
     pub last_sync: Option<String>,
     pub last_summary: Option<String>,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +193,17 @@ pub struct SyncRunResult {
     pub local_files_seen: usize,
     pub bucket_initialized: bool,
     pub unmanaged_remote_objects: usize,
+    pub pending_uploads: usize,
+    pub pending_downloads: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderInspection {
+    pub eligible_files: usize,
+    pub threshold: usize,
+    pub requires_confirmation: bool,
+    pub truncated: bool,
     pub message: String,
 }
 
@@ -317,6 +337,7 @@ pub fn run() {
             save_settings,
             test_connection,
             toggle_pause,
+            inspect_sync_folder,
             sync_now,
             open_window,
             take_pending_route,
@@ -380,6 +401,8 @@ fn configure_linux_appimage_env() {}
 // Tray Setup
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let status = MenuItem::with_id(app, "status", "Status: Idle", false, None::<&str>)?;
+    let status_separator = PredefinedMenuItem::separator(app)?;
     let open = MenuItem::with_id(app, "open", "Open S4Drive", true, None::<&str>)?;
     let sync_now = MenuItem::with_id(app, "sync_now", "Sync Now", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause Sync", true, None::<&str>)?;
@@ -393,6 +416,8 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let menu = Menu::with_items(
         app,
         &[
+            &status,
+            &status_separator,
             &open,
             &sync_now,
             &pause,
@@ -406,6 +431,10 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let pause_for_handler = pause.clone();
+    if let Ok(mut tray_status_item) = app.state::<AppState>().tray_status_item.lock() {
+        *tray_status_item = Some(status.clone());
+    }
+
     let icon = app.default_window_icon().cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "S4Drive app icon is missing")
     })?;
@@ -498,13 +527,36 @@ fn ensure_auto_sync(app: &AppHandle) {
 
             let remote_interval =
                 Duration::from_secs(settings.polling_interval_sec).max(MIN_REMOTE_POLL_INTERVAL);
+            let inspection = match inspect_sync_folder_inner(&settings, &sync_folder) {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    tracing::warn!("auto sync could not inspect sync folder: {}", error);
+                    set_sync_detail(&app, state.inner(), format!("Sync folder error: {}", error));
+                    tokio::time::sleep(remote_interval).await;
+                    continue;
+                }
+            };
+            if inspection.requires_confirmation && !settings.large_sync_confirmed {
+                set_sync_detail(
+                    &app,
+                    state.inner(),
+                    "Large sync folder waiting for confirmation",
+                );
+                tokio::time::sleep(remote_interval).await;
+                continue;
+            }
+
             let signature = match local_folder_signature(&settings, &sync_folder) {
                 Ok(signature) => signature,
                 Err(error) => {
-                    tracing::warn!("auto sync could not scan sync folder: {}", error);
-                    record_sync_failure(&app, state.inner(), &error);
-                    tokio::time::sleep(remote_interval).await;
-                    continue;
+                    if inspection.requires_confirmation && settings.large_sync_confirmed {
+                        "large-confirmed-folder".to_string()
+                    } else {
+                        tracing::warn!("auto sync could not scan sync folder: {}", error);
+                        record_sync_failure(&app, state.inner(), &error);
+                        tokio::time::sleep(remote_interval).await;
+                        continue;
+                    }
                 }
             };
             let local_changed = last_local_signature
@@ -512,8 +564,12 @@ fn ensure_auto_sync(app: &AppHandle) {
                 .map(|last| last != &signature)
                 .unwrap_or(true);
             let remote_due = last_remote_poll.elapsed() >= remote_interval;
+            let large_folder_due = inspection.requires_confirmation
+                && settings.large_sync_confirmed
+                && last_remote_poll.elapsed() >= remote_interval;
+            let pending_transfers = pending_transfer_count(&app, &settings) > 0;
 
-            if !local_changed && !remote_due {
+            if !local_changed && !remote_due && !large_folder_due && !pending_transfers {
                 continue;
             }
 
@@ -851,6 +907,41 @@ fn local_scan(
     Ok(scan.files)
 }
 
+fn inspect_sync_folder_inner(
+    settings: &DesktopSettings,
+    root: &Path,
+) -> Result<FolderInspection, String> {
+    let threshold = LARGE_SYNC_CONFIRM_THRESHOLD;
+    let scan = scan_folder_recursive_bounded(root, &settings.excludes, threshold + 1)
+        .map_err(|e| e.to_string())?;
+    let requires_confirmation = scan.truncated || scan.files.len() > threshold;
+    let eligible_files = scan.files.len().min(threshold);
+    let message = if requires_confirmation {
+        format!(
+            "Sync folder contains more than {} eligible files. Confirm this folder before S4Drive starts a large staged sync.",
+            threshold
+        )
+    } else {
+        format!("Sync folder contains {} eligible file(s).", eligible_files)
+    };
+
+    Ok(FolderInspection {
+        eligible_files,
+        threshold,
+        requires_confirmation,
+        truncated: scan.truncated,
+        message,
+    })
+}
+
+fn pending_transfer_count(app: &AppHandle, settings: &DesktopSettings) -> usize {
+    let config = app_local_config(app, settings);
+    LocalDatabase::new(&config)
+        .and_then(|db| TransferQueue::new(&db).pending_count())
+        .map(|(uploads, downloads)| uploads + downloads)
+        .unwrap_or(0)
+}
+
 fn local_folder_signature(settings: &DesktopSettings, root: &Path) -> Result<String, String> {
     let mut entries = Vec::new();
     let files = local_scan(settings, root, DESKTOP_SYNC_SCAN_LIMIT)?;
@@ -949,6 +1040,7 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
         .lock()
         .map_err(|e| e.to_string())?
         .clone();
+    let detail = state.sync_detail.lock().map_err(|e| e.to_string())?.clone();
 
     Ok(SyncStatus {
         running,
@@ -964,7 +1056,87 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
         conflicts,
         last_sync,
         last_summary,
+        detail,
     })
+}
+
+fn set_sync_detail(app: &AppHandle, state: &AppState, detail: impl Into<String>) {
+    let detail = detail.into();
+    if let Ok(mut current) = state.sync_detail.lock() {
+        *current = detail.clone();
+    }
+    if let Ok(status_item) = state.tray_status_item.lock() {
+        if let Some(item) = status_item.as_ref() {
+            let label = compact_tray_status(&detail);
+            let _ = item.set_text(&label);
+        }
+    }
+
+    refresh_tray_tooltip(app);
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Ok(status) = current_sync_status(state) {
+            let _ = window.emit("sync-status-changed", status);
+        }
+    }
+}
+
+fn compact_tray_status(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 90;
+    let trimmed = detail.trim();
+    let short = if trimmed.chars().count() > MAX_DETAIL_CHARS {
+        let prefix: String = trimmed.chars().take(MAX_DETAIL_CHARS).collect();
+        format!("{}...", prefix)
+    } else if trimmed.is_empty() {
+        "Idle".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    format!("Status: {}", short)
+}
+
+fn refresh_tray_tooltip(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let sync_state = if state.sync_paused.load(Ordering::Relaxed) {
+        "paused"
+    } else if state.sync_running.load(Ordering::Relaxed) {
+        "syncing"
+    } else {
+        "idle"
+    };
+    let detail = state
+        .sync_detail
+        .lock()
+        .map(|detail| detail.clone())
+        .unwrap_or_else(|_| sync_state.to_string());
+    update_tray_tooltip_with_detail(
+        app,
+        sync_state,
+        state.conflict_count.load(Ordering::Relaxed),
+        Some(&detail),
+    );
+}
+
+fn sync_state_detail(sync_state: SyncState, pending: (usize, usize)) -> String {
+    let (uploads, downloads) = pending;
+    match sync_state {
+        SyncState::Idle => {
+            if uploads > 0 || downloads > 0 {
+                format!(
+                    "Queued: {} upload(s), {} download(s); waiting for next batch",
+                    uploads, downloads
+                )
+            } else {
+                "Idle".to_string()
+            }
+        }
+        SyncState::ScanningLocal => "Scanning local folder".to_string(),
+        SyncState::ScanningRemote => "Checking remote changes".to_string(),
+        SyncState::Uploading => format!("Uploading batch; {} upload(s) queued", uploads),
+        SyncState::Downloading => format!("Downloading batch; {} download(s) queued", downloads),
+        SyncState::Resolving => "Resolving conflicts".to_string(),
+        SyncState::Paused => "Sync paused".to_string(),
+        SyncState::Error(error) => format!("Sync error: {}", error),
+    }
 }
 
 fn mark_sync_requested(app: &AppHandle, state: &AppState, resume_if_paused: bool) -> bool {
@@ -986,7 +1158,7 @@ fn mark_sync_requested(app: &AppHandle, state: &AppState, resume_if_paused: bool
     }
 
     set_tray_sync_icon(app, 0);
-    update_tray_tooltip(app, "syncing", state.conflict_count.load(Ordering::Relaxed));
+    set_sync_detail(app, state, "Preparing sync");
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = window.emit("sync-triggered", ());
     }
@@ -1015,10 +1187,10 @@ fn toggle_pause_from_tray(
         "Sync resumed"
     };
     send_notification(app, "S4Drive", message);
-    update_tray_tooltip(
+    set_sync_detail(
         app,
-        if paused { "paused" } else { "idle" },
-        state.conflict_count.load(Ordering::Relaxed),
+        state.inner(),
+        if paused { "Sync paused" } else { "Idle" },
     );
 
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
@@ -1270,14 +1442,24 @@ fn blend_pixel(rgba: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
     rgba[index + 3] = 255;
 }
 
-fn update_tray_tooltip(app: &AppHandle, sync_state: &str, conflicts: u32) {
+fn update_tray_tooltip_with_detail(
+    app: &AppHandle,
+    sync_state: &str,
+    conflicts: u32,
+    detail: Option<&str>,
+) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        update_tray_status(&tray, sync_state, conflicts);
+        update_tray_status(&tray, sync_state, conflicts, detail);
     }
 }
 
 /// Update the tray tooltip to show current sync status.
-pub fn update_tray_status(tray: &tauri::tray::TrayIcon, sync_state: &str, conflicts: u32) {
+pub fn update_tray_status(
+    tray: &tauri::tray::TrayIcon,
+    sync_state: &str,
+    conflicts: u32,
+    detail: Option<&str>,
+) {
     let tooltip = if conflicts > 0 {
         format!(
             "S4Drive - {} ({} conflict{})",
@@ -1288,6 +1470,11 @@ pub fn update_tray_status(tray: &tauri::tray::TrayIcon, sync_state: &str, confli
     } else {
         format!("S4Drive - {}", sync_state)
     };
+    let tooltip = detail
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|detail| format!("{}\n{}", tooltip, detail))
+        .unwrap_or(tooltip);
     let _ = tray.set_tooltip(Some(&tooltip));
 }
 
@@ -1424,12 +1611,19 @@ fn toggle_pause(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<boo
         state.sync_running.store(false, Ordering::Relaxed);
         set_tray_idle_icon(&app);
     }
-    update_tray_tooltip(
+    set_sync_detail(
         &app,
-        if paused { "paused" } else { "idle" },
-        state.conflict_count.load(Ordering::Relaxed),
+        state.inner(),
+        if paused { "Sync paused" } else { "Idle" },
     );
     Ok(paused)
+}
+
+#[tauri::command]
+fn inspect_sync_folder(state: tauri::State<'_, AppState>) -> Result<FolderInspection, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let root = ensure_sync_folder(&settings)?;
+    inspect_sync_folder_inner(&settings, &root)
 }
 
 #[tauri::command]
@@ -1455,16 +1649,33 @@ async fn run_sync_now_with_options(
     }
 
     let sync_folder = ensure_sync_folder(&settings)?;
-    let local_files_seen = local_scan(&settings, &sync_folder, DESKTOP_SYNC_SCAN_LIMIT)?.len();
+    set_sync_detail(&app, state, "Inspecting sync folder");
+    let inspection = inspect_sync_folder_inner(&settings, &sync_folder)?;
+    if inspection.requires_confirmation && !settings.large_sync_confirmed {
+        let message = format!(
+            "{} Open S4Drive and confirm this large folder before syncing.",
+            inspection.message
+        );
+        set_sync_detail(&app, state, "Large sync folder waiting for confirmation");
+        return Err(message);
+    }
+    let local_files_seen = if inspection.requires_confirmation {
+        inspection.eligible_files
+    } else {
+        local_scan(&settings, &sync_folder, DESKTOP_SYNC_SCAN_LIMIT)?.len()
+    };
+    set_sync_detail(&app, state, "Loading saved credentials");
     let secret = resolve_desktop_secret(&app, &settings, None)?;
     let config = app_core_config(&app, &settings, secret);
 
+    set_sync_detail(&app, state, "Checking bucket access");
     let s3 = S3Adapter::new(&config).await.map_err(|e| e.to_string())?;
     s3.check_bucket_access()
         .await
         .map_err(|e| humanize_connection_error(&e.to_string()))?;
     let unmanaged_remote_objects = count_unmanaged_remote_objects(&s3).await.unwrap_or(0);
 
+    set_sync_detail(&app, state, "Preparing metadata");
     let device_id = uuid::Uuid::parse_str(&state.device_id).map_err(|e| e.to_string())?;
     let metadata = MetadataEngine::new(s3.clone(), device_id);
     let mut bucket_initialized = false;
@@ -1487,6 +1698,7 @@ async fn run_sync_now_with_options(
     let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
     let activity_db = db.clone();
     let transfer = TransferQueue::new(&db);
+    let transfer_status = transfer.clone();
     let mut engine = SyncEngine::new();
     engine.configure(
         event_stream,
@@ -1504,7 +1716,23 @@ async fn run_sync_now_with_options(
     if !mark_sync_requested(&app, state, notify_user) {
         return Err("Sync is already running".to_string());
     }
+    let engine_status = engine.clone();
+    let monitor_app = app.clone();
+    let transfer_monitor = transfer_status.clone();
+    let monitor = tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            let state = monitor_app.state::<AppState>();
+            if !state.sync_running.load(Ordering::Relaxed) {
+                break;
+            }
+            let pending = transfer_monitor.pending_count().unwrap_or((0, 0));
+            let detail = sync_state_detail(engine_status.current_state(), pending);
+            set_sync_detail(&monitor_app, state.inner(), detail);
+        }
+    });
     let result = engine.run_once().await;
+    monitor.abort();
     state.sync_running.store(false, Ordering::Relaxed);
 
     let result = match result {
@@ -1517,7 +1745,16 @@ async fn run_sync_now_with_options(
     state
         .conflict_count
         .store(result.conflicts_detected, Ordering::Relaxed);
-    update_tray_tooltip(&app, "idle", result.conflicts_detected);
+    let (pending_uploads, pending_downloads) = transfer_status.pending_count().unwrap_or((0, 0));
+    let completion_detail = if pending_uploads > 0 || pending_downloads > 0 {
+        format!(
+            "Idle; {} upload(s) and {} download(s) remain queued for later sync passes",
+            pending_uploads, pending_downloads
+        )
+    } else {
+        "Idle".to_string()
+    };
+    set_sync_detail(&app, state, completion_detail);
     set_tray_idle_icon(&app);
     if let Ok(mut last_sync) = state.last_sync.lock() {
         *last_sync = Some(chrono::Utc::now().to_rfc3339());
@@ -1537,6 +1774,12 @@ async fn run_sync_now_with_options(
         message.push_str(&format!(
             "; ignored {} unmanaged S3 object(s)",
             unmanaged_remote_objects
+        ));
+    }
+    if pending_uploads > 0 || pending_downloads > 0 {
+        message.push_str(&format!(
+            "; {} upload(s), {} download(s) still queued",
+            pending_uploads, pending_downloads
         ));
     }
 
@@ -1565,6 +1808,8 @@ async fn run_sync_now_with_options(
         local_files_seen,
         bucket_initialized,
         unmanaged_remote_objects,
+        pending_uploads,
+        pending_downloads,
         message: message.clone(),
     };
 
@@ -1582,7 +1827,7 @@ async fn run_sync_now_with_options(
 
 fn record_sync_failure(app: &AppHandle, state: &AppState, error: &str) {
     state.sync_running.store(false, Ordering::Relaxed);
-    update_tray_tooltip(app, "idle", state.conflict_count.load(Ordering::Relaxed));
+    set_sync_detail(app, state, format!("Sync failed: {}", error));
     set_tray_idle_icon(app);
     let summary = format!("Sync failed: {}", error);
     eprintln!("S4Drive {}", summary);
@@ -1653,8 +1898,38 @@ fn get_activity(
 }
 
 #[tauri::command]
-fn get_transfers() -> Result<Vec<TransferItem>, String> {
-    Ok(Vec::new())
+fn get_transfers(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<TransferItem>, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let config = app_local_config(&app, &settings);
+    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let transfer = TransferQueue::new(&db);
+    let mut items = Vec::new();
+
+    for job in transfer.pending_uploads(100).map_err(|e| e.to_string())? {
+        items.push(TransferItem {
+            id: job.id.to_string(),
+            direction: job.direction.as_str().to_string(),
+            path: job.local_path,
+            status: "queued".to_string(),
+            bytes_done: job.transferred_bytes,
+            bytes_total: job.total_bytes,
+        });
+    }
+    for job in transfer.pending_downloads(100).map_err(|e| e.to_string())? {
+        items.push(TransferItem {
+            id: job.id.to_string(),
+            direction: job.direction.as_str().to_string(),
+            path: job.local_path,
+            status: "queued".to_string(),
+            bytes_done: job.transferred_bytes,
+            bytes_total: job.total_bytes,
+        });
+    }
+
+    Ok(items)
 }
 
 #[tauri::command]
@@ -1731,15 +2006,32 @@ async fn run_diagnostics(
     ];
 
     match ensure_sync_folder(&settings) {
-        Ok(path) => items.push(DiagnosticItem {
-            name: "Sync folder".to_string(),
-            status: "ok".to_string(),
-            detail: format!(
-                "{} ({} local file(s))",
-                path.display(),
-                local_scan(&settings, &path, DESKTOP_SYNC_SCAN_LIMIT)?.len()
-            ),
-        }),
+        Ok(path) => {
+            let inspection = inspect_sync_folder_inner(&settings, &path)?;
+            items.push(DiagnosticItem {
+                name: "Sync folder".to_string(),
+                status: if inspection.requires_confirmation && !settings.large_sync_confirmed {
+                    "warning"
+                } else {
+                    "ok"
+                }
+                .to_string(),
+                detail: if inspection.requires_confirmation {
+                    format!(
+                        "{} ({}+ eligible file(s); large sync confirmed={})",
+                        path.display(),
+                        inspection.threshold,
+                        settings.large_sync_confirmed
+                    )
+                } else {
+                    format!(
+                        "{} ({} local file(s))",
+                        path.display(),
+                        inspection.eligible_files
+                    )
+                },
+            });
+        }
         Err(error) => items.push(DiagnosticItem {
             name: "Sync folder".to_string(),
             status: "error".to_string(),

@@ -29,8 +29,9 @@
       use_system_theme: true,
       autostart: false,
       use_tls: true,
+      large_sync_confirmed: false,
     },
-    sync: { running: false, paused: false, state: 'idle', conflicts: 0, lastSync: null },
+    sync: { running: false, paused: false, state: 'idle', conflicts: 0, lastSync: null, detail: 'Idle' },
     files: [],
     fileQuery: '',
     fileView: 'list',
@@ -144,6 +145,7 @@
     const next = status.state || 'idle';
     badge.classList.add(next);
     badge.textContent = next.charAt(0).toUpperCase() + next.slice(1);
+    badge.title = status.detail || next;
   }
 
   // ─── Dashboard ───────────────────────────────────────────────
@@ -151,7 +153,9 @@
     try {
       const sync = await invoke('get_sync_status');
       state.sync = sync;
-      document.getElementById('syncState').textContent = sync.state || '—';
+      const syncState = document.getElementById('syncState');
+      syncState.textContent = sync.state || '—';
+      syncState.title = sync.detail || sync.state || '';
       document.getElementById('conflictCount').textContent = sync.conflicts ?? 0;
       document.getElementById('totalFiles').textContent = String(state.files.length || 0);
       document.getElementById('transferCount').textContent = String(state.transfers.length || 0);
@@ -577,12 +581,13 @@
     const proxy = document.getElementById('inputProxy').value.trim();
     const accountSyncFolder = document.getElementById('inputAccountSyncFolder').value.trim();
     const settingsSyncFolder = document.getElementById('inputSyncFolder').value.trim();
+    const syncFolder = accountSyncFolder || settingsSyncFolder || '~/S4Drive';
     return {
       endpoint: document.getElementById('inputEndpoint').value.trim(),
       bucket: document.getElementById('inputBucket').value.trim(),
       access_key_id: document.getElementById('inputAccessKey').value.trim(),
       region: document.getElementById('inputRegion').value.trim() || 'us-east-1',
-      sync_folder: accountSyncFolder || settingsSyncFolder || '~/S4Drive',
+      sync_folder: syncFolder,
       bucket_prefix: state.settings.bucket_prefix || '/',
       polling_interval_sec: parseInt(document.getElementById('inputPolling').value, 10) || 30,
       bandwidth_limit_kbps: Number.isFinite(bandwidth) && bandwidth > 0 ? bandwidth : null,
@@ -594,11 +599,35 @@
       dark_mode: document.getElementById('inputDarkMode').checked,
       use_system_theme: document.getElementById('inputUseSystemTheme').checked,
       use_tls: document.getElementById('inputUseTls').checked,
+      large_sync_confirmed: Boolean(state.settings.large_sync_confirmed) && syncFolder === state.settings.sync_folder,
     };
   }
 
   function normalizeSettings(settings) {
     return Object.assign({}, state.settings, settings || {});
+  }
+
+  async function confirmLargeSyncIfNeeded() {
+    const inspection = await invoke('inspect_sync_folder');
+    if (!inspection?.requires_confirmation || state.settings.large_sync_confirmed) {
+      return true;
+    }
+
+    const accepted = window.confirm(
+      `${inspection.message}\n\nS4Drive will process this folder in staged batches so the desktop app stays responsive.`
+    );
+    if (!accepted) {
+      showToast('Large sync cancelled', 'info');
+      return false;
+    }
+
+    state.settings.large_sync_confirmed = true;
+    state.settings = normalizeSettings(await invoke('save_settings', {
+      settings: collectSettings(),
+      secretKey: null,
+    }));
+    showToast('Large sync confirmed', 'success');
+    return true;
   }
 
   async function runDiagnostics() {
@@ -747,6 +776,8 @@
       const button = document.getElementById('btnSyncNow');
       button.disabled = true;
       try {
+        const canSync = await confirmLargeSyncIfNeeded();
+        if (!canSync) return;
         const result = await invoke('sync_now');
         showToast(result?.message || 'Sync complete', 'success', 7000);
         await Promise.all([refreshDashboard(), refreshFiles(), refreshActivity(), refreshTransfers()]);
@@ -877,6 +908,11 @@
     await listen('sync-status-changed', (event) => {
       state.sync = event.payload;
       updateStatusBadge(state.sync);
+      const syncState = document.getElementById('syncState');
+      if (syncState) {
+        syncState.textContent = state.sync.state || '—';
+        syncState.title = state.sync.detail || state.sync.state || '';
+      }
     });
 
     await listen('app-exiting', () => {

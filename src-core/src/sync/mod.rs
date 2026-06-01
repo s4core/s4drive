@@ -40,7 +40,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TEXT_AUTO_MERGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_SYNC_SCAN_FILES: usize = 100_000;
+const MAX_SYNC_SCAN_FILES: usize = 1_000_000;
+const MAX_LOCAL_UPLOADS_QUEUED_PER_PASS: u32 = 2_000;
+const MAX_UPLOAD_JOBS_PER_PASS: u32 = 200;
+const MAX_DOWNLOAD_JOBS_PER_PASS: u32 = 200;
 
 /// The sync engine orchestrates two-way synchronization.
 #[allow(clippy::too_many_arguments)]
@@ -580,6 +583,46 @@ async fn run_initial_sync(
         return Ok(result);
     }
 
+    let (pending_uploads, pending_downloads) = transfer.pending_count()?;
+    if pending_uploads > 0 {
+        set_state(state, SyncState::Uploading);
+        let (up, bytes, conf) = process_upload_queue(
+            transfer,
+            download.s3(),
+            metadata,
+            db,
+            activity,
+            conflict,
+            conflict_engine,
+            versions,
+            sync_folder,
+            max_retries,
+            max_concurrent_uploads,
+            exclude_patterns,
+        )
+        .await?;
+        result.files_uploaded = up;
+        result.bytes_uploaded = bytes;
+        result.conflicts_detected += conf;
+        return Ok(result);
+    }
+
+    if pending_downloads > 0 {
+        set_state(state, SyncState::Downloading);
+        let (down, bytes) = process_download_queue(
+            transfer,
+            download,
+            db,
+            activity,
+            max_retries,
+            max_concurrent_downloads,
+        )
+        .await?;
+        result.files_downloaded = down;
+        result.bytes_downloaded = bytes;
+        return Ok(result);
+    }
+
     // ── Phase A: Scan local folder ──
     set_state(state, SyncState::ScanningLocal);
     tracing::info!("Initial sync: scanning local folder: {}", sync_folder);
@@ -594,10 +637,21 @@ async fn run_initial_sync(
     let local_files = local_scan.files;
     tracing::info!("Found {} local files", local_files.len());
 
+    let mut queued_uploads_this_pass = 0u32;
     for (rel_path, _scan_size) in &local_files {
         if paused.load(Ordering::Relaxed) {
             break;
         }
+        if queued_uploads_this_pass >= MAX_LOCAL_UPLOADS_QUEUED_PER_PASS {
+            let message = format!(
+                "queued {} local upload(s); remaining local changes will continue in later sync passes",
+                MAX_LOCAL_UPLOADS_QUEUED_PER_PASS
+            );
+            tracing::info!("{}", message);
+            result.errors.push(message);
+            break;
+        }
+
         let local_full_path = sync_path.join(rel_path);
         let s3_key = path_to_s3_key(rel_path);
         let (hash_hex, file_size) = match blake3_file_hash(&local_full_path).await {
@@ -655,6 +709,7 @@ async fn run_initial_sync(
             &s3_key,
         )?;
 
+        queued_uploads_this_pass += 1;
         result.files_uploaded += 1;
         result.bytes_uploaded += file_size;
         activity.log("initial_upload", &file_id.to_string(), &s3_key, "queued")?;
@@ -676,6 +731,7 @@ async fn run_initial_sync(
             sync_folder,
             max_retries,
             max_concurrent_uploads,
+            exclude_patterns,
         )
         .await?;
         result.files_uploaded = up;
@@ -889,6 +945,7 @@ async fn run_sync_cycle(
             _sync_folder,
             max_retries,
             max_concurrent_uploads,
+            exclude_patterns,
         )
         .await?;
         result.files_uploaded = up;
@@ -946,23 +1003,40 @@ async fn process_upload_queue(
     sync_folder: &str,
     max_retries: u32,
     max_concurrent_uploads: u32,
+    exclude_patterns: &[String],
 ) -> CoreResult<(u32, u64, u32)> {
     let mut uploaded = 0u32;
     let mut total_bytes = 0u64;
     let mut conflicts = 0u32;
     let mut concurrency = AdaptiveConcurrency::new(max_concurrent_uploads);
+    let mut processed_jobs = 0u32;
 
-    loop {
-        let jobs = transfer.pending_uploads(concurrency.current())?;
+    while processed_jobs < MAX_UPLOAD_JOBS_PER_PASS {
+        let remaining = MAX_UPLOAD_JOBS_PER_PASS - processed_jobs;
+        let jobs = transfer.pending_uploads(concurrency.current().min(remaining).max(1))?;
         if jobs.is_empty() {
             break;
         }
 
         for job in &jobs {
+            processed_jobs += 1;
             let started = Instant::now();
             let file_id = job.file_id.clone();
             let local_path = job.local_path.clone();
             let s3_key = job.s3_key.clone();
+            let local_path_ref = Path::new(&local_path);
+
+            if should_ignore_sync_path(local_path_ref, Path::new(sync_folder), exclude_patterns) {
+                transfer.mark_failed(job.id, "excluded by sync settings")?;
+                activity.log("upload_skipped", &file_id, &s3_key, "excluded")?;
+                continue;
+            }
+
+            if !local_path_ref.is_file() {
+                transfer.mark_failed(job.id, "local file missing before upload")?;
+                activity.log("upload_skipped", &file_id, &s3_key, "missing local file")?;
+                continue;
+            }
 
             transfer.mark_in_progress(job.id)?;
 
@@ -1169,14 +1243,17 @@ async fn process_download_queue(
     let mut downloaded = 0u32;
     let mut total_bytes = 0u64;
     let mut concurrency = AdaptiveConcurrency::new(max_concurrent_downloads);
+    let mut processed_jobs = 0u32;
 
-    loop {
-        let jobs = transfer.pending_downloads(concurrency.current())?;
+    while processed_jobs < MAX_DOWNLOAD_JOBS_PER_PASS {
+        let remaining = MAX_DOWNLOAD_JOBS_PER_PASS - processed_jobs;
+        let jobs = transfer.pending_downloads(concurrency.current().min(remaining).max(1))?;
         if jobs.is_empty() {
             break;
         }
 
         for job in &jobs {
+            processed_jobs += 1;
             let started = Instant::now();
             transfer.mark_in_progress(job.id)?;
 
