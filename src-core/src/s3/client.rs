@@ -152,7 +152,11 @@ impl S3Adapter {
                     .body(ByteStream::from(body))
                     .send()
                     .await
-                    .map_err(|e| classify_s3_error(e, key))?;
+                    .map_err(|err| {
+                        let service_err = err.into_service_error();
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        classify_s3_service_error(code.as_deref(), service_err, key)
+                    })?;
 
                 Ok(normalize_etag(resp.e_tag()))
             }
@@ -176,7 +180,11 @@ impl S3Adapter {
                     .body(ByteStream::from(body))
                     .send()
                     .await
-                    .map_err(|e| classify_s3_error(e, key))?;
+                    .map_err(|err| {
+                        let service_err = err.into_service_error();
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        classify_s3_service_error(code.as_deref(), service_err, key)
+                    })?;
 
                 Ok(normalize_etag(resp.e_tag()))
             }
@@ -204,10 +212,11 @@ impl S3Adapter {
                     Ok(_) => Ok(true),
                     Err(err) => {
                         let service_err = err.into_service_error();
-                        if service_err.meta().code() == Some("PreconditionFailed") {
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        if code.as_deref() == Some("PreconditionFailed") {
                             Ok(false)
                         } else {
-                            Err(classify_s3_error(service_err, key))
+                            Err(classify_s3_service_error(code.as_deref(), service_err, key))
                         }
                     }
                 }
@@ -242,10 +251,11 @@ impl S3Adapter {
                     Ok(_) => Ok(true),
                     Err(err) => {
                         let service_err = err.into_service_error();
-                        if service_err.meta().code() == Some("PreconditionFailed") {
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        if code.as_deref() == Some("PreconditionFailed") {
                             Ok(false)
                         } else {
-                            Err(classify_s3_error(service_err, key))
+                            Err(classify_s3_service_error(code.as_deref(), service_err, key))
                         }
                     }
                 }
@@ -281,10 +291,11 @@ impl S3Adapter {
                     Ok(_) => Ok(true),
                     Err(err) => {
                         let service_err = err.into_service_error();
-                        if service_err.meta().code() == Some("PreconditionFailed") {
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        if code.as_deref() == Some("PreconditionFailed") {
                             Ok(false)
                         } else {
-                            Err(classify_s3_error(service_err, key))
+                            Err(classify_s3_service_error(code.as_deref(), service_err, key))
                         }
                     }
                 }
@@ -303,7 +314,11 @@ impl S3Adapter {
                 .key(key)
                 .send()
                 .await
-                .map_err(|e| classify_s3_error(e, key))?;
+                .map_err(|err| {
+                    let service_err = err.into_service_error();
+                    let code = service_err.meta().code().map(ToString::to_string);
+                    classify_s3_service_error(code.as_deref(), service_err, key)
+                })?;
 
             let data = resp
                 .body
@@ -329,7 +344,11 @@ impl S3Adapter {
                 .range(range)
                 .send()
                 .await
-                .map_err(|e| classify_s3_error(e, key))?;
+                .map_err(|err| {
+                    let service_err = err.into_service_error();
+                    let code = service_err.meta().code().map(ToString::to_string);
+                    classify_s3_service_error(code.as_deref(), service_err, key)
+                })?;
 
             let data = resp
                 .body
@@ -357,7 +376,11 @@ impl S3Adapter {
                     .key(key)
                     .send()
                     .await
-                    .map_err(|e| classify_s3_error(e, key))?;
+                    .map_err(|err| {
+                        let service_err = err.into_service_error();
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        classify_s3_service_error(code.as_deref(), service_err, key)
+                    })?;
 
                 let mut reader = resp.body.into_async_read();
                 let mut file = tokio::fs::File::create(&path).await.map_err(|e| {
@@ -386,7 +409,11 @@ impl S3Adapter {
                 .key(key)
                 .send()
                 .await
-                .map_err(|e| classify_s3_error(e, key))?;
+                .map_err(|err| {
+                    let service_err = err.into_service_error();
+                    let code = service_err.meta().code().map(ToString::to_string);
+                    classify_s3_service_error(code.as_deref(), service_err, key)
+                })?;
 
             let size = resp.content_length().unwrap_or(0).max(0) as u64;
 
@@ -413,7 +440,11 @@ impl S3Adapter {
                 .key(key)
                 .send()
                 .await
-                .map_err(|e| classify_s3_error(e, key))?;
+                .map_err(|err| {
+                    let service_err = err.into_service_error();
+                    let code = service_err.meta().code().map(ToString::to_string);
+                    classify_s3_service_error(code.as_deref(), service_err, key)
+                })?;
             Ok(())
         })
         .await
@@ -471,7 +502,11 @@ impl S3Adapter {
                 req = req.continuation_token(token);
             }
 
-            let resp = req.send().await.map_err(|e| classify_s3_error(e, prefix))?;
+            let resp = req.send().await.map_err(|err| {
+                let service_err = err.into_service_error();
+                let code = service_err.meta().code().map(ToString::to_string);
+                classify_s3_service_error(code.as_deref(), service_err, prefix)
+            })?;
             let keys = resp
                 .contents()
                 .iter()
@@ -604,7 +639,11 @@ impl S3Adapter {
                 .key(key)
                 .send()
                 .await
-                .map_err(|e| classify_s3_error(e, key))?;
+                .map_err(|err| {
+                    let service_err = err.into_service_error();
+                    let code = service_err.meta().code().map(ToString::to_string);
+                    classify_s3_service_error(code.as_deref(), service_err, key)
+                })?;
 
             let upload_id = upload.upload_id().ok_or_else(|| {
                 CoreError::S3(format!(
@@ -642,7 +681,11 @@ impl S3Adapter {
                     .body(ByteStream::from(data))
                     .send()
                     .await
-                    .map_err(|e| classify_s3_error(e, key))?;
+                    .map_err(|err| {
+                        let service_err = err.into_service_error();
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        classify_s3_service_error(code.as_deref(), service_err, key)
+                    })?;
 
                 let etag = part_resp.e_tag().ok_or_else(|| {
                     CoreError::S3(format!(
@@ -688,7 +731,11 @@ impl S3Adapter {
                     .body(body)
                     .send()
                     .await
-                    .map_err(|e| classify_s3_error(e, key))?;
+                    .map_err(|err| {
+                        let service_err = err.into_service_error();
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        classify_s3_service_error(code.as_deref(), service_err, key)
+                    })?;
 
                 let etag = part_resp.e_tag().ok_or_else(|| {
                     CoreError::S3(format!(
@@ -795,7 +842,11 @@ impl S3Adapter {
                     .multipart_upload(completed)
                     .send()
                     .await
-                    .map_err(|e| classify_s3_error(e, key))?;
+                    .map_err(|err| {
+                        let service_err = err.into_service_error();
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        classify_s3_service_error(code.as_deref(), service_err, key)
+                    })?;
 
                 Ok(normalize_etag(result.e_tag()))
             }
@@ -852,10 +903,11 @@ impl S3Adapter {
                     Ok(_) => Ok(true),
                     Err(err) => {
                         let service_err = err.into_service_error();
-                        if service_err.meta().code() == Some("PreconditionFailed") {
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        if code.as_deref() == Some("PreconditionFailed") {
                             Ok(false)
                         } else {
-                            Err(classify_s3_error(service_err, key))
+                            Err(classify_s3_service_error(code.as_deref(), service_err, key))
                         }
                     }
                 }
@@ -874,7 +926,11 @@ impl S3Adapter {
                 .upload_id(upload_id)
                 .send()
                 .await
-                .map_err(|e| classify_s3_error(e, key))?;
+                .map_err(|err| {
+                    let service_err = err.into_service_error();
+                    let code = service_err.meta().code().map(ToString::to_string);
+                    classify_s3_service_error(code.as_deref(), service_err, key)
+                })?;
             Ok(())
         })
         .await
@@ -1012,6 +1068,17 @@ pub(crate) fn classify_s3_error(e: impl std::fmt::Display, context: &str) -> Cor
     }
 }
 
+fn classify_s3_service_error(
+    code: Option<&str>,
+    e: impl std::fmt::Display,
+    context: &str,
+) -> CoreError {
+    match code.filter(|code| !code.is_empty()) {
+        Some(code) => classify_s3_error(format!("{}: {}", code, e), context),
+        None => classify_s3_error(e, context),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,6 +1114,10 @@ mod tests {
     fn string_error_classifier_maps_required_statuses() {
         assert!(matches!(
             classify_s3_error("service error: 404 NoSuchKey", "k"),
+            CoreError::NotFound(_)
+        ));
+        assert!(matches!(
+            classify_s3_service_error(Some("NoSuchKey"), "service error", "k"),
             CoreError::NotFound(_)
         ));
         assert!(matches!(
