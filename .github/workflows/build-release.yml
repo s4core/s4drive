@@ -46,7 +46,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          workspaces: |
+            . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Tauri system deps (Linux)
@@ -86,7 +87,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: s4drive-linux
-          path: target/release/bundle/
+          path: |
+            target/release/bundle/
+            src-tauri/target/release/bundle/
           retention-days: 14
           compression-level: 0
 
@@ -106,7 +109,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          workspaces: |
+            . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install WiX Toolset (for MSI)
@@ -128,7 +132,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: s4drive-windows
-          path: target/release/bundle/
+          path: |
+            target/release/bundle/
+            src-tauri/target/release/bundle/
           retention-days: 14
           compression-level: 0
 
@@ -148,7 +154,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          workspaces: |
+            . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Tauri CLI
@@ -278,7 +285,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-core -> target, src-cli -> target
+          workspaces: |
+            . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install system deps (Linux)
@@ -312,7 +320,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          workspaces: |
+            . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Java JDK
@@ -366,7 +375,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-core -> target, src-cli -> target, src-tauri -> target
+          workspaces: |
+            . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Tauri CLI
@@ -418,10 +428,11 @@ jobs:
           else
             LOG=$(git log --oneline --max-count=30 --no-decorate 2>/dev/null)
           fi
-          cat > release-notes.md << 'EOF'
-          # S4Drive vVERSION
-          ## What's Changed
-          EOF
+          {
+            echo "# S4Drive v${VERSION}"
+            echo
+            echo "## What's Changed"
+          } > release-notes.md
           echo "$LOG" | sed 's/^/ - /' >> release-notes.md
 
       - name: Organize release assets
@@ -445,9 +456,14 @@ jobs:
             cp "$f" "release-assets/S4Drive-${V}-macos-universal.dmg"
           done
           # CLI
-          find artifacts/ -name "s4drive-cli-*" -type f 2>/dev/null | while read f; do
-            n=$(basename "$f")
-            cp "$f" "release-assets/${n}"
+          find artifacts/ -type f \( -name "s4drive-cli" -o -name "s4drive-cli.exe" \) 2>/dev/null | while read f; do
+            artifact_dir=$(basename "$(dirname "$f")")
+            target_name="${artifact_dir#s4drive-cli-}"
+            suffix=""
+            case "$(basename "$f")" in
+              *.exe) suffix=".exe" ;;
+            esac
+            cp "$f" "release-assets/S4Drive-${V}-cli-${target_name}${suffix}"
           done
           ls -lh release-assets/
 

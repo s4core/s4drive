@@ -20,43 +20,108 @@ pub struct XdgPaths;
 impl XdgPaths {
     /// `~/.local/share/applications/`
     pub fn applications() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".local/share/applications")
+        home_dir().join(".local/share/applications")
     }
 
     /// `~/.config/autostart/`
     pub fn autostart() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".config/autostart")
+        home_dir().join(".config/autostart")
     }
 
     /// `~/.local/share/nautilus-python/extensions/`
     pub fn nautilus_extensions() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".local/share/nautilus-python/extensions")
+        home_dir().join(".local/share/nautilus-python/extensions")
     }
 
     /// `~/.local/share/thunar/extensions/`
     pub fn thunar_extensions() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".local/share/Thunar/extensions")
+        home_dir().join(".local/share/Thunar/extensions")
     }
 
     /// `~/.icons/hicolor/48x48/apps/` — for badge overlay icons
     pub fn app_icons() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".icons/hicolor/48x48/apps")
+        home_dir().join(".icons/hicolor/48x48/apps")
     }
 
     /// `~/.local/share/s4drive/`
     pub fn data_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".local/share/s4drive")
+        home_dir().join(".local/share/s4drive")
     }
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+fn desktop_exec_arg(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '`' => escaped.push_str("\\`"),
+            '$' => escaped.push_str("\\$"),
+            '%' => escaped.push_str("%%"),
+            '\n' | '\r' => escaped.push(' '),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+fn python_string_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("\\'"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+fn applescript_string_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' | '\r' => escaped.push(' '),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Generate the content of an S4Drive `.desktop` file.
 pub fn desktop_file_content(exec_path: &str) -> String {
+    let exec = desktop_exec_arg(exec_path);
     format!(
         r#"[Desktop Entry]
 Type=Application
@@ -81,12 +146,13 @@ Exec={exec} --tray-sync
 "#,
         name = APP_NAME,
         comment = APP_COMMENT,
-        exec = exec_path
+        exec = exec
     )
 }
 
 /// Generate the content of an S4Drive autostart `.desktop` file.
 pub fn autostart_file_content(exec_path: &str) -> String {
+    let exec = desktop_exec_arg(exec_path);
     format!(
         r#"[Desktop Entry]
 Type=Application
@@ -102,14 +168,17 @@ X-KDE-autostart-after=panel
 "#,
         name = APP_NAME,
         comment = APP_COMMENT,
-        exec = exec_path
+        exec = exec
     )
 }
 
 /// Install (or remove) the S4Drive `.desktop` file(s).
 pub fn install_desktop_file(exec_path: &str) -> std::io::Result<PathBuf> {
-    let dir = XdgPaths::applications();
-    std::fs::create_dir_all(&dir)?;
+    install_desktop_file_at(&XdgPaths::applications(), exec_path)
+}
+
+fn install_desktop_file_at(dir: &Path, exec_path: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.desktop", APP_ID));
     std::fs::write(&path, desktop_file_content(exec_path))?;
     Ok(path)
@@ -126,8 +195,11 @@ pub fn remove_desktop_file() -> std::io::Result<()> {
 
 /// Enable autostart (install `~/.config/autostart/s4drive.desktop`).
 pub fn enable_autostart(exec_path: &str) -> std::io::Result<PathBuf> {
-    let dir = XdgPaths::autostart();
-    std::fs::create_dir_all(&dir)?;
+    enable_autostart_at(&XdgPaths::autostart(), exec_path)
+}
+
+fn enable_autostart_at(dir: &Path, exec_path: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
     let path = dir.join("s4drive.desktop");
     std::fs::write(&path, autostart_file_content(exec_path))?;
     Ok(path)
@@ -169,6 +241,7 @@ pub fn install_thunar_extension(s4drive_cli_path: &str) -> std::io::Result<PathB
 
 /// Generate the Nautilus Python extension source.
 fn generate_nautilus_extension(cli_path: &str) -> String {
+    let cli_literal = python_string_literal(cli_path);
     format!(
         r##"""# S4Drive Nautilus Extension — context menu + status emblems.
 #
@@ -182,7 +255,7 @@ import gi
 gi.require_version('Nautilus', '4.0')
 from gi.repository import Nautilus, GObject, Gio, GLib
 
-S4DRIVE_CLI = "{cli_path}"
+S4DRIVE_CLI = {cli_literal}
 
 # ── Status emblem names (need matching icon theme entries) ─────────
 
@@ -245,10 +318,10 @@ class S4DriveEmblemExtension(GObject.GObject, Nautilus.InfoProvider):
     def update_file_info(self, file):
         path = file.get_location().get_path()
         if not path:
-            return
+            return Nautilus.OperationResult.COMPLETE
 
         if os.path.basename(path) == ".s4drive":
-            return
+            return Nautilus.OperationResult.COMPLETE
 
         state, _ = _get_file_status(path) or ("", "")
         emblem_map = {{
@@ -261,6 +334,7 @@ class S4DriveEmblemExtension(GObject.GObject, Nautilus.InfoProvider):
         emblem = emblem_map.get(state)
         if emblem:
             file.add_emblem(emblem)
+        return Nautilus.OperationResult.COMPLETE
 
 
 # ── Menu Provider (context menu items) ─────────────────────────────
@@ -274,9 +348,10 @@ class S4DriveMenuExtension(GObject.GObject, Nautilus.MenuProvider):
             return []
 
         items = []
-        is_folder = all(f.is_directory() or f.is_gfile() for f in files)
-
         first_path = files[0].get_location().get_path()
+        if not first_path:
+            return []
+        is_folder = all(f.is_directory() for f in files)
         sync_folder = os.path.dirname(first_path) if not files[0].is_directory() else first_path
         item_sync = Nautilus.MenuItem(
             name="S4Drive::SyncNow",
@@ -383,12 +458,13 @@ class S4DriveBackgroundExtension(GObject.GObject, Nautilus.MenuProvider):
         except FileNotFoundError:
             pass
 "##,
-        cli_path = cli_path
+        cli_literal = cli_literal
     )
 }
 
 /// Generate the Thunar Python extension source.
 fn generate_thunar_extension(cli_path: &str) -> String {
+    let cli_literal = python_string_literal(cli_path);
     format!(
         r##"""# S4Drive Thunar Extension — context menu items.
 #
@@ -401,7 +477,7 @@ import subprocess
 
 from thunarx import Thunarx
 
-S4DRIVE_CLI = "{cli_path}"
+S4DRIVE_CLI = {cli_literal}
 
 
 class S4DriveThunarExtension(Thunarx.MenuProvider):
@@ -424,7 +500,7 @@ class S4DriveThunarExtension(Thunarx.MenuProvider):
             icon_name="emblem-synchronizing"
         )
         sync_action.connect("activate", lambda _: self._run_cmd(
-            [S4DRIVE_CLI, "fm", "sync-now"]
+            [S4DRIVE_CLI, "fm", "sync-now", first_path]
         ))
         actions.append(sync_action)
 
@@ -441,6 +517,17 @@ class S4DriveThunarExtension(Thunarx.MenuProvider):
             )
             share.connect("activate", lambda _: self._copy_link(file_path))
             actions.append(share)
+
+            history = Thunarx.MenuItem(
+                id="S4Drive::VersionHistory",
+                label="Version History",
+                tooltip="Open S4Drive version history",
+                icon_name="document-open-recent"
+            )
+            history.connect("activate", lambda _: self._run_cmd(
+                [S4DRIVE_CLI, "fm", "version-history", file_path]
+            ))
+            actions.append(history)
 
         return actions
 
@@ -469,17 +556,22 @@ class S4DriveThunarExtension(Thunarx.MenuProvider):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 "##,
-        cli_path = cli_path
+        cli_literal = cli_literal
     )
 }
 
 /// Check if `nautilus-python` is available (for the extension).
 pub fn has_nautilus_python() -> bool {
     std::process::Command::new("pkg-config")
-        .args(["libnautilus-extension"])
+        .args(["libnautilus-extension-4"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+        || std::process::Command::new("pkg-config")
+            .args(["libnautilus-extension"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
         || Path::new("/usr/lib/python3/dist-packages/gi/overrides/Nautilus.py").exists()
         || Path::new("/usr/share/nautilus-python/extensions").exists()
 }
@@ -509,7 +601,7 @@ pub fn uninstall_extensions() -> std::io::Result<()> {
 ///
 /// Apply the file with: `regedit.exe /s s4drive_context.reg`
 pub fn windows_context_menu_registry(cli_path: &str) -> String {
-    let escaped_path = cli_path.replace('\\', "\\\\");
+    let escaped_path = cli_path.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
         r#"Windows Registry Editor Version 5.00
 
@@ -579,7 +671,7 @@ Write-Host "✓ S4Drive context menu installed. Restart Explorer or log off to s
 /// Generate the content of a Windows autostart registry file.
 /// Uses HKCU — no admin required.
 pub fn windows_autostart_registry(exec_path: &str) -> String {
-    let escaped = exec_path.replace('\\', "\\\\");
+    let escaped = exec_path.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
         r#"Windows Registry Editor Version 5.00
 
@@ -659,40 +751,42 @@ pub fn macos_services_workflow() -> String {
 
 /// Generate an AppleScript for macOS Finder integration.
 pub fn macos_finder_applescript(cli_path: &str) -> String {
+    let cli = applescript_string_literal(cli_path);
     format!(
         r#"-- S4Drive Finder Integration
 -- Save as .app or run: osascript s4drive-finder.applescript
 
 on run {{input, parameters}}
-    set cliPath to "{cli}"
+    set cliPath to {cli}
     repeat with itemPath in input
         set itemPath to POSIX path of itemPath
-        do shell script cliPath & " fm sync-now " & quoted form of itemPath
+        do shell script quoted form of cliPath & " fm sync-now " & quoted form of itemPath
     end repeat
 end run
 
 on share_link(filePath)
-    set cliPath to "{cli}"
-    set linkText to do shell script cliPath & " fm share-link " & quoted form of filePath
+    set cliPath to {cli}
+    set linkText to do shell script quoted form of cliPath & " fm share-link " & quoted form of filePath
     set the clipboard to linkText
 end share_link
 
 on version_history(filePath)
-    set cliPath to "{cli}"
-    do shell script cliPath & " fm version-history " & quoted form of filePath
+    set cliPath to {cli}
+    do shell script quoted form of cliPath & " fm version-history " & quoted form of filePath
 end version_history
 "#,
-        cli = cli_path
+        cli = cli
     )
 }
 
 /// Generate a macOS installer `.command` script for Finder integration.
 pub fn macos_install_script(cli_path: &str) -> String {
-    let escaped = cli_path.replace('"', "\\\"");
+    let shell_cli = shell_single_quote(cli_path);
+    let automator_command = xml_escape(&format!("{} fm sync-now \"$@\"", shell_cli));
     format!(
         r#"#!/bin/bash
 # S4Drive — macOS Finder Integration Installer
-CLI_PATH="{cli}"
+CLI_PATH={cli}
 
 echo "Installing S4Drive Finder Services..."
 
@@ -760,7 +854,7 @@ cat > "$WORKFLOW_DIR/Contents/document.wflow" << 'WFLOW'
                     <key>COMMAND_STRING</key>
                     <dict>
                         <key>value</key>
-                        <string>"$CLI_PATH" fm sync-now</string>
+                        <string>{automator_command}</string>
                     </dict>
                     <key>inputMethod</key>
                     <dict>
@@ -787,7 +881,8 @@ WFLOW
 echo "✓ S4Drive Finder Services installed."
 echo "  Restart Finder or log out/in to see: Services > S4Drive Sync Now"
 "#,
-        cli = escaped
+        cli = shell_cli,
+        automator_command = automator_command
     )
 }
 
@@ -955,19 +1050,13 @@ impl PlatformPaths {
     /// macOS=~/Library/Preferences/com.s4drive
     pub fn config_dir() -> PathBuf {
         match current_platform() {
-            Platform::Linux => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                PathBuf::from(home).join(".config/s4drive")
-            }
+            Platform::Linux => home_dir().join(".config/s4drive"),
             Platform::Windows => {
                 let appdata = std::env::var("APPDATA")
                     .unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Roaming".into());
                 PathBuf::from(appdata).join("S4Drive")
             }
-            Platform::Macos => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                PathBuf::from(home).join("Library/Preferences/com.s4drive.S4Drive")
-            }
+            Platform::Macos => home_dir().join("Library/Preferences/com.s4drive.S4Drive"),
         }
     }
 
@@ -982,10 +1071,7 @@ impl PlatformPaths {
                     .unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".into());
                 PathBuf::from(local).join("S4Drive/logs")
             }
-            Platform::Macos => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                PathBuf::from(home).join("Library/Logs/com.s4drive.S4Drive")
-            }
+            Platform::Macos => home_dir().join("Library/Logs/com.s4drive.S4Drive"),
         }
     }
 
@@ -1021,10 +1107,11 @@ mod tests {
 
     #[test]
     fn test_desktop_file_contains_app_name() {
-        let content = desktop_file_content("/usr/bin/s4drive");
+        let content = desktop_file_content("/usr/bin/S4 Drive/s4drive");
         assert!(content.contains("S4Drive"));
         assert!(content.contains("x-scheme-handler/s4drive"));
         assert!(content.contains("SyncNow"));
+        assert!(content.contains("Exec=\"/usr/bin/S4 Drive/s4drive\" %u"));
     }
 
     #[test]
@@ -1036,55 +1123,55 @@ mod tests {
 
     #[test]
     fn test_xdg_paths_ends_with_home() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        assert!(XdgPaths::applications().to_string_lossy().contains(&home));
-        assert!(XdgPaths::autostart().to_string_lossy().contains(&home));
-        assert!(XdgPaths::nautilus_extensions()
-            .to_string_lossy()
-            .contains(&home));
+        let home = home_dir();
+        assert!(XdgPaths::applications().starts_with(&home));
+        assert!(XdgPaths::autostart().starts_with(&home));
+        assert!(XdgPaths::nautilus_extensions().starts_with(&home));
     }
 
     #[test]
     fn test_nautilus_extension_generated() {
-        let ext = generate_nautilus_extension("/usr/bin/s4drive");
-        assert!(ext.contains("S4DRIVE_CLI = \"/usr/bin/s4drive\""));
+        let ext = generate_nautilus_extension("/usr/bin/S4 Drive/s4drive");
+        assert!(ext.contains("S4DRIVE_CLI = '/usr/bin/S4 Drive/s4drive'"));
         assert!(ext.contains("class S4DriveMenuExtension"));
         assert!(ext.contains("class S4DriveEmblemExtension"));
         assert!(ext.contains("S4Drive::ShareLink"));
         assert!(ext.contains("S4Drive::VersionHistory"));
+        assert!(ext.contains("Nautilus.OperationResult.COMPLETE"));
     }
 
     #[test]
     fn test_thunar_extension_generated() {
-        let ext = generate_thunar_extension("/usr/bin/s4drive");
-        assert!(ext.contains("S4DRIVE_CLI = \"/usr/bin/s4drive\""));
+        let ext = generate_thunar_extension("/usr/bin/S4 Drive/s4drive");
+        assert!(ext.contains("S4DRIVE_CLI = '/usr/bin/S4 Drive/s4drive'"));
         assert!(ext.contains("class S4DriveThunarExtension"));
         assert!(ext.contains("S4Drive::SyncNow"));
+        assert!(ext.contains("S4Drive::VersionHistory"));
+        assert!(ext.contains("[S4DRIVE_CLI, \"fm\", \"sync-now\", first_path]"));
     }
 
     #[test]
     fn test_desktop_file_install_roundtrip() {
         let exec = "/usr/bin/s4drive";
-        let path = install_desktop_file(exec).expect("should install desktop file");
+        let dir = std::env::temp_dir().join(format!("s4drive-desktop-{}", uuid::Uuid::now_v7()));
+        let path = install_desktop_file_at(&dir, exec).expect("should install desktop file");
         assert!(path.exists());
         let content = std::fs::read_to_string(&path).expect("should read back");
         assert!(content.contains(exec));
 
-        remove_desktop_file().expect("should remove");
-        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).expect("should clean temp desktop dir");
     }
 
     #[test]
     fn test_autostart_enable_disable() {
         let exec = "/usr/bin/s4drive";
-        assert!(!autostart_enabled());
-
-        let path = enable_autostart(exec).expect("should enable autostart");
+        let dir = std::env::temp_dir().join(format!("s4drive-autostart-{}", uuid::Uuid::now_v7()));
+        let path = enable_autostart_at(&dir, exec).expect("should enable autostart");
         assert!(path.exists());
-        assert!(autostart_enabled());
+        let content = std::fs::read_to_string(&path).expect("should read autostart file");
+        assert!(content.contains("Exec=\"/usr/bin/s4drive\""));
 
-        disable_autostart().expect("should disable autostart");
-        assert!(!autostart_enabled());
+        std::fs::remove_dir_all(&dir).expect("should clean temp autostart dir");
     }
 
     // ── Windows tests ──────────────────────────────────────────────
@@ -1130,9 +1217,10 @@ mod tests {
 
     #[test]
     fn test_macos_finder_applescript() {
-        let script = macos_finder_applescript("/usr/local/bin/s4drive");
+        let script = macos_finder_applescript("/usr/local/bin/S4 Drive/s4drive");
         assert!(script.contains("s4drive-finder.applescript"));
         assert!(script.contains("fm sync-now"));
+        assert!(script.contains("quoted form of cliPath"));
         assert!(script.contains("share_link"));
         assert!(script.contains("version_history"));
     }
@@ -1157,10 +1245,11 @@ mod tests {
 
     #[test]
     fn test_macos_install_script() {
-        let script = macos_install_script("/opt/s4drive");
+        let script = macos_install_script("/opt/S4 Drive/s4drive");
         assert!(script.contains("#!/bin/bash"));
         assert!(script.contains("macOS Finder Integration"));
         assert!(script.contains("Workflow"));
+        assert!(script.contains("&apos;/opt/S4 Drive/s4drive&apos; fm sync-now"));
     }
 
     // ── Cross-platform tests ───────────────────────────────────────

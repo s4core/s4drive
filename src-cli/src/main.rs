@@ -6,10 +6,14 @@
 ///   cargo run -p s4drive-cli -- metadata status ...
 ///   cargo run -p s4drive-cli -- metadata tree ...
 ///   cargo run -p s4drive-cli -- metadata ops ...
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use rusqlite::OpenFlags;
 use s4drive_core::config::Config;
 use s4drive_core::metadata::engine::MetadataEngine;
 use s4drive_core::s3::S3Adapter;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 #[derive(Parser)]
 #[command(name = "s4drive", about = "S4Drive CLI")]
@@ -90,6 +94,9 @@ enum Commands {
         #[command(subcommand)]
         action: FmAction,
     },
+    /// s4drive:// deep links delegated by the desktop file.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -208,6 +215,8 @@ enum SyncAction {
 
 #[derive(Subcommand)]
 enum DesktopAction {
+    /// Install platform context menu integration
+    InstallContextMenu,
     /// Install the .desktop file (xdg MIME registration)
     InstallDesktop,
     /// Remove the .desktop file
@@ -362,6 +371,7 @@ async fn main() {
             }
         },
         Commands::Desktop { action } => match action {
+            DesktopAction::InstallContextMenu => run_desktop_install_context_menu(),
             DesktopAction::InstallDesktop => run_desktop_install_desktop(),
             DesktopAction::RemoveDesktop => run_desktop_remove_desktop(),
             DesktopAction::AutostartEnable => run_desktop_autostart_enable(),
@@ -378,6 +388,7 @@ async fn main() {
             FmAction::ShareLink { path } => run_fm_share_link(&path),
             FmAction::VersionHistory { path } => run_fm_version_history(&path),
         },
+        Commands::External(args) => run_external_command(&args),
     }
 }
 
@@ -915,9 +926,28 @@ fn get_cli_path() -> String {
         .unwrap_or_else(|| "s4drive".to_string())
 }
 
-fn run_desktop_install_desktop() {
+fn get_app_path() -> String {
+    std::env::var("S4DRIVE_APP_BIN")
+        .or_else(|_| std::env::var("S4DRIVE_TAURI_BIN"))
+        .unwrap_or_else(|_| get_cli_path())
+}
+
+fn run_desktop_install_context_menu() {
     let cli = get_cli_path();
-    match s4drive_core::desktop::install_desktop_file(&cli) {
+    match s4drive_core::desktop::install_context_menu(&cli) {
+        Ok(paths) if paths.is_empty() => println!("No desktop context menu files were installed"),
+        Ok(paths) => {
+            for path in paths {
+                println!("✓ Context integration file: {}", path.display());
+            }
+        }
+        Err(e) => eprintln!("✗ Failed to install context menu integration: {}", e),
+    }
+}
+
+fn run_desktop_install_desktop() {
+    let app = get_app_path();
+    match s4drive_core::desktop::install_desktop_file(&app) {
         Ok(path) => println!("✓ Desktop file installed: {}", path.display()),
         Err(e) => eprintln!("✗ Failed to install desktop file: {}", e),
     }
@@ -939,18 +969,8 @@ fn run_desktop_remove_desktop() {
 }
 
 fn run_desktop_autostart_enable() {
-    let cli = get_cli_path();
-    // Auto-detect Tauri binary or CLI
-    let tauri_path = std::env::var("S4DRIVE_TAURI_BIN")
-        .ok()
-        .unwrap_or_else(|| cli.clone());
-    let autostart_exec = if tauri_path.contains("s4drive") && tauri_path != cli {
-        tauri_path
-    } else {
-        // Use CLI with tray flag as fallback
-        format!("{} tray", cli)
-    };
-    match s4drive_core::desktop::enable_autostart(&autostart_exec) {
+    let app = get_app_path();
+    match s4drive_core::desktop::install_platform_autostart(&app) {
         Ok(path) => println!("✓ Autostart enabled: {}", path.display()),
         Err(e) => eprintln!("✗ Failed to enable autostart: {}", e),
     }
@@ -1047,98 +1067,298 @@ fn run_desktop_status() {
 
     println!();
     println!("  CLI path:  {}", get_cli_path());
+    println!("  App path:  {}", get_app_path());
     println!("  Data dir:  {}", desktop::XdgPaths::data_dir().display());
     println!();
 }
 
 // ─── File Manager (Fm) Commands ──────────────────────────────────────
 
+#[derive(Debug, Clone)]
+struct FmFileInfo {
+    file_id: String,
+    state: String,
+}
+
 fn run_fm_status(path: &str) {
-    let path = std::path::Path::new(path);
-    if !path.exists() {
-        eprintln!("error");
-        return;
-    }
-
-    // Try to find an S4Drive config to determine the sync folder
-    let config_path = dirs::config_dir().map(|p| p.join("s4drive/config.toml"));
-
-    match config_path.filter(|p| p.exists()) {
-        Some(cfg_path) => {
-            let config_content = std::fs::read_to_string(&cfg_path).unwrap_or_default();
-            let sync_folder = config_content
-                .lines()
-                .find(|l| l.contains("local_path"))
-                .and_then(|l| l.split('=').nth(1))
-                .map(|s| s.trim().trim_matches('"').to_string());
-
-            match sync_folder {
-                Some(folder) if path.starts_with(&folder) => {
-                    // Path is within sync folder — query DB
-                    let db_path = dirs::data_dir()
-                        .map(|d| d.join("s4drive/s4drive.db"))
-                        .filter(|p| p.exists());
-
-                    match db_path {
-                        Some(db) => match rusqlite::Connection::open(&db) {
-                            Ok(conn) => {
-                                let rel = path
-                                    .strip_prefix(&folder)
-                                    .unwrap_or(path)
-                                    .to_string_lossy()
-                                    .to_string();
-                                let stmt = conn
-                                    .prepare(
-                                        "SELECT state FROM objects WHERE local_path = ?1 LIMIT 1",
-                                    )
-                                    .ok();
-                                match stmt {
-                                    Some(mut s) => {
-                                        let state: Result<String, _> =
-                                            s.query_row([&rel], |row| row.get(0));
-                                        match state {
-                                            Ok(s) => println!("{}", s),
-                                            Err(_) => println!("unknown"),
-                                        }
-                                    }
-                                    None => println!("unknown"),
-                                }
-                            }
-                            Err(_) => println!("unknown"),
-                        },
-                        None => println!("unknown"),
-                    }
-                }
-                _ => println!("none"),
-            }
+    match lookup_fm_file(Path::new(path)) {
+        Ok(Some(info)) => println!("{} {}", normalize_fm_state(&info.state), info.file_id),
+        Ok(None) => println!("none"),
+        Err(error) => {
+            tracing::debug!("file-manager status lookup failed: {}", error);
+            println!("unknown");
         }
-        None => println!("none"),
     }
 }
 
 fn run_fm_sync_now(path: Option<&str>) {
-    println!("ok");
-    if let Some(p) = path {
-        eprintln!("Sync triggered for: {}", p);
+    if let Some(path) = path {
+        let url = format!("s4drive://sync-now?path={}", percent_encode(path));
+        let _ = open_url_best_effort(&url);
     }
+    println!("ok");
 }
 
 fn run_fm_share_link(path: &str) {
-    let abs = std::path::Path::new(path);
-    let name = abs
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_else(|| path.into());
-    println!("s4drive://share/{}", name);
+    let link = match lookup_fm_file(Path::new(path)) {
+        Ok(Some(info)) => format!("s4drive://files/{}", info.file_id),
+        Ok(None) | Err(_) => format!("s4drive://paths/{}", percent_encode(path)),
+    };
+    let _ = copy_to_clipboard(&link);
+    println!("{}", link);
 }
 
 fn run_fm_version_history(path: &str) {
-    let abs = std::path::Path::new(path);
-    let name = abs
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_else(|| path.into());
-    let url = format!("s4drive://versions/{}", name);
-    let _ = std::process::Command::new("xdg-open").arg(&url).output();
+    let url = match lookup_fm_file(Path::new(path)) {
+        Ok(Some(info)) => format!("s4drive://versions/{}", info.file_id),
+        Ok(None) | Err(_) => format!("s4drive://versions?path={}", percent_encode(path)),
+    };
+    let _ = open_url_best_effort(&url);
     println!("{}", url);
+}
+
+fn run_external_command(args: &[String]) {
+    let Some(first) = args.first() else {
+        let _ = Cli::command().print_help();
+        println!();
+        return;
+    };
+
+    if first.starts_with("s4drive://") {
+        run_open_deep_link(first);
+    } else {
+        eprintln!("Unknown command: {}", first);
+        std::process::exit(2);
+    }
+}
+
+fn run_open_deep_link(url: &str) {
+    if let Ok(app_bin) = std::env::var("S4DRIVE_APP_BIN") {
+        if let Err(error) = std::process::Command::new(app_bin).arg(url).spawn() {
+            tracing::debug!("failed to delegate deep link to app: {}", error);
+        }
+    }
+    println!("{}", url);
+}
+
+fn lookup_fm_file(path: &Path) -> Result<Option<FmFileInfo>, String> {
+    let config = load_fm_config();
+    let sync_folder = absolutize_path(&expand_home_path(&config.sync_folder.local_path))
+        .map_err(|e| e.to_string())?;
+    let requested = absolutize_path(path).map_err(|e| e.to_string())?;
+
+    if !requested.starts_with(&sync_folder) {
+        return Ok(None);
+    }
+
+    let db_path = expand_home_path(&config.core.db_path);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open {}: {}", db_path.display(), e))?;
+
+    let requested_text = requested.to_string_lossy().to_string();
+    if let Some(info) = query_fm_file_by_local_path(&conn, &requested_text)? {
+        return Ok(Some(info));
+    }
+
+    let relative_text = requested
+        .strip_prefix(&sync_folder)
+        .ok()
+        .map(|p| p.to_string_lossy().trim_start_matches('/').to_string())
+        .filter(|p| !p.is_empty());
+
+    match relative_text {
+        Some(relative) => query_fm_file_by_local_path(&conn, &relative),
+        None => Ok(None),
+    }
+}
+
+fn query_fm_file_by_local_path(
+    conn: &rusqlite::Connection,
+    local_path: &str,
+) -> Result<Option<FmFileInfo>, String> {
+    let result = conn.query_row(
+        "SELECT file_id, state FROM objects WHERE local_path = ?1 LIMIT 1",
+        [local_path],
+        |row| {
+            Ok(FmFileInfo {
+                file_id: row.get(0)?,
+                state: row.get(1)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(info) => Ok(Some(info)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn load_fm_config() -> Config {
+    for candidate in fm_config_candidates() {
+        if candidate.exists() {
+            if let Ok(config) = Config::load(&candidate.to_string_lossy()) {
+                return config;
+            }
+        }
+    }
+    Config::default()
+}
+
+fn fm_config_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("S4DRIVE_CONFIG") {
+        candidates.push(expand_home_path(&path));
+    }
+    candidates.push(expand_home_path("~/.s4drive/config.toml"));
+    if let Some(config_dir) = dirs::config_dir() {
+        candidates.push(config_dir.join("s4drive/config.toml"));
+    }
+    candidates
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home_dir().join(rest);
+    }
+    PathBuf::from(path)
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+fn absolutize_path(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn normalize_fm_state(state: &str) -> &'static str {
+    match state {
+        "synced" => "synced",
+        "pending_upload" | "pending_download" | "in_progress" | "queued" => "syncing",
+        "conflicted" | "conflict" => "conflict",
+        "failed" | "error" => "error",
+        "paused" => "paused",
+        "deleted" | "deleted_locally" => "deleted",
+        "ignored" => "ignored",
+        _ => "unknown",
+    }
+}
+
+fn percent_encode(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
+fn copy_to_clipboard(text: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return write_to_command("pbcopy", &[], text);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return write_to_command(
+            "powershell",
+            &["-NoProfile", "-Command", "Set-Clipboard"],
+            text,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        write_to_command("wl-copy", &[], text)
+            || write_to_command("xclip", &["-selection", "clipboard"], text)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = text;
+        false
+    }
+}
+
+fn write_to_command(program: &str, args: &[&str], input: &str) -> bool {
+    let mut child = match std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        if stdin.write_all(input.as_bytes()).is_err() {
+            return false;
+        }
+    }
+
+    child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+fn open_url_best_effort(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = url;
+        return false;
+    }
+
+    result.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fm_state_is_normalized_for_file_manager_badges() {
+        assert_eq!(normalize_fm_state("synced"), "synced");
+        assert_eq!(normalize_fm_state("pending_upload"), "syncing");
+        assert_eq!(normalize_fm_state("pending_download"), "syncing");
+        assert_eq!(normalize_fm_state("conflicted"), "conflict");
+        assert_eq!(normalize_fm_state("deleted_locally"), "deleted");
+        assert_eq!(normalize_fm_state("something-new"), "unknown");
+    }
+
+    #[test]
+    fn percent_encode_makes_deep_link_segments_safe() {
+        assert_eq!(percent_encode("docs/report 1.txt"), "docs%2Freport%201.txt");
+        assert_eq!(percent_encode("abc-_.~"), "abc-_.~");
+    }
 }
