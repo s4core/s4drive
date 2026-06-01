@@ -261,6 +261,9 @@ pub fn run() {
                 let _ = set_pending_route(state.inner(), Some("account".to_string()));
             }
             setup_tray(app)?;
+            if needs_setup {
+                show_main_window(app.handle(), Some("account")).map_err(std::io::Error::other)?;
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -543,9 +546,6 @@ fn save_secret_for_settings(
         settings.region.trim(),
         settings.bucket.trim(),
     );
-    if store_result.is_ok() {
-        return Ok(());
-    }
 
     let path = secret_fallback_path(app)?;
     if let Some(parent) = path.parent() {
@@ -567,10 +567,12 @@ fn save_secret_for_settings(
         std::fs::set_permissions(&path, permissions).map_err(|e| e.to_string())?;
     }
 
-    tracing::warn!(
-        "OS keychain unavailable; stored desktop credential fallback at {}",
-        path.display()
-    );
+    if let Err(error) = store_result {
+        tracing::warn!(
+            "OS keychain unavailable; using desktop credential fallback: {}",
+            error
+        );
+    }
     Ok(())
 }
 
@@ -597,19 +599,22 @@ fn resolve_desktop_secret(
         return Ok(secret.to_string());
     }
 
-    let store = CredentialStore::new("desktop");
-    resolve_secret(
-        &store,
-        settings.endpoint.trim(),
-        settings.access_key_id.trim(),
-        None,
-    )
-    .or_else(|_| {
-        load_secret_fallback(app, settings).map_err(|error| {
+    load_secret_fallback(app, settings)
+        .map_err(|error| {
             s4drive_core::CoreError::NotFound(format!("desktop fallback unavailable: {}", error))
         })
-    })
-    .map_err(|_| "Secret key is required or must already exist in saved credentials".to_string())
+        .or_else(|_| {
+            let store = CredentialStore::new("desktop");
+            resolve_secret(
+                &store,
+                settings.endpoint.trim(),
+                settings.access_key_id.trim(),
+                None,
+            )
+        })
+        .map_err(|_| {
+            "Secret key is required or must already exist in saved credentials".to_string()
+        })
 }
 
 fn app_core_config(app: &AppHandle, settings: &DesktopSettings, secret_key: String) -> Config {
