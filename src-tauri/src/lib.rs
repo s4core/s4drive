@@ -696,6 +696,13 @@ async fn count_unmanaged_remote_objects(s3: &S3Adapter) -> Result<usize, String>
 }
 
 fn list_local_files(root: &Path) -> Result<Vec<FileItem>, String> {
+    list_local_files_with_db(root, None)
+}
+
+fn list_local_files_with_db(
+    root: &Path,
+    db: Option<&LocalDatabase>,
+) -> Result<Vec<FileItem>, String> {
     let mut items = Vec::new();
     let files = scan_folder_recursive(root).map_err(|e| e.to_string())?;
     for (relative_path, size_bytes) in files {
@@ -717,14 +724,24 @@ fn list_local_files(root: &Path) -> Result<Vec<FileItem>, String> {
             .and_then(|name| name.to_str())
             .unwrap_or(path.as_str())
             .to_string();
+        let full_path_text = full_path.to_string_lossy().to_string();
+        let (file_id, sync_state) = db
+            .and_then(|db| db.get_file_by_local_path(&full_path_text).ok().flatten())
+            .map(|entry| {
+                let state = db
+                    .and_then(|db| db.get_object_state(&entry.file_id).ok().flatten())
+                    .unwrap_or_else(|| "synced".to_string());
+                (entry.file_id.to_string(), state)
+            })
+            .unwrap_or_else(|| (format!("local:{}", path), "local".to_string()));
         items.push(FileItem {
-            file_id: format!("local:{}", path),
+            file_id,
             name,
             path,
             kind: "file".to_string(),
             size_bytes,
             modified_at,
-            sync_state: "local".to_string(),
+            sync_state,
         });
     }
     items.sort_by_key(|item| item.path.to_lowercase());
@@ -1171,10 +1188,12 @@ fn take_pending_route(state: tauri::State<'_, AppState>) -> Result<Option<String
 }
 
 #[tauri::command]
-fn get_files(state: tauri::State<'_, AppState>) -> Result<Vec<FileItem>, String> {
+fn get_files(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<Vec<FileItem>, String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
     let root = ensure_sync_folder(&settings)?;
-    list_local_files(&root)
+    let config = app_local_config(&app, &settings);
+    let db = LocalDatabase::new(&config).ok();
+    list_local_files_with_db(&root, db.as_ref())
 }
 
 #[tauri::command]
