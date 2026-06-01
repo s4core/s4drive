@@ -304,8 +304,12 @@ jobs:
           retention-days: 14
 
   # ─── Android build ──────────────────────────────────────────
+  # Mobile artifacts are intentionally disabled while desktop releases are
+  # being stabilized. Re-enable by setting the repository variable
+  # ENABLE_MOBILE_CI=true when Android/iOS work resumes.
   build-android:
     name: Android (APK)
+    if: ${{ vars.ENABLE_MOBILE_CI == 'true' }}
     runs-on: ubuntu-latest
     continue-on-error: true
     needs: [lint-test]
@@ -359,8 +363,12 @@ jobs:
           retention-days: 14
 
   # ─── iOS build ──────────────────────────────────────────────
+  # Mobile artifacts are intentionally disabled while desktop releases are
+  # being stabilized. Re-enable by setting the repository variable
+  # ENABLE_MOBILE_CI=true when Android/iOS work resumes.
   build-ios:
     name: iOS (IPA)
+    if: ${{ vars.ENABLE_MOBILE_CI == 'true' }}
     runs-on: macos-latest
     continue-on-error: true
     needs: [lint-test]
