@@ -1,18 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="S4Drive">
   <defs>
-    <linearGradient id="s4-bg" x1="96" y1="72" x2="430" y2="438" gradientUnits="userSpaceOnUse">
+    <linearGradient id="s4-bg" x1="40" y1="24" x2="478" y2="488" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#ef3f32"/>
       <stop offset="0.56" stop-color="#e4362c"/>
       <stop offset="1" stop-color="#f04437"/>
     </linearGradient>
   </defs>
-  <rect x="58" y="58" width="396" height="396" rx="64" fill="url(#s4-bg)"/>
+  <rect x="6" y="6" width="500" height="500" rx="86" fill="url(#s4-bg)"/>
   <text
     x="256"
-    y="303"
+    y="318"
     fill="#ffffff"
     font-family="Arial, Helvetica, Liberation Sans, sans-serif"
-    font-size="156"
+    font-size="184"
     font-weight="800"
     text-anchor="middle">S4</text>
 </svg>
