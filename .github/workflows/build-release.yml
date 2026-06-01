@@ -64,6 +64,7 @@ jobs:
             -o Dpkg::Options::=--force-confdef \
             -o Dpkg::Options::=--force-confold \
             install \
+            wget file libxdo-dev \
             libwebkit2gtk-4.1-dev librsvg2-dev \
             patchelf libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
@@ -85,7 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build in Docker (Ubuntu 20.04 for GLIBC compat)
+      - name: Build in Docker (Ubuntu 22.04 for Tauri v2 GLIBC compat)
         run: |
           docker run --rm --pull=missing \
             -v $PWD:/workspace \
@@ -95,7 +96,7 @@ jobs:
             -e APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND}" \
             -e NEEDRESTART_MODE="${NEEDRESTART_MODE}" \
             -e TAURI_CLI_VERSION="${TAURI_CLI_VERSION}" \
-            ubuntu:20.04 \
+            ubuntu:22.04 \
             bash /workspace/scripts/build-linux-docker.sh
 
       - name: Upload artifacts
@@ -222,18 +223,20 @@ jobs:
 
       - name: Create universal binary with lipo
         run: |
-          X86="src-tauri/target/x86_64-apple-darwin/release/s4drive"
-          ARM="src-tauri/target/aarch64-apple-darwin/release/s4drive"
-          UNIVERSAL="src-tauri/target/release/s4drive-universal"
-          mkdir -p src-tauri/target/release
+          X86="target/x86_64-apple-darwin/release/s4drive"
+          ARM="target/aarch64-apple-darwin/release/s4drive"
+          UNIVERSAL="target/release/s4drive-universal"
+          test -x "$X86"
+          test -x "$ARM"
+          mkdir -p target/release
           lipo -create -output "$UNIVERSAL" "$X86" "$ARM"
           lipo -info "$UNIVERSAL"
 
       - name: Build universal .app bundle
         run: |
-          APP="src-tauri/target/release/S4Drive.app"
+          APP="target/release/S4Drive.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp src-tauri/target/release/s4drive-universal "$APP/Contents/MacOS/s4drive"
+          cp target/release/s4drive-universal "$APP/Contents/MacOS/s4drive"
           cp src-tauri/icons/icon.svg "$APP/Contents/Resources/"
           cp src-tauri/icons/128x128.png "$APP/Contents/Resources/"
           # Write Info.plist without heredoc to avoid YAML parser confusion
@@ -256,8 +259,8 @@ jobs:
 
       - name: Create universal DMG
         run: |
-          DMG="src-tauri/target/release/S4Drive-0.1.0-universal.dmg"
-          APP="src-tauri/target/release/S4Drive.app"
+          DMG="target/release/S4Drive-0.1.0-universal.dmg"
+          APP="target/release/S4Drive.app"
           hdiutil create -volname "S4Drive" -srcfolder "$APP" -ov -format UDZO "$DMG"
           ls -lh "$DMG"
 
@@ -265,7 +268,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: s4drive-macos
-          path: src-tauri/target/release/*.dmg
+          path: target/release/*.dmg
           if-no-files-found: error
 
   # ─── CLI binary ──────────────────────────────────────────────

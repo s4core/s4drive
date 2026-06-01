@@ -1,6 +1,7 @@
 #!/bin/bash
-# Build all Linux bundles (deb + rpm + AppImage) inside Ubuntu 20.04 Docker
-# for maximum GLIBC compatibility. All bundles will run on 20.04+.
+# Build all Linux bundles (deb + rpm + AppImage) inside Ubuntu 22.04 Docker.
+# Tauri v2 requires WebKitGTK 4.1; Ubuntu 22.04 is the oldest supported
+# Ubuntu baseline that provides it from standard repositories.
 set -euxo pipefail
 
 WORKSPACE="${1:-/workspace}"
@@ -26,17 +27,9 @@ apt_install() {
 
 apt_update
 apt_install \
-    curl ca-certificates build-essential pkg-config libssl-dev \
-    software-properties-common gnupg
-
-# PPA for webkit2gtk-4.1 on 20.04
-add-apt-repository -y ppa:savoury1/webkit
-add-apt-repository -y ppa:savoury1/gtk4
-apt_update
-
-apt_install \
+    curl ca-certificates wget file build-essential pkg-config libssl-dev \
     libwebkit2gtk-4.1-dev librsvg2-dev \
-    libgtk-3-dev libayatana-appindicator3-dev \
+    libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
     libsoup-3.0-dev libfuse2 patchelf
 
 # Install Rust
