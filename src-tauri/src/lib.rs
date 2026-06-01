@@ -12,6 +12,7 @@ use s4drive_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    f64::consts::PI,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -20,6 +21,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
@@ -30,6 +32,7 @@ const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "s4drive-main";
 const LOCAL_AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const TRAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(350);
 
 // Application State
 
@@ -110,6 +113,7 @@ pub struct AppState {
     sync_running: AtomicBool,
     sync_paused: AtomicBool,
     auto_sync_started: AtomicBool,
+    tray_animation_started: AtomicBool,
     conflict_count: AtomicU32,
     allow_exit: AtomicBool,
     exit_started: AtomicBool,
@@ -126,6 +130,7 @@ impl Default for AppState {
             sync_running: AtomicBool::new(false),
             sync_paused: AtomicBool::new(false),
             auto_sync_started: AtomicBool::new(false),
+            tray_animation_started: AtomicBool::new(false),
             conflict_count: AtomicU32::new(0),
             allow_exit: AtomicBool::new(false),
             exit_started: AtomicBool::new(false),
@@ -284,6 +289,7 @@ pub fn run() {
                 let _ = set_pending_route(state.inner(), Some("account".to_string()));
             }
             setup_tray(app)?;
+            ensure_tray_sync_animation(app.handle());
             ensure_auto_sync(app.handle());
             if needs_setup {
                 show_main_window(app.handle(), Some("account")).map_err(std::io::Error::other)?;
@@ -519,6 +525,38 @@ fn ensure_auto_sync(app: &AppHandle) {
                     last_local_signature = Some(signature);
                     last_remote_poll = Instant::now();
                 }
+            }
+        }
+    });
+}
+
+fn ensure_tray_sync_animation(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.tray_animation_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut frame = 0usize;
+        let mut showing_sync_icon = false;
+
+        loop {
+            tokio::time::sleep(TRAY_ANIMATION_INTERVAL).await;
+
+            let state = app.state::<AppState>();
+            if state.exit_started.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if state.sync_running.load(Ordering::Relaxed) {
+                set_tray_sync_icon(&app, frame);
+                frame = frame.wrapping_add(1);
+                showing_sync_icon = true;
+            } else if showing_sync_icon {
+                set_tray_idle_icon(&app);
+                frame = 0;
+                showing_sync_icon = false;
             }
         }
     });
@@ -918,6 +956,7 @@ fn mark_sync_requested(app: &AppHandle, state: &AppState, resume_if_paused: bool
         *last_sync = Some(now);
     }
 
+    set_tray_sync_icon(app, 0);
     update_tray_tooltip(app, "syncing", state.conflict_count.load(Ordering::Relaxed));
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = window.emit("sync-triggered", ());
@@ -934,6 +973,7 @@ fn toggle_pause_from_tray(
     state.sync_paused.store(paused, Ordering::Relaxed);
     if paused {
         state.sync_running.store(false, Ordering::Relaxed);
+        set_tray_idle_icon(app);
     }
 
     pause_item
@@ -967,6 +1007,7 @@ fn request_safe_exit(app: &AppHandle) {
 
     state.sync_running.store(false, Ordering::Relaxed);
     state.sync_paused.store(true, Ordering::Relaxed);
+    set_tray_idle_icon(app);
 
     if let Ok(settings) = state.settings.lock() {
         if let Err(error) = save_settings_to_disk(app, &settings) {
@@ -1008,6 +1049,196 @@ pub fn send_sync_notification(app: &AppHandle, kind: &str, body: &str) {
         _ => body.to_string(),
     };
     send_notification(app, title, &full_body);
+}
+
+fn set_tray_idle_icon(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let Some(icon) = app.default_window_icon().cloned() else {
+        return;
+    };
+    if let Err(error) = tray.set_icon(Some(icon)) {
+        tracing::warn!("failed to restore idle tray icon: {}", error);
+    }
+}
+
+fn set_tray_sync_icon(app: &AppHandle, frame: usize) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let Some(base_icon) = app.default_window_icon() else {
+        return;
+    };
+    if let Err(error) = tray.set_icon(Some(sync_tray_icon(base_icon, frame))) {
+        tracing::warn!("failed to update sync tray icon: {}", error);
+    }
+}
+
+fn sync_tray_icon(base_icon: &Image<'_>, frame: usize) -> Image<'static> {
+    let width = base_icon.width();
+    let height = base_icon.height();
+    let mut rgba = base_icon.rgba().to_vec();
+    draw_sync_overlay(&mut rgba, width, height, frame);
+    Image::new_owned(rgba, width, height)
+}
+
+fn draw_sync_overlay(rgba: &mut [u8], width: u32, height: u32, frame: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let size = f64::from(width.min(height));
+    let center_x = f64::from(width) / 2.0;
+    let center_y = f64::from(height) / 2.0;
+    let radius = size * 0.37;
+    let stroke = (size * 0.055).max(2.0);
+    let dot = (size * 0.085).max(3.0);
+    let angle = (frame % 12) as f64 * (PI / 6.0);
+
+    draw_arc(
+        rgba,
+        width,
+        height,
+        center_x,
+        center_y,
+        radius,
+        angle,
+        angle + PI * 0.72,
+        stroke,
+        [58, 213, 195, 235],
+    );
+    draw_arc(
+        rgba,
+        width,
+        height,
+        center_x,
+        center_y,
+        radius,
+        angle + PI,
+        angle + PI * 1.72,
+        stroke,
+        [255, 255, 255, 230],
+    );
+
+    draw_orbit_dot(
+        rgba,
+        width,
+        height,
+        center_x,
+        center_y,
+        radius,
+        angle + PI * 0.72,
+        dot,
+        [58, 213, 195, 255],
+    );
+    draw_orbit_dot(
+        rgba,
+        width,
+        height,
+        center_x,
+        center_y,
+        radius,
+        angle + PI * 1.72,
+        dot,
+        [255, 255, 255, 255],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_arc(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+    start: f64,
+    end: f64,
+    stroke: f64,
+    color: [u8; 4],
+) {
+    let steps = 28;
+    for index in 0..=steps {
+        let t = index as f64 / steps as f64;
+        let angle = start + (end - start) * t;
+        draw_circle(
+            rgba,
+            width,
+            height,
+            center_x + angle.cos() * radius,
+            center_y + angle.sin() * radius,
+            stroke,
+            color,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_orbit_dot(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+    angle: f64,
+    dot: f64,
+    color: [u8; 4],
+) {
+    draw_circle(
+        rgba,
+        width,
+        height,
+        center_x + angle.cos() * radius,
+        center_y + angle.sin() * radius,
+        dot,
+        color,
+    );
+}
+
+fn draw_circle(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+    color: [u8; 4],
+) {
+    let min_x = (center_x - radius).floor().max(0.0) as u32;
+    let max_x = (center_x + radius)
+        .ceil()
+        .min(f64::from(width.saturating_sub(1))) as u32;
+    let min_y = (center_y - radius).floor().max(0.0) as u32;
+    let max_y = (center_y + radius)
+        .ceil()
+        .min(f64::from(height.saturating_sub(1))) as u32;
+    let radius_sq = radius * radius;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = f64::from(x) + 0.5 - center_x;
+            let dy = f64::from(y) + 0.5 - center_y;
+            if dx * dx + dy * dy <= radius_sq {
+                blend_pixel(rgba, width, x, y, color);
+            }
+        }
+    }
+}
+
+fn blend_pixel(rgba: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
+    let index = ((y * width + x) * 4) as usize;
+    if index + 3 >= rgba.len() {
+        return;
+    }
+
+    let alpha = f32::from(color[3]) / 255.0;
+    let inv_alpha = 1.0 - alpha;
+    rgba[index] = (f32::from(color[0]) * alpha + f32::from(rgba[index]) * inv_alpha) as u8;
+    rgba[index + 1] = (f32::from(color[1]) * alpha + f32::from(rgba[index + 1]) * inv_alpha) as u8;
+    rgba[index + 2] = (f32::from(color[2]) * alpha + f32::from(rgba[index + 2]) * inv_alpha) as u8;
+    rgba[index + 3] = 255;
 }
 
 fn update_tray_tooltip(app: &AppHandle, sync_state: &str, conflicts: u32) {
@@ -1162,6 +1393,7 @@ fn toggle_pause(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<boo
     state.sync_paused.store(paused, Ordering::Relaxed);
     if paused {
         state.sync_running.store(false, Ordering::Relaxed);
+        set_tray_idle_icon(&app);
     }
     update_tray_tooltip(
         &app,
@@ -1256,6 +1488,7 @@ async fn run_sync_now_with_options(
         .conflict_count
         .store(result.conflicts_detected, Ordering::Relaxed);
     update_tray_tooltip(&app, "idle", result.conflicts_detected);
+    set_tray_idle_icon(&app);
     if let Ok(mut last_sync) = state.last_sync.lock() {
         *last_sync = Some(chrono::Utc::now().to_rfc3339());
     }
@@ -1320,6 +1553,7 @@ async fn run_sync_now_with_options(
 fn record_sync_failure(app: &AppHandle, state: &AppState, error: &str) {
     state.sync_running.store(false, Ordering::Relaxed);
     update_tray_tooltip(app, "idle", state.conflict_count.load(Ordering::Relaxed));
+    set_tray_idle_icon(app);
     let summary = format!("Sync failed: {}", error);
     eprintln!("S4Drive {}", summary);
     if let Ok(mut last_summary) = state.last_sync_summary.lock() {
@@ -1625,5 +1859,15 @@ mod tests {
         assert_ne!(first, local_folder_signature(&root).unwrap());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_tray_icon_adds_overlay_without_resizing() {
+        let base = Image::new_owned(vec![220, 50, 40, 255].repeat(64 * 64), 64, 64);
+        let frame = sync_tray_icon(&base, 2);
+
+        assert_eq!(frame.width(), 64);
+        assert_eq!(frame.height(), 64);
+        assert_ne!(frame.rgba(), base.rgba());
     }
 }
