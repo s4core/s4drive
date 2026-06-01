@@ -23,7 +23,7 @@
       bandwidth_limit_kbps: null,
       max_concurrent_uploads: 4,
       max_concurrent_downloads: 4,
-      excludes: [],
+      excludes: ['node_modules', '.DS_Store'],
       proxy: null,
       dark_mode: true,
       use_system_theme: true,

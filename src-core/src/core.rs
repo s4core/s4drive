@@ -209,6 +209,7 @@ impl S4DriveCore {
                 max_retries,
                 self.config.sync_folder.max_concurrent_uploads,
                 self.config.sync_folder.max_concurrent_downloads,
+                &self.config.sync_folder.exclude_patterns,
             );
             sync.start().await?;
             self.diagnostics.log("Sync engine started");

@@ -1,12 +1,12 @@
 //! S4Drive Tauri desktop shell: tray-first window lifecycle and IPC bridge.
 
 use s4drive_core::{
-    config::Config,
+    config::{default_exclude_patterns, Config},
     credentials::{resolve_secret, CredentialStore},
     db::LocalDatabase,
     metadata::engine::MetadataEngine,
     s3::S3Adapter,
-    sync::{scan_folder_recursive, ActivityLog, SyncEngine},
+    sync::{scan_folder_recursive_bounded, ActivityLog, SyncEngine},
     transfer::TransferQueue,
     watcher::FileWatcher,
 };
@@ -33,6 +33,8 @@ const TRAY_ID: &str = "s4drive-main";
 const LOCAL_AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TRAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(350);
+const DESKTOP_FILE_LIST_LIMIT: usize = 5_000;
+const DESKTOP_SYNC_SCAN_LIMIT: usize = 100_000;
 
 // Application State
 
@@ -72,7 +74,7 @@ impl Default for DesktopSettings {
             bandwidth_limit_kbps: core_defaults.sync_folder.bandwidth_limit_kbps,
             max_concurrent_uploads: core_defaults.sync_folder.max_concurrent_uploads,
             max_concurrent_downloads: core_defaults.sync_folder.max_concurrent_downloads,
-            excludes: Vec::new(),
+            excludes: core_defaults.sync_folder.exclude_patterns,
             proxy: None,
             autostart: false,
             dark_mode: true,
@@ -97,6 +99,7 @@ impl DesktopSettings {
         config.sync_folder.bandwidth_limit_kbps = self.bandwidth_limit_kbps;
         config.sync_folder.max_concurrent_uploads = self.max_concurrent_uploads;
         config.sync_folder.max_concurrent_downloads = self.max_concurrent_downloads;
+        config.sync_folder.exclude_patterns = self.excludes.clone();
         config
     }
 
@@ -495,10 +498,12 @@ fn ensure_auto_sync(app: &AppHandle) {
 
             let remote_interval =
                 Duration::from_secs(settings.polling_interval_sec).max(MIN_REMOTE_POLL_INTERVAL);
-            let signature = match local_folder_signature(&sync_folder) {
+            let signature = match local_folder_signature(&settings, &sync_folder) {
                 Ok(signature) => signature,
                 Err(error) => {
                     tracing::warn!("auto sync could not scan sync folder: {}", error);
+                    record_sync_failure(&app, state.inner(), &error);
+                    tokio::time::sleep(remote_interval).await;
                     continue;
                 }
             };
@@ -514,7 +519,8 @@ fn ensure_auto_sync(app: &AppHandle) {
 
             match run_sync_now_with_options(app.clone(), state.inner(), false).await {
                 Ok(_) => {
-                    let new_signature = local_folder_signature(&sync_folder).unwrap_or(signature);
+                    let new_signature =
+                        local_folder_signature(&settings, &sync_folder).unwrap_or(signature);
                     last_local_signature = Some(new_signature);
                     last_remote_poll = Instant::now();
                 }
@@ -678,7 +684,15 @@ fn load_settings_from_disk(app: &AppHandle) -> Result<DesktopSettings, String> {
     }
 
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&content).map_err(|e| format!("invalid settings file: {}", e))
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("invalid settings file: {}", e))?;
+    let had_excludes = value.get("excludes").is_some();
+    let mut settings: DesktopSettings =
+        serde_json::from_value(value).map_err(|e| format!("invalid settings file: {}", e))?;
+    if !had_excludes {
+        settings.excludes = default_exclude_patterns();
+    }
+    Ok(settings)
 }
 
 fn save_settings_to_disk(app: &AppHandle, settings: &DesktopSettings) -> Result<(), String> {
@@ -821,13 +835,25 @@ async fn count_unmanaged_remote_objects(s3: &S3Adapter) -> Result<usize, String>
         .map_err(|e| e.to_string())
 }
 
-fn list_local_files(root: &Path) -> Result<Vec<FileItem>, String> {
-    list_local_files_with_db(root, None)
+fn local_scan(
+    settings: &DesktopSettings,
+    root: &Path,
+    limit: usize,
+) -> Result<Vec<(PathBuf, u64)>, String> {
+    let scan = scan_folder_recursive_bounded(root, &settings.excludes, limit)
+        .map_err(|e| e.to_string())?;
+    if scan.truncated {
+        return Err(format!(
+            "Sync folder has more than {} eligible files after excludes. Add patterns such as node_modules, target, dist, or split the folder before syncing.",
+            limit
+        ));
+    }
+    Ok(scan.files)
 }
 
-fn local_folder_signature(root: &Path) -> Result<String, String> {
+fn local_folder_signature(settings: &DesktopSettings, root: &Path) -> Result<String, String> {
     let mut entries = Vec::new();
-    let files = scan_folder_recursive(root).map_err(|e| e.to_string())?;
+    let files = local_scan(settings, root, DESKTOP_SYNC_SCAN_LIMIT)?;
     for (relative_path, size_bytes) in files {
         if relative_path
             .components()
@@ -860,11 +886,14 @@ fn system_time_millis(time: SystemTime) -> Option<u128> {
 }
 
 fn list_local_files_with_db(
+    settings: &DesktopSettings,
     root: &Path,
     db: Option<&LocalDatabase>,
 ) -> Result<Vec<FileItem>, String> {
     let mut items = Vec::new();
-    let files = scan_folder_recursive(root).map_err(|e| e.to_string())?;
+    let scan = scan_folder_recursive_bounded(root, &settings.excludes, DESKTOP_FILE_LIST_LIMIT)
+        .map_err(|e| e.to_string())?;
+    let files = scan.files;
     for (relative_path, size_bytes) in files {
         if relative_path
             .components()
@@ -1426,7 +1455,7 @@ async fn run_sync_now_with_options(
     }
 
     let sync_folder = ensure_sync_folder(&settings)?;
-    let local_files_seen = list_local_files(&sync_folder)?.len();
+    let local_files_seen = local_scan(&settings, &sync_folder, DESKTOP_SYNC_SCAN_LIMIT)?.len();
     let secret = resolve_desktop_secret(&app, &settings, None)?;
     let config = app_core_config(&app, &settings, secret);
 
@@ -1469,6 +1498,7 @@ async fn run_sync_now_with_options(
         config.core.max_retries,
         config.sync_folder.max_concurrent_uploads,
         config.sync_folder.max_concurrent_downloads,
+        &config.sync_folder.exclude_patterns,
     );
 
     if !mark_sync_requested(&app, state, notify_user) {
@@ -1583,7 +1613,7 @@ fn get_files(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<Vec<Fi
     let root = ensure_sync_folder(&settings)?;
     let config = app_local_config(&app, &settings);
     let db = LocalDatabase::new(&config).ok();
-    list_local_files_with_db(&root, db.as_ref())
+    list_local_files_with_db(&settings, &root, db.as_ref())
 }
 
 #[tauri::command]
@@ -1707,7 +1737,7 @@ async fn run_diagnostics(
             detail: format!(
                 "{} ({} local file(s))",
                 path.display(),
-                list_local_files(&path)?.len()
+                local_scan(&settings, &path, DESKTOP_SYNC_SCAN_LIMIT)?.len()
             ),
         }),
         Err(error) => items.push(DiagnosticItem {
@@ -1820,6 +1850,10 @@ mod tests {
             settings.polling_interval_sec
         );
         assert_eq!(config.s3.secret_key_fallback.as_deref(), Some("secret"));
+        assert!(config
+            .sync_folder
+            .exclude_patterns
+            .contains(&"node_modules".to_string()));
     }
 
     #[test]
@@ -1850,13 +1884,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("s4drive-tauri-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(root.join(".s4drive")).unwrap();
         std::fs::write(root.join("doc.txt"), b"one").unwrap();
+        let settings = DesktopSettings::default();
 
-        let first = local_folder_signature(&root).unwrap();
+        let first = local_folder_signature(&settings, &root).unwrap();
         std::fs::write(root.join(".s4drive").join("internal.json"), b"changed").unwrap();
-        assert_eq!(first, local_folder_signature(&root).unwrap());
+        assert_eq!(first, local_folder_signature(&settings, &root).unwrap());
 
         std::fs::write(root.join("doc.txt"), b"changed").unwrap();
-        assert_ne!(first, local_folder_signature(&root).unwrap());
+        assert_ne!(first, local_folder_signature(&settings, &root).unwrap());
 
         std::fs::remove_dir_all(root).unwrap();
     }

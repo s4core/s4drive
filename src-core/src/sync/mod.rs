@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TEXT_AUTO_MERGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SYNC_SCAN_FILES: usize = 100_000;
 
 /// The sync engine orchestrates two-way synchronization.
 #[allow(clippy::too_many_arguments)]
@@ -52,6 +53,7 @@ pub struct SyncEngine {
     max_retries: u32,
     max_concurrent_uploads: u32,
     max_concurrent_downloads: u32,
+    exclude_patterns: Vec<String>,
 
     configured: bool,
     sync_folder: String,
@@ -83,6 +85,7 @@ impl SyncEngine {
             max_retries: 3,
             max_concurrent_uploads: crate::optimization::DEFAULT_MAX_CONCURRENT,
             max_concurrent_downloads: crate::optimization::DEFAULT_MAX_CONCURRENT,
+            exclude_patterns: crate::config::default_exclude_patterns(),
             configured: false,
             sync_folder: String::new(),
             event_stream: None,
@@ -110,6 +113,7 @@ impl SyncEngine {
         max_retries: u32,
         max_concurrent_uploads: u32,
         max_concurrent_downloads: u32,
+        exclude_patterns: &[String],
     ) {
         self.event_stream = Some(Arc::new(Mutex::new(event_stream)));
         self.metadata = Some(metadata);
@@ -132,6 +136,7 @@ impl SyncEngine {
         self.max_retries = max_retries;
         self.max_concurrent_uploads = clamp_concurrency(max_concurrent_uploads);
         self.max_concurrent_downloads = clamp_concurrency(max_concurrent_downloads);
+        self.exclude_patterns = exclude_patterns.to_vec();
         self.conflict = Some(ConflictHandler::new());
         self.conflict_engine = Some(ConflictEngine::new(
             Some(db.clone()),
@@ -225,6 +230,7 @@ impl SyncEngine {
         let max_retries = self.max_retries;
         let max_concurrent_uploads = self.max_concurrent_uploads;
         let max_concurrent_downloads = self.max_concurrent_downloads;
+        let exclude_patterns = self.exclude_patterns.clone();
         let handle = tokio::spawn(async move {
             let mut idle_backoff = IdleBackoff::new();
             tracing::info!("Sync loop started");
@@ -245,6 +251,7 @@ impl SyncEngine {
                 max_retries,
                 max_concurrent_uploads,
                 max_concurrent_downloads,
+                &exclude_patterns,
             )
             .await
             {
@@ -280,6 +287,7 @@ impl SyncEngine {
                     max_retries,
                     max_concurrent_uploads,
                     max_concurrent_downloads,
+                    &exclude_patterns,
                 )
                 .await
                 {
@@ -447,6 +455,7 @@ impl SyncEngine {
             self.max_retries,
             self.max_concurrent_uploads,
             self.max_concurrent_downloads,
+            &self.exclude_patterns,
         )
         .await;
         self.running.store(false, Ordering::Relaxed);
@@ -466,6 +475,7 @@ impl Clone for SyncEngine {
             max_retries: self.max_retries,
             max_concurrent_uploads: self.max_concurrent_uploads,
             max_concurrent_downloads: self.max_concurrent_downloads,
+            exclude_patterns: self.exclude_patterns.clone(),
             configured: self.configured,
             sync_folder: self.sync_folder.clone(),
             event_stream: self.event_stream.clone(),
@@ -560,6 +570,7 @@ async fn run_initial_sync(
     max_retries: u32,
     max_concurrent_uploads: u32,
     max_concurrent_downloads: u32,
+    exclude_patterns: &[String],
 ) -> CoreResult<SyncResult> {
     let mut result = SyncResult::empty();
     let sync_path = Path::new(sync_folder);
@@ -572,7 +583,15 @@ async fn run_initial_sync(
     // ── Phase A: Scan local folder ──
     set_state(state, SyncState::ScanningLocal);
     tracing::info!("Initial sync: scanning local folder: {}", sync_folder);
-    let local_files = scan_folder_recursive(sync_path)?;
+    let local_scan =
+        scan_folder_recursive_bounded(sync_path, exclude_patterns, MAX_SYNC_SCAN_FILES)?;
+    if local_scan.truncated {
+        return Err(CoreError::FileSystem(format!(
+            "sync folder has more than {} eligible files; add excludes or split the folder before syncing",
+            MAX_SYNC_SCAN_FILES
+        )));
+    }
+    let local_files = local_scan.files;
     tracing::info!("Found {} local files", local_files.len());
 
     for (rel_path, _scan_size) in &local_files {
@@ -749,6 +768,7 @@ async fn run_sync_cycle(
     max_retries: u32,
     max_concurrent_uploads: u32,
     max_concurrent_downloads: u32,
+    exclude_patterns: &[String],
 ) -> CoreResult<SyncResult> {
     let mut result = SyncResult::empty();
 
@@ -763,7 +783,7 @@ async fn run_sync_cycle(
 
     for event in &events {
         let path = event.path();
-        if should_ignore_sync(path) {
+        if should_ignore_sync_with_excludes(path, exclude_patterns) {
             continue;
         }
 
@@ -2142,31 +2162,75 @@ fn safe_join_sync_path(sync_folder: &str, remote_path: &str) -> CoreResult<PathB
     Ok(path)
 }
 
+#[derive(Debug, Clone)]
+pub struct FolderScan {
+    pub files: Vec<(PathBuf, u64)>,
+    pub truncated: bool,
+}
+
 pub fn scan_folder_recursive(path: &Path) -> CoreResult<Vec<(PathBuf, u64)>> {
+    Ok(scan_folder_recursive_bounded(path, &[], usize::MAX)?.files)
+}
+
+pub fn scan_folder_recursive_bounded(
+    path: &Path,
+    exclude_patterns: &[String],
+    max_files: usize,
+) -> CoreResult<FolderScan> {
     let mut files = Vec::new();
     if !path.is_dir() {
-        return Ok(files);
+        return Ok(FolderScan {
+            files,
+            truncated: false,
+        });
     }
-    scan_folder_recursive_inner(path, path, &mut files)?;
-    Ok(files)
+    let mut truncated = false;
+    scan_folder_recursive_inner(
+        path,
+        path,
+        exclude_patterns,
+        max_files,
+        &mut files,
+        &mut truncated,
+    )?;
+    Ok(FolderScan { files, truncated })
 }
 
 fn scan_folder_recursive_inner(
     root: &Path,
     path: &Path,
+    exclude_patterns: &[String],
+    max_files: usize,
     files: &mut Vec<(PathBuf, u64)>,
+    truncated: &mut bool,
 ) -> CoreResult<()> {
+    if *truncated {
+        return Ok(());
+    }
+
     let entries = std::fs::read_dir(path)
         .map_err(|e| CoreError::FileSystem(format!("scan {}: {}", path.display(), e)))?;
 
     for entry in entries {
+        if files.len() >= max_files {
+            *truncated = true;
+            break;
+        }
+
         let entry = entry.map_err(|e| CoreError::FileSystem(e.to_string()))?;
         let entry_path = entry.path();
-        if should_ignore_sync(&entry_path.to_string_lossy()) {
+        if should_ignore_sync_path(&entry_path, root, exclude_patterns) {
             continue;
         }
         if entry_path.is_dir() {
-            scan_folder_recursive_inner(root, &entry_path, files)?;
+            scan_folder_recursive_inner(
+                root,
+                &entry_path,
+                exclude_patterns,
+                max_files,
+                files,
+                truncated,
+            )?;
         } else if entry_path.is_file() {
             let rel = entry_path
                 .strip_prefix(root)
@@ -2185,11 +2249,19 @@ fn scan_folder_recursive_inner(
 }
 
 pub fn should_ignore_sync(path: &str) -> bool {
-    let path = Path::new(path);
+    should_ignore_sync_with_excludes(path, &[])
+}
+
+pub fn should_ignore_sync_with_excludes(path: &str, exclude_patterns: &[String]) -> bool {
+    should_ignore_sync_path(Path::new(path), Path::new(""), exclude_patterns)
+}
+
+fn should_ignore_sync_path(path: &Path, root: &Path, exclude_patterns: &[String]) -> bool {
     if path.components().any(|component| {
         matches!(
             component,
             Component::Normal(name) if name.to_string_lossy().starts_with('.')
+                || name == "node_modules"
         )
     }) {
         return true;
@@ -2199,7 +2271,7 @@ pub fn should_ignore_sync(path: &str) -> bool {
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_default();
-    name.starts_with('.')
+    if name.starts_with('.')
         || name.ends_with('~')
         || name.ends_with(".tmp")
         || name.ends_with(".swp")
@@ -2208,6 +2280,50 @@ pub fn should_ignore_sync(path: &str) -> bool {
         || name == "Thumbs.db"
         || name == ".DS_Store"
         || name == "desktop.ini"
+    {
+        return true;
+    }
+
+    matches_exclude_pattern(path, root, exclude_patterns)
+}
+
+fn matches_exclude_pattern(path: &Path, root: &Path, exclude_patterns: &[String]) -> bool {
+    exclude_patterns.iter().any(|pattern| {
+        let pattern = pattern.trim().trim_matches('/');
+        if pattern.is_empty() {
+            return false;
+        }
+
+        let normalized_pattern = pattern.replace('\\', "/");
+        let normalized_path = path.to_string_lossy().replace('\\', "/");
+        let relative_path = path
+            .strip_prefix(root)
+            .ok()
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| normalized_path.clone());
+
+        if let Some(suffix) = normalized_pattern.strip_prefix('*') {
+            return path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(suffix))
+                .unwrap_or(false);
+        }
+
+        if normalized_pattern.contains('/') {
+            return relative_path == normalized_pattern
+                || relative_path.starts_with(&format!("{}/", normalized_pattern))
+                || normalized_path.ends_with(&format!("/{}", normalized_pattern))
+                || normalized_path.contains(&format!("/{}/", normalized_pattern));
+        }
+
+        path.components().any(|component| {
+            matches!(
+                component,
+                Component::Normal(name) if name.to_string_lossy() == normalized_pattern
+            )
+        })
+    })
 }
 
 fn is_conflict_error(err: &CoreError) -> bool {
@@ -2243,9 +2359,47 @@ mod tests {
         assert!(should_ignore_sync("/tmp/.hidden"));
         assert!(should_ignore_sync("/tmp/dir/.hidden/file.txt"));
         assert!(should_ignore_sync("/tmp/.s4drive/descriptor.json"));
+        assert!(should_ignore_sync("/tmp/project/node_modules/pkg/index.js"));
         assert!(should_ignore_sync("/tmp/file.txt~"));
         assert!(should_ignore_sync("/tmp/Thumbs.db"));
         assert!(!should_ignore_sync("/tmp/real-file.txt"));
+    }
+
+    #[test]
+    fn scan_folder_bounded_prunes_excluded_directories() {
+        let dir = std::env::temp_dir().join(format!("s4drive-scan-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("node_modules").join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("node_modules").join("pkg").join("index.js"),
+            b"ignored",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src").join("main.rs"), b"tracked").unwrap();
+
+        let scan = scan_folder_recursive_bounded(&dir, &[], 10).unwrap();
+
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].0, PathBuf::from("src/main.rs"));
+        assert!(!scan.truncated);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_folder_bounded_truncates_large_trees() {
+        let dir = std::env::temp_dir().join(format!("s4drive-scan-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..3 {
+            std::fs::write(dir.join(format!("{}.txt", index)), b"tracked").unwrap();
+        }
+
+        let scan = scan_folder_recursive_bounded(&dir, &[], 2).unwrap();
+
+        assert_eq!(scan.files.len(), 2);
+        assert!(scan.truncated);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -288,6 +288,7 @@ fn should_ignore_path(path: &Path) -> bool {
         matches!(
             component,
             Component::Normal(name) if name.to_string_lossy().starts_with('.')
+                || name == "node_modules"
         )
     }) {
         return true;
@@ -307,7 +308,8 @@ fn should_ignore_path(path: &Path) -> bool {
     {
         return true;
     }
-    if name == "Thumbs.db" || name == ".DS_Store" || name == "desktop.ini" {
+    if name == "Thumbs.db" || name == ".DS_Store" || name == "desktop.ini" || name == "node_modules"
+    {
         return true;
     }
     false
@@ -323,6 +325,7 @@ mod tests {
         assert!(should_ignore("/tmp/.hidden"));
         assert!(should_ignore("/tmp/dir/.hidden/file.txt"));
         assert!(should_ignore("/tmp/.s4drive/descriptor.json"));
+        assert!(should_ignore("/tmp/project/node_modules/pkg/index.js"));
         assert!(should_ignore("/tmp/Thumbs.db"));
         assert!(should_ignore("/tmp/.DS_Store"));
         assert!(!should_ignore("/tmp/real-file.txt"));

@@ -31,6 +31,8 @@ pub struct SyncFolderConfig {
     pub bandwidth_limit_kbps: Option<u64>,
     pub max_concurrent_uploads: u32,
     pub max_concurrent_downloads: u32,
+    #[serde(default = "default_exclude_patterns")]
+    pub exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +60,7 @@ impl Default for Config {
                 bandwidth_limit_kbps: None,
                 max_concurrent_uploads: 4,
                 max_concurrent_downloads: 4,
+                exclude_patterns: default_exclude_patterns(),
             },
             core: CoreConfig {
                 db_path: "~/.s4drive/db.sqlite".into(),
@@ -66,6 +69,10 @@ impl Default for Config {
             },
         }
     }
+}
+
+pub fn default_exclude_patterns() -> Vec<String> {
+    vec!["node_modules".to_string(), ".DS_Store".to_string()]
 }
 
 impl Config {
