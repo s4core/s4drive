@@ -42,8 +42,16 @@ use std::time::{Duration, Instant};
 const TEXT_AUTO_MERGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SYNC_SCAN_FILES: usize = 1_000_000;
 const MAX_LOCAL_UPLOADS_QUEUED_PER_PASS: u32 = 2_000;
+const MAX_REMOTE_DOWNLOADS_QUEUED_PER_PASS: u32 = 2_000;
 const MAX_UPLOAD_JOBS_PER_PASS: u32 = 200;
 const MAX_DOWNLOAD_JOBS_PER_PASS: u32 = 200;
+const MAX_REMOTE_HEAD_WALK_OPS: usize = 10_000;
+const MAX_REMOTE_TREE_PAGES_PER_PASS: usize = 8;
+const REMOTE_TREE_PAGE_SIZE: i32 = 250;
+const REMOTE_HEAD_CHECKPOINT: &str = "remote_head";
+const REMOTE_TREE_CURSOR_CHECKPOINT: &str = "remote_tree_cursor";
+const REMOTE_TREE_TARGET_HEAD_CHECKPOINT: &str = "remote_tree_target_head";
+const REMOTE_TREE_CURSOR_DONE: &str = "__complete__";
 
 /// The sync engine orchestrates two-way synchronization.
 #[allow(clippy::too_many_arguments)]
@@ -583,6 +591,7 @@ async fn run_initial_sync(
         return Ok(result);
     }
 
+    let had_local_index = db.count_objects()? > 0;
     let (pending_uploads, pending_downloads) = transfer.pending_count()?;
     if pending_uploads > 0 {
         set_state(state, SyncState::Uploading);
@@ -627,93 +636,21 @@ async fn run_initial_sync(
     set_state(state, SyncState::ScanningLocal);
     tracing::info!("Initial sync: scanning local folder: {}", sync_folder);
     let local_scan =
-        scan_folder_recursive_bounded(sync_path, exclude_patterns, MAX_SYNC_SCAN_FILES)?;
+        queue_local_uploads_from_scan(sync_path, transfer, db, activity, paused, exclude_patterns)
+            .await?;
+    result.files_uploaded += local_scan.queued;
+    result.bytes_uploaded += local_scan.bytes;
     if local_scan.truncated {
-        return Err(CoreError::FileSystem(format!(
-            "sync folder has more than {} eligible files; add excludes or split the folder before syncing",
-            MAX_SYNC_SCAN_FILES
-        )));
+        result.errors.push(format!(
+            "queued {} local upload(s); remaining local changes will continue in later sync passes",
+            local_scan.queued
+        ));
     }
-    let local_files = local_scan.files;
-    tracing::info!("Found {} local files", local_files.len());
-
-    let mut queued_uploads_this_pass = 0u32;
-    for (rel_path, _scan_size) in &local_files {
-        if paused.load(Ordering::Relaxed) {
-            break;
-        }
-        if queued_uploads_this_pass >= MAX_LOCAL_UPLOADS_QUEUED_PER_PASS {
-            let message = format!(
-                "queued {} local upload(s); remaining local changes will continue in later sync passes",
-                MAX_LOCAL_UPLOADS_QUEUED_PER_PASS
-            );
-            tracing::info!("{}", message);
-            result.errors.push(message);
-            break;
-        }
-
-        let local_full_path = sync_path.join(rel_path);
-        let s3_key = path_to_s3_key(rel_path);
-        let (hash_hex, file_size) = match blake3_file_hash(&local_full_path).await {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::warn!("Initial sync skipped unreadable file: {}", e);
-                result.errors.push(e.to_string());
-                continue;
-            }
-        };
-        let local_hash = blake3_local_hash(&hash_hex);
-
-        let existing = db.get_file_by_local_path(&local_full_path.to_string_lossy())?;
-        let (file_id, entry) = if let Some(mut entry) = existing {
-            if entry.size == file_size
-                && content_hash_matches(entry.content_hash.as_deref(), &hash_hex)
-            {
-                continue;
-            }
-            entry.name = s3_key.clone();
-            entry.normalized_name = Validator::normalize_name(&s3_key).to_lowercase();
-            entry.size = file_size;
-            entry.content_hash = Some(local_hash.clone());
-            entry.updated_at = chrono::Utc::now().to_rfc3339();
-            (entry.file_id, entry)
-        } else {
-            let file_id = uuid::Uuid::now_v7();
-            let now = chrono::Utc::now().to_rfc3339();
-            (
-                file_id,
-                FileEntry {
-                    file_id,
-                    parent_id: None,
-                    name: s3_key.clone(),
-                    normalized_name: Validator::normalize_name(&s3_key).to_lowercase(),
-                    entry_type: EntryType::File,
-                    current_revision_id: None,
-                    content_ref: None,
-                    size: file_size,
-                    content_hash: Some(local_hash),
-                    mime: None,
-                    created_at: now.clone(),
-                    updated_at: now,
-                    deleted_at: None,
-                    version_history: Vec::new(),
-                    attributes: Default::default(),
-                    lock_state: Default::default(),
-                },
-            )
-        };
-        db.register_local_file_at_path(&entry, &local_full_path.to_string_lossy(), &s3_key)?;
-        transfer.enqueue_upload(
-            &file_id.to_string(),
-            &local_full_path.to_string_lossy(),
-            &s3_key,
-        )?;
-
-        queued_uploads_this_pass += 1;
-        result.files_uploaded += 1;
-        result.bytes_uploaded += file_size;
-        activity.log("initial_upload", &file_id.to_string(), &s3_key, "queued")?;
-    }
+    tracing::info!(
+        "Local scan visited {} eligible files and queued {} upload(s)",
+        local_scan.visited,
+        local_scan.queued
+    );
 
     // ── Phase B: Process upload queue ──
     let (pending_uploads, _) = transfer.pending_count()?;
@@ -737,52 +674,44 @@ async fn run_initial_sync(
         result.files_uploaded = up;
         result.bytes_uploaded = bytes;
         result.conflicts_detected += conf;
+        let (remaining_uploads, _) = transfer.pending_count()?;
+        if remaining_uploads > 0 {
+            tracing::info!(
+                "Upload queue still has {} item(s); remote polling deferred to next pass",
+                remaining_uploads
+            );
+            return Ok(result);
+        }
     }
 
-    // ── Phase C: Scan remote tree ──
+    // ── Phase C: Pull remote changes ──
     set_state(state, SyncState::ScanningRemote);
-    tracing::info!("Initial sync: scanning remote tree");
-    use crate::metadata::tree::FileTree;
-    let tree = FileTree::new(download.s3());
-    let remote_ids = tree.list_entries().await?;
-    tracing::info!("Found {} remote entries", remote_ids.len());
-
-    for file_id in &remote_ids {
-        if paused.load(Ordering::Relaxed) {
-            break;
+    if remote_tree_bootstrap_in_progress(db)? || !had_local_index {
+        let remote_scan =
+            queue_missing_remote_tree_entries(download.s3(), db, transfer, versions, sync_folder)
+                .await?;
+        if remote_scan.queued > 0 {
+            tracing::info!(
+                "Remote tree scan queued {} download(s); complete={}",
+                remote_scan.queued,
+                remote_scan.complete
+            );
         }
-        if db.get_file(file_id)?.is_some() {
-            continue;
-        }
-        if let Ok(entry) = tree.get_entry(file_id).await {
-            if entry.entry_type == EntryType::File {
-                if let Some(ref content_ref) = entry.content_ref {
-                    let local_path = safe_join_sync_path(sync_folder, &entry.name)?;
-                    let blob_key = content_ref.storage_key.clone();
-                    transfer.enqueue_download(
-                        &file_id.to_string(),
-                        &local_path.to_string_lossy(),
-                        &blob_key,
-                    )?;
-                    db.register_file_at_path_with_state(
-                        &entry,
-                        &local_path.to_string_lossy(),
-                        &entry.name,
-                        "pending_download",
-                    )?;
-                    record_entry_revision(
-                        versions,
-                        file_id,
-                        entry.current_revision_id,
-                        parent_revision_from_history(&entry),
-                        Some(content_ref),
-                        "remote",
-                        "remote",
-                        "clean",
-                        None,
-                    )?;
-                }
-            }
+    } else {
+        let (download_jobs, remote_conflicts) = poll_remote_changes(
+            download.s3(),
+            db,
+            transfer,
+            activity,
+            conflict,
+            conflict_engine,
+            versions,
+            sync_folder,
+        )
+        .await?;
+        result.conflicts_detected += remote_conflicts;
+        if download_jobs > 0 {
+            tracing::info!("Queued {} remote download(s)", download_jobs);
         }
     }
 
@@ -804,6 +733,297 @@ async fn run_initial_sync(
     }
 
     Ok(result)
+}
+
+#[derive(Debug, Default)]
+struct LocalUploadScan {
+    visited: usize,
+    queued: u32,
+    bytes: u64,
+    truncated: bool,
+}
+
+async fn queue_local_uploads_from_scan(
+    sync_path: &Path,
+    transfer: &TransferQueue,
+    db: &LocalDatabase,
+    activity: &ActivityLog,
+    paused: &AtomicBool,
+    exclude_patterns: &[String],
+) -> CoreResult<LocalUploadScan> {
+    let mut result = LocalUploadScan::default();
+    let mut dirs = vec![sync_path.to_path_buf()];
+
+    while let Some(dir) = dirs.pop() {
+        if paused.load(Ordering::Relaxed) || result.queued >= MAX_LOCAL_UPLOADS_QUEUED_PER_PASS {
+            result.truncated = result.queued >= MAX_LOCAL_UPLOADS_QUEUED_PER_PASS;
+            break;
+        }
+
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| CoreError::FileSystem(format!("scan {}: {}", dir.display(), e)))?;
+        for entry in entries {
+            if paused.load(Ordering::Relaxed) || result.queued >= MAX_LOCAL_UPLOADS_QUEUED_PER_PASS
+            {
+                result.truncated = result.queued >= MAX_LOCAL_UPLOADS_QUEUED_PER_PASS;
+                break;
+            }
+
+            let entry = entry.map_err(|e| CoreError::FileSystem(e.to_string()))?;
+            let entry_path = entry.path();
+            if should_ignore_sync_path(&entry_path, sync_path, exclude_patterns) {
+                continue;
+            }
+
+            let metadata = entry.metadata().map_err(|e| {
+                CoreError::FileSystem(format!("metadata {}: {}", entry_path.display(), e))
+            })?;
+            if metadata.is_dir() {
+                dirs.push(entry_path);
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+
+            result.visited += 1;
+            if result.visited > MAX_SYNC_SCAN_FILES {
+                return Err(CoreError::FileSystem(format!(
+                    "sync folder has more than {} eligible files; confirm a smaller folder or add excludes before syncing",
+                    MAX_SYNC_SCAN_FILES
+                )));
+            }
+
+            let rel_path = entry_path
+                .strip_prefix(sync_path)
+                .unwrap_or(&entry_path)
+                .to_path_buf();
+            let local_path = entry_path.to_string_lossy().to_string();
+            let s3_key = path_to_s3_key(&rel_path);
+            let file_size = metadata.len();
+            let local_mtime = metadata_mtime_millis(&metadata);
+
+            if let Some(snapshot) = db.get_file_snapshot_by_local_path(&local_path)? {
+                let unchanged_mtime = snapshot.size == file_size
+                    && snapshot.local_mtime.as_deref() == local_mtime.as_deref()
+                    && matches!(snapshot.state.as_str(), "synced" | "pending_upload");
+                if unchanged_mtime {
+                    continue;
+                }
+            }
+
+            let (hash_hex, file_size) = match blake3_file_hash(&entry_path).await {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!("Initial sync skipped unreadable file: {}", e);
+                    continue;
+                }
+            };
+            let local_hash = blake3_local_hash(&hash_hex);
+
+            let existing = db.get_file_by_local_path(&local_path)?;
+            let (file_id, entry) = if let Some(mut entry) = existing {
+                if entry.size == file_size
+                    && content_hash_matches(entry.content_hash.as_deref(), &hash_hex)
+                {
+                    db.update_local_mtime_by_path(&local_path)?;
+                    continue;
+                }
+                entry.name = s3_key.clone();
+                entry.normalized_name = Validator::normalize_name(&s3_key).to_lowercase();
+                entry.size = file_size;
+                entry.content_hash = Some(local_hash.clone());
+                entry.updated_at = chrono::Utc::now().to_rfc3339();
+                (entry.file_id, entry)
+            } else {
+                let file_id = uuid::Uuid::now_v7();
+                let now = chrono::Utc::now().to_rfc3339();
+                (
+                    file_id,
+                    FileEntry {
+                        file_id,
+                        parent_id: None,
+                        name: s3_key.clone(),
+                        normalized_name: Validator::normalize_name(&s3_key).to_lowercase(),
+                        entry_type: EntryType::File,
+                        current_revision_id: None,
+                        content_ref: None,
+                        size: file_size,
+                        content_hash: Some(local_hash),
+                        mime: None,
+                        created_at: now.clone(),
+                        updated_at: now,
+                        deleted_at: None,
+                        version_history: Vec::new(),
+                        attributes: Default::default(),
+                        lock_state: Default::default(),
+                    },
+                )
+            };
+
+            db.register_local_file_at_path(&entry, &local_path, &s3_key)?;
+            transfer.enqueue_upload(&file_id.to_string(), &local_path, &s3_key)?;
+
+            result.queued += 1;
+            result.bytes += file_size;
+            activity.log("initial_upload", &file_id.to_string(), &s3_key, "queued")?;
+        }
+    }
+
+    Ok(result)
+}
+
+fn metadata_mtime_millis(metadata: &std::fs::Metadata) -> Option<String> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().to_string())
+}
+
+#[derive(Debug, Default)]
+struct RemoteTreeScan {
+    queued: usize,
+    complete: bool,
+}
+
+fn remote_tree_bootstrap_in_progress(db: &LocalDatabase) -> CoreResult<bool> {
+    match db.get_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT)? {
+        Some(value) => Ok(value != REMOTE_TREE_CURSOR_DONE),
+        None => Ok(false),
+    }
+}
+
+async fn remote_head_for_checkpoint(s3: &S3Adapter) -> CoreResult<String> {
+    let mut clock: u64 = 0;
+    let device_id = uuid::Uuid::now_v7();
+    let mut ops_log = OperationLog::new(s3, device_id, &mut clock);
+    Ok(ops_log.load_head().await?.unwrap_or_default())
+}
+
+async fn queue_missing_remote_tree_entries(
+    s3: &S3Adapter,
+    db: &LocalDatabase,
+    transfer: &TransferQueue,
+    versions: &VersionApi,
+    sync_folder: &str,
+) -> CoreResult<RemoteTreeScan> {
+    queue_missing_remote_tree_entries_from(s3, db, transfer, versions, sync_folder, false).await
+}
+
+async fn queue_missing_remote_tree_entries_from(
+    s3: &S3Adapter,
+    db: &LocalDatabase,
+    transfer: &TransferQueue,
+    versions: &VersionApi,
+    sync_folder: &str,
+    restart: bool,
+) -> CoreResult<RemoteTreeScan> {
+    use crate::metadata::tree::FileTree;
+
+    if !restart
+        && db.get_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT)?.as_deref()
+            == Some(REMOTE_TREE_CURSOR_DONE)
+    {
+        return Ok(RemoteTreeScan {
+            queued: 0,
+            complete: true,
+        });
+    }
+
+    let mut continuation_token = if restart {
+        None
+    } else {
+        db.get_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT)?
+            .filter(|value| !value.is_empty())
+    };
+    let target_head = if restart || continuation_token.is_none() {
+        let target_head = remote_head_for_checkpoint(s3).await?;
+        db.set_checkpoint(REMOTE_TREE_TARGET_HEAD_CHECKPOINT, &target_head)?;
+        target_head
+    } else {
+        db.get_checkpoint(REMOTE_TREE_TARGET_HEAD_CHECKPOINT)?
+            .unwrap_or_default()
+    };
+
+    tracing::info!(
+        "Initial sync: scanning remote tree page; continuation={}",
+        continuation_token.as_deref().unwrap_or("<start>")
+    );
+    let tree = FileTree::new(s3);
+
+    let mut queued = 0usize;
+    let mut complete = false;
+    for _ in 0..MAX_REMOTE_TREE_PAGES_PER_PASS {
+        let page = tree
+            .list_entries_page(continuation_token.as_deref(), REMOTE_TREE_PAGE_SIZE)
+            .await?;
+
+        for file_id in &page.ids {
+            if db.get_file(file_id)?.is_some() {
+                continue;
+            }
+            if let Ok(entry) = tree.get_entry(file_id).await {
+                if entry.entry_type == EntryType::File {
+                    if let Some(ref content_ref) = entry.content_ref {
+                        let local_path = safe_join_sync_path(sync_folder, &entry.name)?;
+                        let blob_key = content_ref.storage_key.clone();
+                        transfer.enqueue_download(
+                            &file_id.to_string(),
+                            &local_path.to_string_lossy(),
+                            &blob_key,
+                        )?;
+                        db.register_file_at_path_with_state(
+                            &entry,
+                            &local_path.to_string_lossy(),
+                            &entry.name,
+                            "pending_download",
+                        )?;
+                        record_entry_revision(
+                            versions,
+                            file_id,
+                            entry.current_revision_id,
+                            parent_revision_from_history(&entry),
+                            Some(content_ref),
+                            "remote",
+                            "remote",
+                            "clean",
+                            None,
+                        )?;
+                        queued += 1;
+                    }
+                }
+            }
+        }
+
+        if page.is_truncated {
+            let next = page.next_continuation_token.ok_or_else(|| {
+                CoreError::S3(
+                    "remote tree LIST was truncated without ContinuationToken".to_string(),
+                )
+            })?;
+            db.set_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT, &next)?;
+            continuation_token = Some(next);
+        } else {
+            db.set_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT, REMOTE_TREE_CURSOR_DONE)?;
+            db.set_checkpoint(REMOTE_HEAD_CHECKPOINT, &target_head)?;
+            complete = true;
+            break;
+        }
+
+        if queued >= MAX_REMOTE_DOWNLOADS_QUEUED_PER_PASS as usize {
+            break;
+        }
+    }
+
+    if !complete {
+        tracing::info!(
+            "Remote tree bootstrap queued {} download(s); cursor saved for next pass",
+            queued
+        );
+    }
+
+    Ok(RemoteTreeScan { queued, complete })
 }
 
 // ─── Incremental Sync Cycle ─────────────────────────────────────
@@ -1269,6 +1489,7 @@ async fn process_download_queue(
                         } else {
                             db.mark_file_synced(&file_id)?;
                         }
+                        db.update_local_mtime_by_path(&job.local_path)?;
                     }
                     transfer.mark_completed(job.id)?;
                     downloaded += 1;
@@ -1308,137 +1529,117 @@ async fn poll_remote_changes(
 ) -> CoreResult<(usize, u32)> {
     let mut clock: u64 = 0;
     let device_id = uuid::Uuid::now_v7(); // temporary device ID for scanning
-    let ops_log = OperationLog::new(s3, device_id, &mut clock);
-
-    let ops = match ops_log.list_operations().await {
-        Ok(ops) => ops,
-        Err(e) => {
-            tracing::debug!("No remote ops: {}", e);
+    let mut ops_log = OperationLog::new(s3, device_id, &mut clock);
+    let current_head = match ops_log.load_head().await? {
+        Some(head) => head,
+        None => {
+            db.set_checkpoint(REMOTE_HEAD_CHECKPOINT, "")?;
             return Ok((0, 0));
         }
     };
 
-    if ops.is_empty() {
+    let checkpoint = db.get_checkpoint(REMOTE_HEAD_CHECKPOINT)?;
+    if checkpoint.as_deref() == Some(current_head.as_str()) {
         return Ok((0, 0));
     }
 
+    let mut ops = Vec::new();
+    let mut cursor = current_head.clone();
+    let mut reached_checkpoint = false;
+    for _ in 0..MAX_REMOTE_HEAD_WALK_OPS {
+        if checkpoint.as_deref() == Some(cursor.as_str()) {
+            reached_checkpoint = true;
+            break;
+        }
+        let op = ops_log.read_operation(&cursor).await?;
+        let previous = op.base_head.clone();
+        ops.push(op);
+        if previous.is_empty() {
+            reached_checkpoint = checkpoint.as_deref().is_none_or(str::is_empty);
+            break;
+        }
+        cursor = previous;
+    }
+
+    if !reached_checkpoint {
+        tracing::warn!("Remote op checkpoint is too far behind; falling back to remote tree scan");
+        let remote_scan =
+            queue_missing_remote_tree_entries_from(s3, db, transfer, versions, _sync_folder, true)
+                .await?;
+        return Ok((remote_scan.queued, 0));
+    }
+
+    ops.reverse();
     let mut new_downloads = 0usize;
     let mut conflicts = 0u32;
+    let mut processed_all = true;
     let tree = FileTree::new(s3);
 
-    for op_key in &ops {
-        if let Ok(op) = ops_log.read_operation(op_key).await {
-            let file_id = match op.target_file_id {
-                Some(id) => id,
-                None => continue,
-            };
+    for op in &ops {
+        let file_id = match op.target_file_id {
+            Some(id) => id,
+            None => continue,
+        };
 
-            match op.op_type {
-                OpType::UploadNewRevision | OpType::CreateFile => {
-                    let (entry, content_ref, remote_path) =
-                        match remote_file_state(&tree, &op, &file_id).await {
-                            Ok(Some(value)) => value,
-                            Ok(None) => continue,
-                            Err(e) => {
-                                tracing::warn!("Remote op {} is not usable yet: {}", op_key, e);
-                                continue;
-                            }
-                        };
+        match op.op_type {
+            OpType::UploadNewRevision | OpType::CreateFile => {
+                let (entry, content_ref, remote_path) =
+                    match remote_file_state(&tree, op, &file_id).await {
+                        Ok(Some(value)) => value,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            tracing::warn!("Remote op {} is not usable yet: {}", op.op_id, e);
+                            processed_all = false;
+                            break;
+                        }
+                    };
 
-                    let local_path = safe_join_sync_path(_sync_folder, &remote_path)?;
-                    let local_path_text = local_path.to_string_lossy().to_string();
+                let local_path = safe_join_sync_path(_sync_folder, &remote_path)?;
+                let local_path_text = local_path.to_string_lossy().to_string();
 
-                    if let Some(local_entry) = db.get_file(&file_id)? {
-                        if content_hash_matches(
-                            local_entry.content_hash.as_deref(),
-                            &content_ref.hash,
-                        ) {
+                if let Some(local_entry) = db.get_file(&file_id)? {
+                    if content_hash_matches(local_entry.content_hash.as_deref(), &content_ref.hash)
+                    {
+                        continue;
+                    }
+
+                    if local_file_changed_since_sync(
+                        &local_path,
+                        local_entry.content_hash.as_deref(),
+                    )
+                    .await?
+                    {
+                        if has_open_conflict(db, &file_id, ConflictType::EditEdit.as_str())? {
                             continue;
                         }
-
-                        if local_file_changed_since_sync(
+                        if let Some(merged) = try_text_auto_merge(
+                            s3,
+                            versions,
+                            &local_entry,
                             &local_path,
-                            local_entry.content_hash.as_deref(),
+                            &remote_path,
+                            &content_ref,
                         )
                         .await?
                         {
-                            if has_open_conflict(db, &file_id, ConflictType::EditEdit.as_str())? {
-                                continue;
-                            }
-                            if let Some(merged) = try_text_auto_merge(
-                                s3,
-                                versions,
-                                &local_entry,
-                                &local_path,
-                                &remote_path,
-                                &content_ref,
-                            )
-                            .await?
-                            {
-                                let (hash_hex, size) =
-                                    write_merged_content(&local_path, &merged).await?;
-                                let mut merged_entry = entry.clone();
-                                merged_entry.content_hash = Some(blake3_local_hash(&hash_hex));
-                                merged_entry.size = size;
-                                merged_entry.current_revision_id = local_entry.current_revision_id;
-                                db.register_file_at_path_with_state(
-                                    &merged_entry,
-                                    &local_path_text,
-                                    &remote_path,
-                                    "pending_upload",
-                                )?;
-                                transfer.enqueue_upload(
-                                    &file_id.to_string(),
-                                    &local_path_text,
-                                    &remote_path,
-                                )?;
-                                let now = chrono::Utc::now().to_rfc3339();
-                                let remote_rev =
-                                    op.effects.new_revision_id.map(|id| id.to_string());
-                                let local_rev =
-                                    local_entry.current_revision_id.map(|id| id.to_string());
-                                let reason = ConflictEngine::explain_conflict(
-                                    &ConflictType::EditEdit,
-                                    &local_path_text,
-                                    &remote_path,
-                                    versions.device_name(),
-                                    "remote",
-                                    &now,
-                                    &op.timestamp,
-                                );
-                                let conflict_id = conflict_engine.record_conflict(
-                                    &file_id.to_string(),
-                                    &ConflictType::EditEdit,
-                                    &local_path_text,
-                                    &remote_path,
-                                    "",
-                                    local_rev.as_deref(),
-                                    remote_rev.as_deref(),
-                                    &reason,
-                                )?;
-                                conflict_engine.resolve(
-                                    &conflict_id,
-                                    ConflictResolution::Merged(String::new()),
-                                    "automatic text 3-way merge",
-                                )?;
-                                activity.log(
-                                    "auto_merge",
-                                    &file_id.to_string(),
-                                    &remote_path,
-                                    "queued merged upload",
-                                )?;
-                                conflicts += 1;
-                                continue;
-                            }
-
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let conflict_path = ConflictEngine::create_conflict_copy(
+                            let (hash_hex, size) =
+                                write_merged_content(&local_path, &merged).await?;
+                            let mut merged_entry = entry.clone();
+                            merged_entry.content_hash = Some(blake3_local_hash(&hash_hex));
+                            merged_entry.size = size;
+                            merged_entry.current_revision_id = local_entry.current_revision_id;
+                            db.register_file_at_path_with_state(
+                                &merged_entry,
                                 &local_path_text,
-                                _sync_folder,
                                 &remote_path,
-                                versions.device_name(),
-                                &now,
+                                "pending_upload",
                             )?;
+                            transfer.enqueue_upload(
+                                &file_id.to_string(),
+                                &local_path_text,
+                                &remote_path,
+                            )?;
+                            let now = chrono::Utc::now().to_rfc3339();
                             let remote_rev = op.effects.new_revision_id.map(|id| id.to_string());
                             let local_rev =
                                 local_entry.current_revision_id.map(|id| id.to_string());
@@ -1451,23 +1652,31 @@ async fn poll_remote_changes(
                                 &now,
                                 &op.timestamp,
                             );
-                            conflict.register(&file_id.to_string(), &local_path_text, &reason);
-                            conflict_engine.record_conflict(
+                            let conflict_id = conflict_engine.record_conflict(
                                 &file_id.to_string(),
                                 &ConflictType::EditEdit,
                                 &local_path_text,
                                 &remote_path,
-                                &conflict_path,
+                                "",
                                 local_rev.as_deref(),
                                 remote_rev.as_deref(),
                                 &reason,
                             )?;
+                            conflict_engine.resolve(
+                                &conflict_id,
+                                ConflictResolution::Merged(String::new()),
+                                "automatic text 3-way merge",
+                            )?;
+                            activity.log(
+                                "auto_merge",
+                                &file_id.to_string(),
+                                &remote_path,
+                                "queued merged upload",
+                            )?;
                             conflicts += 1;
-                        }
-                    } else if local_path.exists() {
-                        if has_open_conflict(db, &file_id, ConflictType::CreateCreate.as_str())? {
                             continue;
                         }
+
                         let now = chrono::Utc::now().to_rfc3339();
                         let conflict_path = ConflictEngine::create_conflict_copy(
                             &local_path_text,
@@ -1477,8 +1686,9 @@ async fn poll_remote_changes(
                             &now,
                         )?;
                         let remote_rev = op.effects.new_revision_id.map(|id| id.to_string());
+                        let local_rev = local_entry.current_revision_id.map(|id| id.to_string());
                         let reason = ConflictEngine::explain_conflict(
-                            &ConflictType::CreateCreate,
+                            &ConflictType::EditEdit,
                             &local_path_text,
                             &remote_path,
                             versions.device_name(),
@@ -1489,189 +1699,223 @@ async fn poll_remote_changes(
                         conflict.register(&file_id.to_string(), &local_path_text, &reason);
                         conflict_engine.record_conflict(
                             &file_id.to_string(),
-                            &ConflictType::CreateCreate,
+                            &ConflictType::EditEdit,
                             &local_path_text,
                             &remote_path,
                             &conflict_path,
-                            None,
+                            local_rev.as_deref(),
                             remote_rev.as_deref(),
                             &reason,
                         )?;
                         conflicts += 1;
+                        continue;
                     }
-
-                    let remote_revision_uuid =
-                        op.effects.new_revision_id.or(entry.current_revision_id);
-                    let parent_revision_uuid = db
-                        .get_file(&file_id)?
-                        .and_then(|entry| entry.current_revision_id)
-                        .filter(|revision| Some(*revision) != remote_revision_uuid)
-                        .or_else(|| parent_revision_from_history(&entry));
-                    let parent_revision = parent_revision_uuid.map(|id| id.to_string());
-                    let remote_revision = remote_revision_uuid.map(|id| id.to_string());
-                    if let Some(revision_id) = remote_revision.as_deref() {
-                        versions.record_revision(
-                            revision_id,
-                            &file_id,
-                            parent_revision.as_deref(),
-                            Some(&blake3_local_hash(&content_ref.hash)),
-                            content_ref.size,
-                            Some(&content_ref.mime),
-                            &op.device_id.to_string(),
-                            &op.actor_id,
-                            "clean",
-                            None,
-                        )?;
+                } else if local_path.exists() {
+                    if has_open_conflict(db, &file_id, ConflictType::CreateCreate.as_str())? {
+                        continue;
                     }
-                    transfer.enqueue_download(
-                        &file_id.to_string(),
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let conflict_path = ConflictEngine::create_conflict_copy(
                         &local_path_text,
-                        &content_ref.storage_key,
+                        _sync_folder,
+                        &remote_path,
+                        versions.device_name(),
+                        &now,
                     )?;
-                    db.register_file_at_path_with_state(
-                        &entry,
+                    let remote_rev = op.effects.new_revision_id.map(|id| id.to_string());
+                    let reason = ConflictEngine::explain_conflict(
+                        &ConflictType::CreateCreate,
                         &local_path_text,
                         &remote_path,
-                        "pending_download",
+                        versions.device_name(),
+                        "remote",
+                        &now,
+                        &op.timestamp,
+                    );
+                    conflict.register(&file_id.to_string(), &local_path_text, &reason);
+                    conflict_engine.record_conflict(
+                        &file_id.to_string(),
+                        &ConflictType::CreateCreate,
+                        &local_path_text,
+                        &remote_path,
+                        &conflict_path,
+                        None,
+                        remote_rev.as_deref(),
+                        &reason,
                     )?;
-                    new_downloads += 1;
-                    activity.log("remote_change", &file_id.to_string(), op_key, "queued")?;
+                    conflicts += 1;
+                    continue;
                 }
-                OpType::Rename | OpType::Move => {
-                    if let Some(new_name) = op.effects.new_name.as_deref() {
-                        if let Some(old_path) = db.get_local_path(&file_id)? {
-                            let new_path = safe_join_sync_path(_sync_folder, new_name)?;
-                            let old_path_obj = Path::new(&old_path);
-                            if new_path.exists() && !same_path(old_path_obj, &new_path) {
-                                if has_open_conflict(
-                                    db,
-                                    &file_id,
-                                    ConflictType::RenameRename.as_str(),
-                                )? {
-                                    continue;
-                                }
-                                let now = chrono::Utc::now().to_rfc3339();
-                                let conflict_path = ConflictEngine::create_conflict_copy(
-                                    &new_path.to_string_lossy(),
-                                    _sync_folder,
-                                    new_name,
-                                    versions.device_name(),
-                                    &now,
-                                )?;
-                                let reason = ConflictEngine::explain_conflict(
-                                    &ConflictType::RenameRename,
-                                    &old_path,
-                                    new_name,
-                                    versions.device_name(),
-                                    "remote",
-                                    &now,
-                                    &op.timestamp,
-                                );
-                                conflict.register(&file_id.to_string(), &old_path, &reason);
-                                conflict_engine.record_conflict(
-                                    &file_id.to_string(),
-                                    &ConflictType::RenameRename,
-                                    &old_path,
-                                    new_name,
-                                    &conflict_path,
-                                    None,
-                                    None,
-                                    &reason,
-                                )?;
-                                conflicts += 1;
+
+                if new_downloads >= MAX_REMOTE_DOWNLOADS_QUEUED_PER_PASS as usize {
+                    processed_all = false;
+                    break;
+                }
+
+                let remote_revision_uuid = op.effects.new_revision_id.or(entry.current_revision_id);
+                let parent_revision_uuid = db
+                    .get_file(&file_id)?
+                    .and_then(|entry| entry.current_revision_id)
+                    .filter(|revision| Some(*revision) != remote_revision_uuid)
+                    .or_else(|| parent_revision_from_history(&entry));
+                let parent_revision = parent_revision_uuid.map(|id| id.to_string());
+                let remote_revision = remote_revision_uuid.map(|id| id.to_string());
+                if let Some(revision_id) = remote_revision.as_deref() {
+                    versions.record_revision(
+                        revision_id,
+                        &file_id,
+                        parent_revision.as_deref(),
+                        Some(&blake3_local_hash(&content_ref.hash)),
+                        content_ref.size,
+                        Some(&content_ref.mime),
+                        &op.device_id.to_string(),
+                        &op.actor_id,
+                        "clean",
+                        None,
+                    )?;
+                }
+                transfer.enqueue_download(
+                    &file_id.to_string(),
+                    &local_path_text,
+                    &content_ref.storage_key,
+                )?;
+                db.register_file_at_path_with_state(
+                    &entry,
+                    &local_path_text,
+                    &remote_path,
+                    "pending_download",
+                )?;
+                new_downloads += 1;
+                activity.log("remote_change", &file_id.to_string(), &op.op_id, "queued")?;
+            }
+            OpType::Rename | OpType::Move => {
+                if let Some(new_name) = op.effects.new_name.as_deref() {
+                    if let Some(old_path) = db.get_local_path(&file_id)? {
+                        let new_path = safe_join_sync_path(_sync_folder, new_name)?;
+                        let old_path_obj = Path::new(&old_path);
+                        if new_path.exists() && !same_path(old_path_obj, &new_path) {
+                            if has_open_conflict(db, &file_id, ConflictType::RenameRename.as_str())?
+                            {
                                 continue;
                             }
-                            if old_path_obj.exists() {
-                                if let Some(parent) = new_path.parent() {
-                                    std::fs::create_dir_all(parent).map_err(|e| {
-                                        CoreError::FileSystem(format!(
-                                            "create rename parent: {}",
-                                            e
-                                        ))
-                                    })?;
-                                }
-                                std::fs::rename(&old_path, &new_path).map_err(|e| {
-                                    CoreError::FileSystem(format!("remote rename apply: {}", e))
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let conflict_path = ConflictEngine::create_conflict_copy(
+                                &new_path.to_string_lossy(),
+                                _sync_folder,
+                                new_name,
+                                versions.device_name(),
+                                &now,
+                            )?;
+                            let reason = ConflictEngine::explain_conflict(
+                                &ConflictType::RenameRename,
+                                &old_path,
+                                new_name,
+                                versions.device_name(),
+                                "remote",
+                                &now,
+                                &op.timestamp,
+                            );
+                            conflict.register(&file_id.to_string(), &old_path, &reason);
+                            conflict_engine.record_conflict(
+                                &file_id.to_string(),
+                                &ConflictType::RenameRename,
+                                &old_path,
+                                new_name,
+                                &conflict_path,
+                                None,
+                                None,
+                                &reason,
+                            )?;
+                            conflicts += 1;
+                            continue;
+                        }
+                        if old_path_obj.exists() {
+                            if let Some(parent) = new_path.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| {
+                                    CoreError::FileSystem(format!("create rename parent: {}", e))
                                 })?;
                             }
-                            db.update_local_path(&file_id, &new_path.to_string_lossy(), new_name)?;
-                            activity.log(
-                                "remote_rename",
-                                &file_id.to_string(),
-                                op_key,
-                                "applied",
-                            )?;
+                            std::fs::rename(&old_path, &new_path).map_err(|e| {
+                                CoreError::FileSystem(format!("remote rename apply: {}", e))
+                            })?;
                         }
+                        db.update_local_path(&file_id, &new_path.to_string_lossy(), new_name)?;
+                        activity.log(
+                            "remote_rename",
+                            &file_id.to_string(),
+                            &op.op_id,
+                            "applied",
+                        )?;
                     }
                 }
-                OpType::Delete => {
-                    if let Ok(Some(_entry)) = db.get_file(&file_id) {
-                        if let Some(local_path) = db.get_local_path(&file_id)? {
-                            let local_path_obj = PathBuf::from(&local_path);
-                            let local_hash =
-                                db.get_file(&file_id)?.and_then(|entry| entry.content_hash);
-                            if local_file_changed_since_sync(&local_path_obj, local_hash.as_deref())
-                                .await?
-                            {
-                                if has_open_conflict(
-                                    db,
-                                    &file_id,
-                                    ConflictType::DeleteEdit.as_str(),
-                                )? {
-                                    continue;
-                                }
-                                let now = chrono::Utc::now().to_rfc3339();
-                                let conflict_name =
-                                    relative_s3_key(_sync_folder, Path::new(&local_path))
-                                        .unwrap_or_else(|_| {
-                                            Path::new(&local_path)
-                                                .file_name()
-                                                .map(|name| name.to_string_lossy().to_string())
-                                                .unwrap_or_else(|| "deleted".to_string())
-                                        });
-                                let conflict_path = ConflictEngine::create_conflict_copy(
-                                    &local_path,
-                                    _sync_folder,
-                                    &conflict_name,
-                                    versions.device_name(),
-                                    &now,
-                                )?;
-                                let local_rev = db
-                                    .get_file(&file_id)?
-                                    .and_then(|entry| entry.current_revision_id)
-                                    .map(|id| id.to_string());
-                                let reason = ConflictEngine::explain_conflict(
-                                    &ConflictType::DeleteEdit,
-                                    &local_path,
-                                    &local_path,
-                                    versions.device_name(),
-                                    "remote",
-                                    &now,
-                                    &op.timestamp,
-                                );
-                                conflict.register(&file_id.to_string(), &local_path, &reason);
-                                conflict_engine.record_conflict(
-                                    &file_id.to_string(),
-                                    &ConflictType::DeleteEdit,
-                                    &local_path,
-                                    &local_path,
-                                    &conflict_path,
-                                    local_rev.as_deref(),
-                                    None,
-                                    &reason,
-                                )?;
-                                conflicts += 1;
+            }
+            OpType::Delete => {
+                if let Ok(Some(_entry)) = db.get_file(&file_id) {
+                    if let Some(local_path) = db.get_local_path(&file_id)? {
+                        let local_path_obj = PathBuf::from(&local_path);
+                        let local_hash =
+                            db.get_file(&file_id)?.and_then(|entry| entry.content_hash);
+                        if local_file_changed_since_sync(&local_path_obj, local_hash.as_deref())
+                            .await?
+                        {
+                            if has_open_conflict(db, &file_id, ConflictType::DeleteEdit.as_str())? {
                                 continue;
                             }
-                            move_local_file_to_trash(_sync_folder, &local_path, &file_id)?;
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let conflict_name =
+                                relative_s3_key(_sync_folder, Path::new(&local_path))
+                                    .unwrap_or_else(|_| {
+                                        Path::new(&local_path)
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "deleted".to_string())
+                                    });
+                            let conflict_path = ConflictEngine::create_conflict_copy(
+                                &local_path,
+                                _sync_folder,
+                                &conflict_name,
+                                versions.device_name(),
+                                &now,
+                            )?;
+                            let local_rev = db
+                                .get_file(&file_id)?
+                                .and_then(|entry| entry.current_revision_id)
+                                .map(|id| id.to_string());
+                            let reason = ConflictEngine::explain_conflict(
+                                &ConflictType::DeleteEdit,
+                                &local_path,
+                                &local_path,
+                                versions.device_name(),
+                                "remote",
+                                &now,
+                                &op.timestamp,
+                            );
+                            conflict.register(&file_id.to_string(), &local_path, &reason);
+                            conflict_engine.record_conflict(
+                                &file_id.to_string(),
+                                &ConflictType::DeleteEdit,
+                                &local_path,
+                                &local_path,
+                                &conflict_path,
+                                local_rev.as_deref(),
+                                None,
+                                &reason,
+                            )?;
+                            conflicts += 1;
+                            continue;
                         }
-                        db.mark_file_deleted(&file_id)?;
-                        activity.log("remote_delete", &file_id.to_string(), op_key, "applied")?;
+                        move_local_file_to_trash(_sync_folder, &local_path, &file_id)?;
                     }
+                    db.mark_file_deleted(&file_id)?;
+                    activity.log("remote_delete", &file_id.to_string(), &op.op_id, "applied")?;
                 }
-                _ => {}
             }
+            _ => {}
         }
+    }
+
+    if processed_all {
+        db.set_checkpoint(REMOTE_HEAD_CHECKPOINT, &current_head)?;
     }
 
     Ok((new_downloads, conflicts))

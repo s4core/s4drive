@@ -5,12 +5,22 @@ use rusqlite::types::Type;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
 /// Local SQLite database for metadata index and transfer queue.
 #[derive(Clone)]
 pub struct LocalDatabase {
     conn: Arc<Mutex<Connection>>,
     healthy: Arc<Mutex<bool>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalFileSnapshot {
+    pub file_id: uuid::Uuid,
+    pub size: u64,
+    pub local_hash: Option<String>,
+    pub local_mtime: Option<String>,
+    pub state: String,
 }
 
 impl LocalDatabase {
@@ -116,6 +126,16 @@ impl LocalDatabase {
             .map_err(|e| CoreError::Database(e.to_string()))?;
         }
 
+        if version < 4 {
+            conn.execute_batch(include_str!("../migrations/v004_large_scale.sql"))
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (4, datetime('now'))",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -157,11 +177,12 @@ impl LocalDatabase {
             .conn
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let local_mtime = local_file_mtime_millis(local_path);
         conn.execute(
             "INSERT OR REPLACE INTO objects 
             (file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
-             current_revision_id, local_hash, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             current_revision_id, local_hash, local_mtime, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 entry.file_id.to_string(),
                 local_path,
@@ -172,9 +193,54 @@ impl LocalDatabase {
                 entry.parent_id.map(|id| id.to_string()),
                 entry.current_revision_id.map(|id| id.to_string()),
                 entry.content_hash.clone(),
+                local_mtime,
                 entry.created_at,
                 entry.updated_at,
             ],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_file_snapshot_by_local_path(
+        &self,
+        local_path: &str,
+    ) -> CoreResult<Option<LocalFileSnapshot>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let result = conn.query_row(
+            "SELECT file_id, size, local_hash, local_mtime, state
+             FROM objects WHERE local_path = ?1",
+            rusqlite::params![local_path],
+            |row| {
+                Ok(LocalFileSnapshot {
+                    file_id: parse_uuid_column(row.get::<_, String>(0)?, 0)?,
+                    size: row.get::<_, i64>(1)?.max(0) as u64,
+                    local_hash: row.get::<_, Option<String>>(2)?,
+                    local_mtime: row.get::<_, Option<String>>(3)?,
+                    state: row.get::<_, String>(4)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoreError::Database(e.to_string())),
+        }
+    }
+
+    pub fn update_local_mtime_by_path(&self, local_path: &str) -> CoreResult<()> {
+        let local_mtime = local_file_mtime_millis(local_path);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE objects SET local_mtime = ?1, updated_at = datetime('now') WHERE local_path = ?2",
+            rusqlite::params![local_mtime, local_path],
         )
         .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(())
@@ -450,6 +516,17 @@ impl LocalDatabase {
         Ok(count as usize)
     }
 
+    pub fn count_objects(&self) -> CoreResult<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(count as usize)
+    }
+
     pub fn sum_pending_bytes(&self, direction: &str) -> CoreResult<u64> {
         let conn = self
             .conn
@@ -478,6 +555,41 @@ impl LocalDatabase {
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(deleted as u64)
+    }
+
+    pub fn get_checkpoint(&self, name: &str) -> CoreResult<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let result = conn.query_row(
+            "SELECT value FROM sync_checkpoints WHERE name = ?1",
+            rusqlite::params![name],
+            |row| row.get::<_, String>(0),
+        );
+
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoreError::Database(e.to_string())),
+        }
+    }
+
+    pub fn set_checkpoint(&self, name: &str, value: &str) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO sync_checkpoints (name, value, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![name, value],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
     }
 
     // ─── Extended File Operations (Phase 4) ────────────────────────
@@ -1225,6 +1337,18 @@ fn entry_name_from_paths(local_path: &str, s3_key: &str) -> String {
         .unwrap_or_default()
 }
 
+fn local_file_mtime_millis(local_path: &str) -> Option<String> {
+    if local_path.is_empty() {
+        return None;
+    }
+
+    std::fs::metadata(local_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().to_string())
+}
+
 // ─── Structs for Phase 5 ─────────────────────────────────────────
 
 /// A file revision stored in SQLite.
@@ -1308,6 +1432,13 @@ mod tests {
         }
     }
 
+    fn temp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("s4drive-db-{}-{}", uuid::Uuid::now_v7(), name));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
     #[test]
     fn register_file_preserves_lookup_path_and_metadata() {
         let db = test_db();
@@ -1323,6 +1454,47 @@ mod tests {
         assert_eq!(loaded.size, 42);
         assert_eq!(loaded.current_revision_id, entry.current_revision_id);
         assert_eq!(loaded.content_hash, entry.content_hash);
+    }
+
+    #[test]
+    fn register_file_records_local_snapshot() {
+        let db = test_db();
+        let path = temp_file("snapshot.txt", b"hello");
+        let entry = file_entry("snapshot.txt", 5);
+        let local_path = path.to_string_lossy().to_string();
+
+        db.register_local_file_at_path(&entry, &local_path, "snapshot.txt")
+            .unwrap();
+
+        let snapshot = db
+            .get_file_snapshot_by_local_path(&local_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.file_id, entry.file_id);
+        assert_eq!(snapshot.size, 5);
+        assert_eq!(snapshot.local_hash, entry.content_hash);
+        assert_eq!(snapshot.state, "pending_upload");
+        assert!(snapshot.local_mtime.is_some());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn checkpoints_roundtrip() {
+        let db = test_db();
+        assert_eq!(db.get_checkpoint("remote_head").unwrap(), None);
+
+        db.set_checkpoint("remote_head", "op-1").unwrap();
+        assert_eq!(
+            db.get_checkpoint("remote_head").unwrap(),
+            Some("op-1".to_string())
+        );
+
+        db.set_checkpoint("remote_head", "op-2").unwrap();
+        assert_eq!(
+            db.get_checkpoint("remote_head").unwrap(),
+            Some("op-2".to_string())
+        );
     }
 
     #[test]

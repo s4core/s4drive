@@ -12,6 +12,13 @@ pub struct FileTree<'a> {
     s3: &'a S3Adapter,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileTreePage {
+    pub ids: Vec<FileId>,
+    pub next_continuation_token: Option<String>,
+    pub is_truncated: bool,
+}
+
 impl<'a> FileTree<'a> {
     pub fn new(s3: &'a S3Adapter) -> Self {
         Self { s3 }
@@ -54,21 +61,42 @@ impl<'a> FileTree<'a> {
     /// Список всех file_id в дереве.
     pub async fn list_entries(&self) -> CoreResult<Vec<FileId>> {
         let keys = self.s3.list_objects(&Self::tree_prefix()).await?;
-        let ids: Vec<FileId> = keys
-            .iter()
-            .filter_map(|k| {
-                k.strip_prefix(".s4drive/meta/tree/")
-                    .and_then(|s| s.strip_suffix(".json"))
-                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            })
-            .collect();
+        let ids: Vec<FileId> = keys.iter().filter_map(|k| tree_key_to_file_id(k)).collect();
         Ok(ids)
+    }
+
+    /// One page of file_id values from the materialized tree.
+    pub async fn list_entries_page(
+        &self,
+        continuation_token: Option<&str>,
+        max_keys: i32,
+    ) -> CoreResult<FileTreePage> {
+        let page = self
+            .s3
+            .list_objects_page(&Self::tree_prefix(), None, max_keys, continuation_token)
+            .await?;
+        let ids = page
+            .keys
+            .iter()
+            .filter_map(|key| tree_key_to_file_id(key))
+            .collect();
+        Ok(FileTreePage {
+            ids,
+            next_continuation_token: page.next_continuation_token,
+            is_truncated: page.is_truncated,
+        })
     }
 
     /// Количество записей в дереве.
     pub async fn entry_count(&self) -> CoreResult<usize> {
         self.list_entries().await.map(|v| v.len())
     }
+}
+
+fn tree_key_to_file_id(key: &str) -> Option<FileId> {
+    key.strip_prefix(".s4drive/meta/tree/")
+        .and_then(|s| s.strip_suffix(".json"))
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
 }
 
 // ─── Tombstone Management ─────────────────────────────────────────────
