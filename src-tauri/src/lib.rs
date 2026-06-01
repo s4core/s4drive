@@ -17,6 +17,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Mutex,
     },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -27,6 +28,8 @@ use tauri_plugin_notification::NotificationExt;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "s4drive-main";
+const LOCAL_AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+const MIN_REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 // Application State
 
@@ -106,6 +109,7 @@ impl DesktopSettings {
 pub struct AppState {
     sync_running: AtomicBool,
     sync_paused: AtomicBool,
+    auto_sync_started: AtomicBool,
     conflict_count: AtomicU32,
     allow_exit: AtomicBool,
     exit_started: AtomicBool,
@@ -121,6 +125,7 @@ impl Default for AppState {
         Self {
             sync_running: AtomicBool::new(false),
             sync_paused: AtomicBool::new(false),
+            auto_sync_started: AtomicBool::new(false),
             conflict_count: AtomicU32::new(0),
             allow_exit: AtomicBool::new(false),
             exit_started: AtomicBool::new(false),
@@ -279,6 +284,7 @@ pub fn run() {
                 let _ = set_pending_route(state.inner(), Some("account".to_string()));
             }
             setup_tray(app)?;
+            ensure_auto_sync(app.handle());
             if needs_setup {
                 show_main_window(app.handle(), Some("account")).map_err(std::io::Error::other)?;
             }
@@ -434,6 +440,88 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     Ok(())
+}
+
+fn ensure_auto_sync(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.auto_sync_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut last_local_signature: Option<String> = None;
+        let mut last_remote_poll = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
+
+        loop {
+            tokio::time::sleep(LOCAL_AUTO_SYNC_INTERVAL).await;
+
+            let state = app.state::<AppState>();
+            if state.exit_started.load(Ordering::SeqCst) {
+                break;
+            }
+            if state.sync_paused.load(Ordering::Relaxed)
+                || state.sync_running.load(Ordering::Relaxed)
+            {
+                continue;
+            }
+
+            let settings = match state.settings.lock() {
+                Ok(settings) => settings.clone(),
+                Err(error) => {
+                    tracing::warn!("auto sync could not read settings: {}", error);
+                    continue;
+                }
+            };
+            if !settings.account_is_complete() {
+                continue;
+            }
+
+            let sync_folder = match ensure_sync_folder(&settings) {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::warn!("auto sync could not prepare sync folder: {}", error);
+                    continue;
+                }
+            };
+
+            let remote_interval =
+                Duration::from_secs(settings.polling_interval_sec).max(MIN_REMOTE_POLL_INTERVAL);
+            let signature = match local_folder_signature(&sync_folder) {
+                Ok(signature) => signature,
+                Err(error) => {
+                    tracing::warn!("auto sync could not scan sync folder: {}", error);
+                    continue;
+                }
+            };
+            let local_changed = last_local_signature
+                .as_ref()
+                .map(|last| last != &signature)
+                .unwrap_or(true);
+            let remote_due = last_remote_poll.elapsed() >= remote_interval;
+
+            if !local_changed && !remote_due {
+                continue;
+            }
+
+            match run_sync_now_with_options(app.clone(), state.inner(), false).await {
+                Ok(_) => {
+                    let new_signature = local_folder_signature(&sync_folder).unwrap_or(signature);
+                    last_local_signature = Some(new_signature);
+                    last_remote_poll = Instant::now();
+                }
+                Err(error) if error == "Sync is already running" => {}
+                Err(error) => {
+                    tracing::warn!("auto sync failed: {}", error);
+                    record_sync_failure(&app, state.inner(), &error);
+                    last_local_signature = Some(signature);
+                    last_remote_poll = Instant::now();
+                }
+            }
+        }
+    });
 }
 
 fn spawn_sync_now(app: &AppHandle) {
@@ -699,6 +787,40 @@ fn list_local_files(root: &Path) -> Result<Vec<FileItem>, String> {
     list_local_files_with_db(root, None)
 }
 
+fn local_folder_signature(root: &Path) -> Result<String, String> {
+    let mut entries = Vec::new();
+    let files = scan_folder_recursive(root).map_err(|e| e.to_string())?;
+    for (relative_path, size_bytes) in files {
+        if relative_path
+            .components()
+            .any(|part| part.as_os_str() == ".s4drive")
+        {
+            continue;
+        }
+
+        let full_path = root.join(&relative_path);
+        let modified = std::fs::metadata(&full_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(system_time_millis)
+            .unwrap_or(0);
+        entries.push(format!(
+            "{}:{}:{}",
+            relative_path.to_string_lossy().replace('\\', "/"),
+            size_bytes,
+            modified
+        ));
+    }
+    entries.sort();
+    Ok(entries.join("\n"))
+}
+
+fn system_time_millis(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis())
+}
+
 fn list_local_files_with_db(
     root: &Path,
     db: Option<&LocalDatabase>,
@@ -778,11 +900,18 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
     })
 }
 
-fn mark_sync_requested(app: &AppHandle, state: &AppState) -> bool {
+fn mark_sync_requested(app: &AppHandle, state: &AppState, resume_if_paused: bool) -> bool {
     if state.sync_running.swap(true, Ordering::Relaxed) {
         return false;
     }
-    state.sync_paused.store(false, Ordering::Relaxed);
+    if state.sync_paused.load(Ordering::Relaxed) {
+        if resume_if_paused {
+            state.sync_paused.store(false, Ordering::Relaxed);
+        } else {
+            state.sync_running.store(false, Ordering::Relaxed);
+            return false;
+        }
+    }
 
     let now = chrono::Utc::now().to_rfc3339();
     if let Ok(mut last_sync) = state.last_sync.lock() {
@@ -946,6 +1075,8 @@ fn save_settings(
     save_settings_to_disk(&app, &settings)?;
     let mut current = state.settings.lock().map_err(|e| e.to_string())?;
     *current = settings.clone();
+    drop(current);
+    ensure_auto_sync(&app);
     Ok(settings)
 }
 
@@ -1049,6 +1180,14 @@ async fn sync_now(
 }
 
 async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<SyncRunResult, String> {
+    run_sync_now_with_options(app, state, true).await
+}
+
+async fn run_sync_now_with_options(
+    app: AppHandle,
+    state: &AppState,
+    notify_user: bool,
+) -> Result<SyncRunResult, String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
     if !settings.account_is_complete() {
         return Err("Connect a storage account before syncing".to_string());
@@ -1100,7 +1239,7 @@ async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<SyncRunResult,
         config.sync_folder.max_concurrent_downloads,
     );
 
-    if !mark_sync_requested(&app, state) {
+    if !mark_sync_requested(&app, state, notify_user) {
         return Err("Sync is already running".to_string());
     }
     let result = engine.run_once().await;
@@ -1109,15 +1248,7 @@ async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<SyncRunResult,
     let result = match result {
         Ok(result) => result,
         Err(error) => {
-            update_tray_tooltip(&app, "idle", state.conflict_count.load(Ordering::Relaxed));
-            let summary = format!("Sync failed: {}", error);
-            eprintln!("S4Drive {}", summary);
-            if let Ok(mut last_summary) = state.last_sync_summary.lock() {
-                *last_summary = Some(summary.clone());
-            }
-            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = window.emit("sync-status-changed", current_sync_status(state)?);
-            }
+            record_sync_failure(&app, state, &error.to_string());
             return Err(error.to_string());
         }
     };
@@ -1146,13 +1277,21 @@ async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<SyncRunResult,
         ));
     }
 
-    if let Ok(activity) = ActivityLog::new(&activity_db) {
-        let _ = activity.log("sync_complete", "", &settings.sync_folder, &message);
+    let meaningful_activity = result.files_uploaded > 0
+        || result.files_downloaded > 0
+        || result.conflicts_detected > 0
+        || bucket_initialized;
+    if notify_user || meaningful_activity {
+        if let Ok(activity) = ActivityLog::new(&activity_db) {
+            let _ = activity.log("sync_complete", "", &settings.sync_folder, &message);
+        }
     }
     if let Ok(mut last_summary) = state.last_sync_summary.lock() {
         *last_summary = Some(message.clone());
     }
-    eprintln!("S4Drive {}", message);
+    if notify_user || meaningful_activity {
+        eprintln!("S4Drive {}", message);
+    }
 
     let sync_result = SyncRunResult {
         files_uploaded: result.files_uploaded,
@@ -1172,8 +1311,25 @@ async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<SyncRunResult,
         let _ = window.emit("files-changed", ());
     }
 
-    send_sync_notification(&app, "sync_complete", &message);
+    if notify_user {
+        send_sync_notification(&app, "sync_complete", &message);
+    }
     Ok(sync_result)
+}
+
+fn record_sync_failure(app: &AppHandle, state: &AppState, error: &str) {
+    state.sync_running.store(false, Ordering::Relaxed);
+    update_tray_tooltip(app, "idle", state.conflict_count.load(Ordering::Relaxed));
+    let summary = format!("Sync failed: {}", error);
+    eprintln!("S4Drive {}", summary);
+    if let Ok(mut last_summary) = state.last_sync_summary.lock() {
+        *last_summary = Some(summary);
+    }
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Ok(status) = current_sync_status(state) {
+            let _ = window.emit("sync-status-changed", status);
+        }
+    }
 }
 
 #[tauri::command]
@@ -1453,5 +1609,21 @@ mod tests {
 
         let network = humanize_connection_error("request timeout");
         assert!(network.contains("storage server"));
+    }
+
+    #[test]
+    fn local_folder_signature_ignores_internal_metadata() {
+        let root = std::env::temp_dir().join(format!("s4drive-tauri-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(root.join(".s4drive")).unwrap();
+        std::fs::write(root.join("doc.txt"), b"one").unwrap();
+
+        let first = local_folder_signature(&root).unwrap();
+        std::fs::write(root.join(".s4drive").join("internal.json"), b"changed").unwrap();
+        assert_eq!(first, local_folder_signature(&root).unwrap());
+
+        std::fs::write(root.join("doc.txt"), b"changed").unwrap();
+        assert_ne!(first, local_folder_signature(&root).unwrap());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

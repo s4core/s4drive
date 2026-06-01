@@ -1,22 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="S4Drive">
   <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#e94560"/>
-      <stop offset="100%" style="stop-color:#0f3460"/>
+    <linearGradient id="s4-bg" x1="96" y1="72" x2="430" y2="438" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ef3f32"/>
+      <stop offset="0.56" stop-color="#e4362c"/>
+      <stop offset="1" stop-color="#f04437"/>
     </linearGradient>
   </defs>
-  <!-- Background circle -->
-  <rect width="256" height="256" rx="48" fill="url(#bg)"/>
-  <!-- Drive icon -->
-  <g transform="translate(128,128)" fill="white">
-    <!-- Outer drive shape -->
-    <rect x="-48" y="-32" width="96" height="64" rx="8" stroke="white" stroke-width="3" fill="none"/>
-    <!-- Inner label -->
-    <text x="0" y="8" text-anchor="middle" font-family="Arial,sans-serif" font-weight="bold" font-size="36">S4</text>
-    <!-- Sync arrows -->
-    <path d="M48,0 Q60,-20 48,-32" stroke="#53d769" stroke-width="3" fill="none" stroke-linecap="round"/>
-    <polygon points="48,-2 44,-12 52,-12" fill="#53d769"/>
-    <path d="M-48,0 Q-60,20 -48,32" stroke="#53d769" stroke-width="3" fill="none" stroke-linecap="round"/>
-    <polygon points="-48,2 -44,12 -52,12" fill="#53d769"/>
-  </g>
+  <rect x="58" y="58" width="396" height="396" rx="64" fill="url(#s4-bg)"/>
+  <text
+    x="256"
+    y="303"
+    fill="#ffffff"
+    font-family="Arial, Helvetica, Liberation Sans, sans-serif"
+    font-size="156"
+    font-weight="800"
+    text-anchor="middle">S4</text>
 </svg>
