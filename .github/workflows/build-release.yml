@@ -23,6 +23,10 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   RUST_BACKTRACE: 1
   TAURI_CLI_VERSION: "2"
+  DEBIAN_FRONTEND: noninteractive
+  TZ: Etc/UTC
+  APT_LISTCHANGES_FRONTEND: none
+  NEEDRESTART_MODE: a
 
 defaults:
   run:
@@ -53,7 +57,13 @@ jobs:
       - name: Install Tauri system deps (Linux)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
+          sudo env DEBIAN_FRONTEND="${DEBIAN_FRONTEND}" TZ="${TZ}" \
+            APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND}" \
+            NEEDRESTART_MODE="${NEEDRESTART_MODE}" \
+            apt-get -y -qq --no-install-recommends \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            install \
             libwebkit2gtk-4.1-dev librsvg2-dev \
             patchelf libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
@@ -77,9 +87,14 @@ jobs:
 
       - name: Build in Docker (Ubuntu 20.04 for GLIBC compat)
         run: |
-          docker run --rm \
+          docker run --rm --pull=missing \
             -v $PWD:/workspace \
             -e CARGO_HOME=/workspace/.cargo-docker \
+            -e DEBIAN_FRONTEND="${DEBIAN_FRONTEND}" \
+            -e TZ="${TZ}" \
+            -e APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND}" \
+            -e NEEDRESTART_MODE="${NEEDRESTART_MODE}" \
+            -e TAURI_CLI_VERSION="${TAURI_CLI_VERSION}" \
             ubuntu:20.04 \
             bash /workspace/scripts/build-linux-docker.sh
 
@@ -291,7 +306,16 @@ jobs:
 
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
+        run: |
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND="${DEBIAN_FRONTEND}" TZ="${TZ}" \
+            APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND}" \
+            NEEDRESTART_MODE="${NEEDRESTART_MODE}" \
+            apt-get -y -qq --no-install-recommends \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            install \
+            libssl-dev pkg-config
 
       - name: Build CLI binary
         run: cargo build --package s4drive-cli --target ${{ matrix.target }} --release
