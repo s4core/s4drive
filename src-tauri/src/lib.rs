@@ -3,11 +3,16 @@
 use s4drive_core::{
     config::Config,
     credentials::{resolve_secret, CredentialStore},
+    db::LocalDatabase,
+    metadata::engine::MetadataEngine,
     s3::S3Adapter,
+    sync::{scan_folder_recursive, SyncEngine},
+    transfer::TransferQueue,
+    watcher::FileWatcher,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Mutex,
@@ -173,6 +178,13 @@ struct FileItem {
     sync_state: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DesktopSecretFallback {
+    endpoint: String,
+    access_key_id: String,
+    secret_key: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct TransferItem {
     id: String,
@@ -239,6 +251,15 @@ pub fn run() {
         .manage(AppState::default())
         .setup(|app| {
             load_settings_into_state(app.handle());
+            let state = app.state::<AppState>();
+            let needs_setup = state
+                .settings
+                .lock()
+                .map(|settings| !settings.account_is_complete())
+                .unwrap_or(true);
+            if needs_setup {
+                let _ = set_pending_route(state.inner(), Some("account".to_string()));
+            }
             setup_tray(app)?;
             Ok(())
         })
@@ -329,8 +350,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => spawn_show_main_window(app, None),
             "sync_now" => {
-                mark_sync_requested(app, app.state::<AppState>().inner());
-                send_notification(app, "S4Drive", "Sync requested");
+                spawn_sync_now(app);
             }
             "pause" => {
                 if let Err(error) = toggle_pause_from_tray(app, &pause_for_handler) {
@@ -361,6 +381,17 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     Ok(())
+}
+
+fn spawn_sync_now(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        if let Err(error) = run_sync_now(app.clone(), state.inner()).await {
+            tracing::warn!("sync from tray failed: {}", error);
+            send_sync_notification(&app, "error", &error);
+        }
+    });
 }
 
 // Window Lifecycle
@@ -430,6 +461,9 @@ fn set_pending_route(state: &AppState, route: Option<String>) -> Result<(), Stri
 fn load_settings_into_state(app: &AppHandle) {
     match load_settings_from_disk(app) {
         Ok(settings) => {
+            if let Err(error) = ensure_sync_folder(&settings) {
+                tracing::warn!("failed to prepare sync folder: {}", error);
+            }
             let state = app.state::<AppState>();
             let mut current = match state.settings.lock() {
                 Ok(current) => current,
@@ -451,6 +485,13 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
+fn secret_fallback_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|dir| dir.join("credentials-fallback.json"))
+        .map_err(|e| e.to_string())
+}
+
 fn load_settings_from_disk(app: &AppHandle) -> Result<DesktopSettings, String> {
     let path = settings_path(app)?;
     if !path.exists() {
@@ -468,6 +509,154 @@ fn save_settings_to_disk(app: &AppHandle, settings: &DesktopSettings) -> Result<
     }
     let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     std::fs::write(path, content).map_err(|e| e.to_string())
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(path.trim()).to_string())
+}
+
+fn ensure_sync_folder(settings: &DesktopSettings) -> Result<PathBuf, String> {
+    if settings.sync_folder.trim().is_empty() {
+        return Err("Sync folder is required".to_string());
+    }
+
+    let path = expand_user_path(&settings.sync_folder);
+    std::fs::create_dir_all(&path)
+        .map_err(|e| format!("create sync folder {}: {}", path.to_string_lossy(), e))?;
+    Ok(path)
+}
+
+fn save_secret_for_settings(
+    app: &AppHandle,
+    settings: &DesktopSettings,
+    secret_key: &str,
+) -> Result<(), String> {
+    let secret = secret_key.trim();
+    if secret.is_empty() {
+        return Ok(());
+    }
+
+    let store_result = CredentialStore::new("desktop").store(
+        settings.endpoint.trim(),
+        settings.access_key_id.trim(),
+        secret,
+        settings.region.trim(),
+        settings.bucket.trim(),
+    );
+    if store_result.is_ok() {
+        return Ok(());
+    }
+
+    let path = secret_fallback_path(app)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let fallback = DesktopSecretFallback {
+        endpoint: settings.endpoint.trim().to_string(),
+        access_key_id: settings.access_key_id.trim().to_string(),
+        secret_key: secret.to_string(),
+    };
+    let content = serde_json::to_string_pretty(&fallback).map_err(|e| e.to_string())?;
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&path, permissions).map_err(|e| e.to_string())?;
+    }
+
+    tracing::warn!(
+        "OS keychain unavailable; stored desktop credential fallback at {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn load_secret_fallback(app: &AppHandle, settings: &DesktopSettings) -> Result<String, String> {
+    let path = secret_fallback_path(app)?;
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let fallback: DesktopSecretFallback =
+        serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    if fallback.endpoint == settings.endpoint.trim()
+        && fallback.access_key_id == settings.access_key_id.trim()
+    {
+        Ok(fallback.secret_key)
+    } else {
+        Err("stored credential belongs to another endpoint or access key".to_string())
+    }
+}
+
+fn resolve_desktop_secret(
+    app: &AppHandle,
+    settings: &DesktopSettings,
+    secret_key: Option<&str>,
+) -> Result<String, String> {
+    if let Some(secret) = secret_key.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(secret.to_string());
+    }
+
+    let store = CredentialStore::new("desktop");
+    resolve_secret(
+        &store,
+        settings.endpoint.trim(),
+        settings.access_key_id.trim(),
+        None,
+    )
+    .or_else(|_| {
+        load_secret_fallback(app, settings).map_err(|error| {
+            s4drive_core::CoreError::NotFound(format!("desktop fallback unavailable: {}", error))
+        })
+    })
+    .map_err(|_| "Secret key is required or must already exist in saved credentials".to_string())
+}
+
+fn app_core_config(app: &AppHandle, settings: &DesktopSettings, secret_key: String) -> Config {
+    let mut config = settings.to_core_config(Some(secret_key));
+    if let Ok(config_dir) = app.path().app_config_dir() {
+        config.core.db_path = config_dir
+            .join("local-index.sqlite")
+            .to_string_lossy()
+            .to_string();
+    }
+    config
+}
+
+fn list_local_files(root: &Path) -> Result<Vec<FileItem>, String> {
+    let mut items = Vec::new();
+    let files = scan_folder_recursive(root).map_err(|e| e.to_string())?;
+    for (relative_path, size_bytes) in files {
+        if relative_path
+            .components()
+            .any(|part| part.as_os_str() == ".s4drive")
+        {
+            continue;
+        }
+        let full_path = root.join(&relative_path);
+        let modified_at = std::fs::metadata(&full_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .map(|timestamp| timestamp.to_rfc3339());
+        let path = relative_path.to_string_lossy().replace('\\', "/");
+        let name = relative_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path.as_str())
+            .to_string();
+        items.push(FileItem {
+            file_id: format!("local:{}", path),
+            name,
+            path,
+            kind: "file".to_string(),
+            size_bytes,
+            modified_at,
+            sync_state: "local".to_string(),
+        });
+    }
+    items.sort_by_key(|item| item.path.to_lowercase());
+    Ok(items)
 }
 
 // Sync State
@@ -494,8 +683,10 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
     })
 }
 
-fn mark_sync_requested(app: &AppHandle, state: &AppState) {
-    state.sync_running.store(true, Ordering::Relaxed);
+fn mark_sync_requested(app: &AppHandle, state: &AppState) -> bool {
+    if state.sync_running.swap(true, Ordering::Relaxed) {
+        return false;
+    }
     state.sync_paused.store(false, Ordering::Relaxed);
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -507,6 +698,7 @@ fn mark_sync_requested(app: &AppHandle, state: &AppState) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = window.emit("sync-triggered", ());
     }
+    true
 }
 
 fn toggle_pause_from_tray(
@@ -651,22 +843,11 @@ fn save_settings(
     settings: DesktopSettings,
     secret_key: Option<String>,
 ) -> Result<DesktopSettings, String> {
-    if let Some(secret) = secret_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        CredentialStore::new("desktop")
-            .store(
-                &settings.endpoint,
-                &settings.access_key_id,
-                secret,
-                &settings.region,
-                &settings.bucket,
-            )
-            .map_err(|e| e.to_string())?;
+    if let Some(secret) = secret_key.as_deref() {
+        save_secret_for_settings(&app, &settings, secret)?;
     }
 
+    ensure_sync_folder(&settings)?;
     save_settings_to_disk(&app, &settings)?;
     let mut current = state.settings.lock().map_err(|e| e.to_string())?;
     *current = settings.clone();
@@ -675,6 +856,7 @@ fn save_settings(
 
 #[tauri::command]
 async fn test_connection(
+    app: AppHandle,
     settings: DesktopSettings,
     secret_key: Option<String>,
 ) -> Result<ConnectionTestResult, String> {
@@ -685,37 +867,30 @@ async fn test_connection(
         });
     }
 
-    let secret = match secret_key
+    let provided_secret = secret_key
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
-        Some(secret) => Some(secret.to_string()),
-        None => {
-            let resolved = {
-                let store = CredentialStore::new("desktop");
-                resolve_secret(&store, &settings.endpoint, &settings.access_key_id, None)
-            };
-            match resolved {
-                Ok(secret) => Some(secret),
-                Err(_) => {
-                    return Ok(ConnectionTestResult {
-                        ok: false,
-                        message: "Secret key is required or must already exist in the keychain"
-                            .to_string(),
-                    });
-                }
-            }
+        .map(str::to_string);
+    let secret = match resolve_desktop_secret(&app, &settings, provided_secret.as_deref()) {
+        Ok(secret) => secret,
+        Err(message) => {
+            return Ok(ConnectionTestResult { ok: false, message });
         }
     };
 
-    let config = settings.to_core_config(secret);
+    let config = app_core_config(&app, &settings, secret);
     match S3Adapter::new(&config).await {
         Ok(adapter) => match adapter.check_bucket_access().await {
-            Ok(()) => Ok(ConnectionTestResult {
-                ok: true,
-                message: "Connection OK".to_string(),
-            }),
+            Ok(()) => {
+                if let Some(secret) = provided_secret.as_deref() {
+                    save_secret_for_settings(&app, &settings, secret)?;
+                }
+                Ok(ConnectionTestResult {
+                    ok: true,
+                    message: "Connection OK".to_string(),
+                })
+            }
             Err(error) => Ok(ConnectionTestResult {
                 ok: false,
                 message: humanize_connection_error(&error.to_string()),
@@ -771,8 +946,93 @@ fn toggle_pause(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<boo
 }
 
 #[tauri::command]
-fn sync_now(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    mark_sync_requested(&app, state.inner());
+async fn sync_now(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    run_sync_now(app, state.inner()).await
+}
+
+async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<(), String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    if !settings.account_is_complete() {
+        return Err("Connect a storage account before syncing".to_string());
+    }
+
+    let sync_folder = ensure_sync_folder(&settings)?;
+    let secret = resolve_desktop_secret(&app, &settings, None)?;
+    let config = app_core_config(&app, &settings, secret);
+
+    let s3 = S3Adapter::new(&config).await.map_err(|e| e.to_string())?;
+    s3.check_bucket_access()
+        .await
+        .map_err(|e| humanize_connection_error(&e.to_string()))?;
+
+    let device_id = uuid::Uuid::parse_str(&state.device_id).map_err(|e| e.to_string())?;
+    let metadata = MetadataEngine::new(s3.clone(), device_id);
+    if !metadata
+        .check_initialized()
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        let device_name = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "desktop".to_string());
+        metadata
+            .init_bucket(&device_name)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let (_watcher, event_stream) = FileWatcher::with_channel(&config).map_err(|e| e.to_string())?;
+    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let transfer = TransferQueue::new(&db);
+    let mut engine = SyncEngine::new();
+    engine.configure(
+        event_stream,
+        metadata,
+        transfer,
+        db,
+        s3,
+        &sync_folder.to_string_lossy(),
+        config.core.max_retries,
+        config.sync_folder.max_concurrent_uploads,
+        config.sync_folder.max_concurrent_downloads,
+    );
+
+    if !mark_sync_requested(&app, state) {
+        return Err("Sync is already running".to_string());
+    }
+    let result = engine.run_once().await;
+    state.sync_running.store(false, Ordering::Relaxed);
+
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            update_tray_tooltip(&app, "idle", state.conflict_count.load(Ordering::Relaxed));
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                let _ = window.emit("sync-status-changed", current_sync_status(state)?);
+            }
+            return Err(error.to_string());
+        }
+    };
+    state
+        .conflict_count
+        .store(result.conflicts_detected, Ordering::Relaxed);
+    update_tray_tooltip(&app, "idle", result.conflicts_detected);
+    if let Ok(mut last_sync) = state.last_sync.lock() {
+        *last_sync = Some(chrono::Utc::now().to_rfc3339());
+    }
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.emit("sync-status-changed", current_sync_status(state)?);
+        let _ = window.emit("files-changed", ());
+    }
+
+    send_sync_notification(
+        &app,
+        "sync_complete",
+        &format!(
+            "Uploaded {}, downloaded {}, conflicts {}",
+            result.files_uploaded, result.files_downloaded, result.conflicts_detected
+        ),
+    );
     Ok(())
 }
 
@@ -788,8 +1048,10 @@ fn take_pending_route(state: tauri::State<'_, AppState>) -> Result<Option<String
 }
 
 #[tauri::command]
-fn get_files() -> Result<Vec<FileItem>, String> {
-    Ok(Vec::new())
+fn get_files(state: tauri::State<'_, AppState>) -> Result<Vec<FileItem>, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let root = ensure_sync_folder(&settings)?;
+    list_local_files(&root)
 }
 
 #[tauri::command]

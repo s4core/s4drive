@@ -171,7 +171,7 @@ impl SyncEngine {
     pub async fn start(&mut self) -> CoreResult<()> {
         if !self.configured {
             return Err(CoreError::Internal(
-                "SyncEngine not configured — call configure() first".into(),
+                "SyncEngine not configured - call configure() first".into(),
             ));
         }
         if self.is_running() {
@@ -383,6 +383,75 @@ impl SyncEngine {
         set_state(&self.current_state, SyncState::ScanningLocal);
         tracing::info!("Manual sync triggered");
         Ok(())
+    }
+
+    /// Run a single foreground sync pass using the configured dependencies.
+    ///
+    /// This is intended for GUI "Sync Now" actions where the desktop shell
+    /// needs a deterministic one-shot operation instead of starting the
+    /// long-running background loop.
+    pub async fn run_once(&self) -> CoreResult<SyncResult> {
+        if !self.configured {
+            return Err(CoreError::Internal(
+                "SyncEngine not configured — call configure() first".into(),
+            ));
+        }
+
+        let metadata = self
+            .metadata
+            .clone()
+            .ok_or_else(|| CoreError::Internal("metadata engine missing".into()))?;
+        let transfer = self
+            .transfer
+            .clone()
+            .ok_or_else(|| CoreError::Internal("transfer queue missing".into()))?;
+        let db = self
+            .db
+            .clone()
+            .ok_or_else(|| CoreError::Internal("database missing".into()))?;
+        let download = self
+            .download
+            .clone()
+            .ok_or_else(|| CoreError::Internal("download engine missing".into()))?;
+        let conflict = self
+            .conflict
+            .clone()
+            .ok_or_else(|| CoreError::Internal("conflict handler missing".into()))?;
+        let conflict_engine = self
+            .conflict_engine
+            .clone()
+            .ok_or_else(|| CoreError::Internal("conflict engine missing".into()))?;
+        let versions = self
+            .versions
+            .clone()
+            .ok_or_else(|| CoreError::Internal("version api missing".into()))?;
+        let activity = self
+            .activity
+            .clone()
+            .ok_or_else(|| CoreError::Internal("activity log missing".into()))?;
+
+        self.running.store(true, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed);
+        let result = run_initial_sync(
+            &self.sync_folder,
+            &transfer,
+            &metadata,
+            &download,
+            &db,
+            &activity,
+            &conflict,
+            &conflict_engine,
+            &versions,
+            &self.current_state,
+            &self.paused,
+            self.max_retries,
+            self.max_concurrent_uploads,
+            self.max_concurrent_downloads,
+        )
+        .await;
+        self.running.store(false, Ordering::Relaxed);
+        set_state(&self.current_state, SyncState::Idle);
+        result
     }
 }
 

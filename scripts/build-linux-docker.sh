@@ -49,6 +49,46 @@ cd "$WORKSPACE/src-tauri"
 # Build all bundles
 cargo tauri build --bundles deb,rpm,appimage --ci
 
+patch_appimage_runtime() {
+    local appdir
+    appdir="$(find "$WORKSPACE/target/release/bundle" "$WORKSPACE/src-tauri/target/release/bundle" \
+        -maxdepth 3 -type d -name '*.AppDir' 2>/dev/null | head -n 1 || true)"
+    if [ -z "$appdir" ] || [ ! -f "$appdir/AppRun.wrapped" ]; then
+        return 0
+    fi
+
+    cat > "$appdir/AppRun" <<'EOF'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+export GIO_USE_VFS=local
+export GIO_MODULE_DIR="${GIO_MODULE_DIR:-$HERE/usr/lib/gio/modules-disabled}"
+unset GIO_EXTRA_MODULES
+exec "$HERE/AppRun.wrapped" "$@"
+EOF
+    chmod +x "$appdir/AppRun"
+
+    local appimage appimagetool
+    appimage="$(find "$WORKSPACE/target/release/bundle" "$WORKSPACE/src-tauri/target/release/bundle" \
+        -type f -name '*.AppImage' 2>/dev/null | head -n 1 || true)"
+    if [ -z "$appimage" ]; then
+        return 0
+    fi
+
+    appimagetool="$(command -v appimagetool || true)"
+    if [ -z "$appimagetool" ]; then
+        appimagetool="$(find /root/.cache "$CARGO_HOME" -type f -name 'appimagetool*' -perm /111 2>/dev/null | head -n 1 || true)"
+    fi
+    if [ -z "$appimagetool" ]; then
+        echo "WARNING: appimagetool not found; AppImage runtime wrapper was not repacked" >&2
+        return 0
+    fi
+
+    ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$appimagetool" "$appdir" "$appimage"
+    chmod +x "$appimage"
+}
+
+patch_appimage_runtime
+
 # Copy only final distributable files. Uploading the whole bundle directory also
 # includes AppImage staging files such as AppRun.wrapped, which may be unreadable
 # outside the root-owned Docker build.

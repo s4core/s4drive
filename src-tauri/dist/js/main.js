@@ -517,6 +517,7 @@
     document.getElementById('inputBucket').value = s.bucket || '';
     document.getElementById('inputAccessKey').value = s.access_key_id || '';
     document.getElementById('inputRegion').value = s.region || 'us-east-1';
+    document.getElementById('inputAccountSyncFolder').value = s.sync_folder || '~/S4Drive';
     document.getElementById('inputSyncFolder').value = s.sync_folder || '~/S4Drive';
     document.getElementById('inputPolling').value = s.polling_interval_sec || 30;
     document.getElementById('inputBandwidth').value = s.bandwidth_limit_kbps ?? '';
@@ -552,6 +553,7 @@
       document.getElementById('inputSecretKey').value = '';
       setTheme(state.settings.dark_mode);
       await refreshSettings();
+      await refreshFiles();
       showToast('Settings saved', 'success');
     } catch(e) {
       showToast(`Save failed: ${e}`, 'error');
@@ -573,12 +575,14 @@
   function collectSettings() {
     const bandwidth = parseInt(document.getElementById('inputBandwidth').value, 10);
     const proxy = document.getElementById('inputProxy').value.trim();
+    const accountSyncFolder = document.getElementById('inputAccountSyncFolder').value.trim();
+    const settingsSyncFolder = document.getElementById('inputSyncFolder').value.trim();
     return {
       endpoint: document.getElementById('inputEndpoint').value.trim(),
       bucket: document.getElementById('inputBucket').value.trim(),
       access_key_id: document.getElementById('inputAccessKey').value.trim(),
       region: document.getElementById('inputRegion').value.trim() || 'us-east-1',
-      sync_folder: document.getElementById('inputSyncFolder').value.trim() || '~/S4Drive',
+      sync_folder: accountSyncFolder || settingsSyncFolder || '~/S4Drive',
       bucket_prefix: state.settings.bucket_prefix || '/',
       polling_interval_sec: parseInt(document.getElementById('inputPolling').value, 10) || 30,
       bandwidth_limit_kbps: Number.isFinite(bandwidth) && bandwidth > 0 ? bandwidth : null,
@@ -768,6 +772,12 @@
     });
     document.getElementById('btnCheckUpdates').addEventListener('click', checkUpdates);
     document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+    ['inputAccountSyncFolder', 'inputSyncFolder'].forEach((id) => {
+      document.getElementById(id).addEventListener('input', (event) => {
+        const otherId = id === 'inputAccountSyncFolder' ? 'inputSyncFolder' : 'inputAccountSyncFolder';
+        document.getElementById(otherId).value = event.target.value;
+      });
+    });
     document.getElementById('inputUseSystemTheme').addEventListener('change', function() {
       state.settings.use_system_theme = this.checked;
       applyThemeSettings();
@@ -844,7 +854,14 @@
 
     await listen('sync-triggered', () => {
       refreshDashboard();
+      refreshFiles();
       showToast('Sync triggered', 'info');
+    });
+
+    await listen('files-changed', () => {
+      refreshFiles();
+      refreshActivity();
+      refreshTransfers();
     });
 
     await listen('sync-status-changed', (event) => {
@@ -873,6 +890,9 @@
     if (pendingRoute) {
       navigate(pendingRoute);
       if (pendingRoute === 'diagnostics') runDiagnostics();
+      if (pendingRoute === 'account') {
+        showToast('Connect storage and choose a sync folder before syncing', 'warning', 6000);
+      }
     }
 
     // Auto-refresh
