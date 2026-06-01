@@ -744,12 +744,16 @@
 
     // Wire dashboard actions
     document.getElementById('btnSyncNow').addEventListener('click', async () => {
+      const button = document.getElementById('btnSyncNow');
+      button.disabled = true;
       try {
-        await invoke('sync_now');
-        showToast('Sync requested', 'info');
-        refreshDashboard();
+        const result = await invoke('sync_now');
+        showToast(result?.message || 'Sync complete', 'success', 7000);
+        await Promise.all([refreshDashboard(), refreshFiles(), refreshActivity(), refreshTransfers()]);
       } catch(e) {
         showToast(`Sync failed: ${humanizeError(e)}`, 'error');
+      } finally {
+        button.disabled = false;
       }
     });
     document.getElementById('btnPauseSync').addEventListener('click', async () => {
@@ -855,7 +859,13 @@
     await listen('sync-triggered', () => {
       refreshDashboard();
       refreshFiles();
-      showToast('Sync triggered', 'info');
+    });
+
+    await listen('sync-completed', () => {
+      refreshDashboard();
+      refreshFiles();
+      refreshActivity();
+      refreshTransfers();
     });
 
     await listen('files-changed', () => {

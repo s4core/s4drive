@@ -6,7 +6,7 @@ use s4drive_core::{
     db::LocalDatabase,
     metadata::engine::MetadataEngine,
     s3::S3Adapter,
-    sync::{scan_folder_recursive, SyncEngine},
+    sync::{scan_folder_recursive, ActivityLog, SyncEngine},
     transfer::TransferQueue,
     watcher::FileWatcher,
 };
@@ -110,6 +110,7 @@ pub struct AppState {
     allow_exit: AtomicBool,
     exit_started: AtomicBool,
     last_sync: Mutex<Option<String>>,
+    last_sync_summary: Mutex<Option<String>>,
     pending_route: Mutex<Option<String>>,
     device_id: String,
     settings: Mutex<DesktopSettings>,
@@ -124,6 +125,7 @@ impl Default for AppState {
             allow_exit: AtomicBool::new(false),
             exit_started: AtomicBool::new(false),
             last_sync: Mutex::new(None),
+            last_sync_summary: Mutex::new(None),
             pending_route: Mutex::new(None),
             device_id: uuid::Uuid::now_v7().to_string(),
             settings: Mutex::new(DesktopSettings::default()),
@@ -140,6 +142,7 @@ pub struct SyncStatus {
     pub state: String,
     pub conflicts: u32,
     pub last_sync: Option<String>,
+    pub last_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +158,19 @@ pub struct AppInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionTestResult {
     pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncRunResult {
+    pub files_uploaded: u32,
+    pub files_downloaded: u32,
+    pub conflicts_detected: u32,
+    pub bytes_uploaded: u64,
+    pub bytes_downloaded: u64,
+    pub local_files_seen: usize,
+    pub bucket_initialized: bool,
+    pub unmanaged_remote_objects: usize,
     pub message: String,
 }
 
@@ -652,7 +668,13 @@ fn resolve_desktop_secret(
 }
 
 fn app_core_config(app: &AppHandle, settings: &DesktopSettings, secret_key: String) -> Config {
-    let mut config = settings.to_core_config(Some(secret_key));
+    let mut config = app_local_config(app, settings);
+    config.s3.secret_key_fallback = Some(secret_key);
+    config
+}
+
+fn app_local_config(app: &AppHandle, settings: &DesktopSettings) -> Config {
+    let mut config = settings.to_core_config(None);
     if let Ok(config_dir) = app.path().app_config_dir() {
         config.core.db_path = config_dir
             .join("local-index.sqlite")
@@ -660,6 +682,17 @@ fn app_core_config(app: &AppHandle, settings: &DesktopSettings, secret_key: Stri
             .to_string();
     }
     config
+}
+
+async fn count_unmanaged_remote_objects(s3: &S3Adapter) -> Result<usize, String> {
+    s3.list_objects("")
+        .await
+        .map(|keys| {
+            keys.into_iter()
+                .filter(|key| !key.starts_with(".s4drive/"))
+                .count()
+        })
+        .map_err(|e| e.to_string())
 }
 
 fn list_local_files(root: &Path) -> Result<Vec<FileItem>, String> {
@@ -705,6 +738,11 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
     let paused = state.sync_paused.load(Ordering::Relaxed);
     let conflicts = state.conflict_count.load(Ordering::Relaxed);
     let last_sync = state.last_sync.lock().map_err(|e| e.to_string())?.clone();
+    let last_summary = state
+        .last_sync_summary
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
 
     Ok(SyncStatus {
         running,
@@ -719,6 +757,7 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
         .to_string(),
         conflicts,
         last_sync,
+        last_summary,
     })
 }
 
@@ -985,17 +1024,21 @@ fn toggle_pause(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<boo
 }
 
 #[tauri::command]
-async fn sync_now(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn sync_now(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<SyncRunResult, String> {
     run_sync_now(app, state.inner()).await
 }
 
-async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<(), String> {
+async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<SyncRunResult, String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
     if !settings.account_is_complete() {
         return Err("Connect a storage account before syncing".to_string());
     }
 
     let sync_folder = ensure_sync_folder(&settings)?;
+    let local_files_seen = list_local_files(&sync_folder)?.len();
     let secret = resolve_desktop_secret(&app, &settings, None)?;
     let config = app_core_config(&app, &settings, secret);
 
@@ -1003,9 +1046,11 @@ async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<(), String> {
     s3.check_bucket_access()
         .await
         .map_err(|e| humanize_connection_error(&e.to_string()))?;
+    let unmanaged_remote_objects = count_unmanaged_remote_objects(&s3).await.unwrap_or(0);
 
     let device_id = uuid::Uuid::parse_str(&state.device_id).map_err(|e| e.to_string())?;
     let metadata = MetadataEngine::new(s3.clone(), device_id);
+    let mut bucket_initialized = false;
     if !metadata
         .check_initialized()
         .await
@@ -1018,10 +1063,12 @@ async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<(), String> {
             .init_bucket(&device_name)
             .await
             .map_err(|e| e.to_string())?;
+        bucket_initialized = true;
     }
 
     let (_watcher, event_stream) = FileWatcher::with_channel(&config).map_err(|e| e.to_string())?;
     let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let activity_db = db.clone();
     let transfer = TransferQueue::new(&db);
     let mut engine = SyncEngine::new();
     engine.configure(
@@ -1046,6 +1093,11 @@ async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<(), String> {
         Ok(result) => result,
         Err(error) => {
             update_tray_tooltip(&app, "idle", state.conflict_count.load(Ordering::Relaxed));
+            let summary = format!("Sync failed: {}", error);
+            eprintln!("S4Drive {}", summary);
+            if let Ok(mut last_summary) = state.last_sync_summary.lock() {
+                *last_summary = Some(summary.clone());
+            }
             if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 let _ = window.emit("sync-status-changed", current_sync_status(state)?);
             }
@@ -1059,20 +1111,52 @@ async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<(), String> {
     if let Ok(mut last_sync) = state.last_sync.lock() {
         *last_sync = Some(chrono::Utc::now().to_rfc3339());
     }
+
+    let mut message = format!(
+        "Sync complete: uploaded {}, downloaded {}, conflicts {}",
+        result.files_uploaded, result.files_downloaded, result.conflicts_detected
+    );
+    if bucket_initialized {
+        message.push_str("; initialized bucket metadata");
+    }
+    if local_files_seen == 0 {
+        message.push_str("; local sync folder is empty");
+    }
+    if unmanaged_remote_objects > 0 {
+        message.push_str(&format!(
+            "; ignored {} unmanaged S3 object(s)",
+            unmanaged_remote_objects
+        ));
+    }
+
+    if let Ok(activity) = ActivityLog::new(&activity_db) {
+        let _ = activity.log("sync_complete", "", &settings.sync_folder, &message);
+    }
+    if let Ok(mut last_summary) = state.last_sync_summary.lock() {
+        *last_summary = Some(message.clone());
+    }
+    eprintln!("S4Drive {}", message);
+
+    let sync_result = SyncRunResult {
+        files_uploaded: result.files_uploaded,
+        files_downloaded: result.files_downloaded,
+        conflicts_detected: result.conflicts_detected,
+        bytes_uploaded: result.bytes_uploaded,
+        bytes_downloaded: result.bytes_downloaded,
+        local_files_seen,
+        bucket_initialized,
+        unmanaged_remote_objects,
+        message: message.clone(),
+    };
+
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = window.emit("sync-status-changed", current_sync_status(state)?);
+        let _ = window.emit("sync-completed", sync_result.clone());
         let _ = window.emit("files-changed", ());
     }
 
-    send_sync_notification(
-        &app,
-        "sync_complete",
-        &format!(
-            "Uploaded {}, downloaded {}, conflicts {}",
-            result.files_uploaded, result.files_downloaded, result.conflicts_detected
-        ),
-    );
-    Ok(())
+    send_sync_notification(&app, "sync_complete", &message);
+    Ok(sync_result)
 }
 
 #[tauri::command]
@@ -1094,7 +1178,30 @@ fn get_files(state: tauri::State<'_, AppState>) -> Result<Vec<FileItem>, String>
 }
 
 #[tauri::command]
-fn get_activity(state: tauri::State<'_, AppState>) -> Result<Vec<ActivityItem>, String> {
+fn get_activity(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ActivityItem>, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let config = app_local_config(&app, &settings);
+    if let Ok(db) = LocalDatabase::new(&config) {
+        if let Ok(activity) = ActivityLog::new(&db) {
+            let entries = activity.recent(50);
+            if !entries.is_empty() {
+                return Ok(entries
+                    .into_iter()
+                    .map(|entry| ActivityItem {
+                        action: entry.action,
+                        file_id: entry.file_id,
+                        path: entry.path,
+                        status: entry.status,
+                        timestamp: entry.timestamp,
+                    })
+                    .collect());
+            }
+        }
+    }
+
     let status = current_sync_status(state.inner())?;
     let timestamp = chrono::Utc::now().to_rfc3339();
     Ok(vec![ActivityItem {
@@ -1139,7 +1246,7 @@ fn resolve_conflict(conflict_id: String, resolution: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn run_diagnostics(
+async fn run_diagnostics(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<DiagnosticItem>, String> {
@@ -1148,7 +1255,7 @@ fn run_diagnostics(
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("unavailable: {}", error));
 
-    Ok(vec![
+    let mut items = vec![
         DiagnosticItem {
             name: "Tray lifecycle".to_string(),
             status: "ok".to_string(),
@@ -1182,7 +1289,101 @@ fn run_diagnostics(
                 state.conflict_count.load(Ordering::Relaxed)
             ),
         },
-    ])
+    ];
+
+    match ensure_sync_folder(&settings) {
+        Ok(path) => items.push(DiagnosticItem {
+            name: "Sync folder".to_string(),
+            status: "ok".to_string(),
+            detail: format!(
+                "{} ({} local file(s))",
+                path.display(),
+                list_local_files(&path)?.len()
+            ),
+        }),
+        Err(error) => items.push(DiagnosticItem {
+            name: "Sync folder".to_string(),
+            status: "error".to_string(),
+            detail: error,
+        }),
+    }
+
+    if settings.account_is_complete() {
+        match resolve_desktop_secret(&app, &settings, None) {
+            Ok(secret) => {
+                let config = app_core_config(&app, &settings, secret);
+                match S3Adapter::new(&config).await {
+                    Ok(s3) => {
+                        let bucket_access = s3.check_bucket_access().await;
+                        items.push(DiagnosticItem {
+                            name: "Bucket access".to_string(),
+                            status: if bucket_access.is_ok() { "ok" } else { "error" }.to_string(),
+                            detail: bucket_access
+                                .map(|_| format!("{} / {}", settings.endpoint, settings.bucket))
+                                .unwrap_or_else(|error| {
+                                    humanize_connection_error(&error.to_string())
+                                }),
+                        });
+
+                        if items
+                            .last()
+                            .map(|item| item.status.as_str() == "ok")
+                            .unwrap_or(false)
+                        {
+                            let device_id = uuid::Uuid::parse_str(&state.device_id)
+                                .map_err(|e| e.to_string())?;
+                            let metadata = MetadataEngine::new(s3.clone(), device_id);
+                            let initialized = metadata.check_initialized().await;
+                            items.push(DiagnosticItem {
+                                name: "S4 metadata".to_string(),
+                                status: match initialized {
+                                    Ok(true) => "ok",
+                                    Ok(false) => "warning",
+                                    Err(_) => "error",
+                                }
+                                .to_string(),
+                                detail: match initialized {
+                                    Ok(true) => "Bucket has .s4drive/ metadata".to_string(),
+                                    Ok(false) => {
+                                        "Bucket is not initialized yet; Sync Now will create metadata"
+                                            .to_string()
+                                    }
+                                    Err(error) => error.to_string(),
+                                },
+                            });
+
+                            if let Ok(count) = count_unmanaged_remote_objects(&s3).await {
+                                items.push(DiagnosticItem {
+                                    name: "Unmanaged S3 objects".to_string(),
+                                    status: if count == 0 { "ok" } else { "warning" }.to_string(),
+                                    detail: if count == 0 {
+                                        "No objects outside .s4drive/".to_string()
+                                    } else {
+                                        format!(
+                                            "{} object(s) outside .s4drive/ are ignored in S4 native mode",
+                                            count
+                                        )
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => items.push(DiagnosticItem {
+                        name: "Bucket access".to_string(),
+                        status: "error".to_string(),
+                        detail: humanize_connection_error(&error.to_string()),
+                    }),
+                }
+            }
+            Err(error) => items.push(DiagnosticItem {
+                name: "Credentials".to_string(),
+                status: "error".to_string(),
+                detail: error,
+            }),
+        }
+    }
+
+    Ok(items)
 }
 
 #[tauri::command]
