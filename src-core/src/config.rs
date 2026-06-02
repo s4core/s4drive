@@ -68,6 +68,7 @@ pub struct MaintenanceConfig {
     pub remote_op_compaction_enabled: bool,
     pub remote_op_compaction_batch_size: usize,
     pub remote_op_snapshot_interval_ops: usize,
+    pub remote_op_snapshot_max_entries: usize,
     pub remote_op_watermark_stale_days: u64,
     pub blob_lease_ttl_minutes: u64,
     pub sqlite_maintenance: bool,
@@ -96,6 +97,7 @@ impl Default for MaintenanceConfig {
             remote_op_compaction_enabled: true,
             remote_op_compaction_batch_size: 250,
             remote_op_snapshot_interval_ops: 1_000,
+            remote_op_snapshot_max_entries: 50_000,
             remote_op_watermark_stale_days: 90,
             blob_lease_ttl_minutes: 30,
             sqlite_maintenance: true,
@@ -218,5 +220,6 @@ max_retries = 3
         assert!(config.maintenance.remote_op_compaction_enabled);
         assert_eq!(config.maintenance.remote_op_compaction_batch_size, 250);
         assert_eq!(config.maintenance.remote_op_snapshot_interval_ops, 1_000);
+        assert_eq!(config.maintenance.remote_op_snapshot_max_entries, 50_000);
     }
 }

@@ -63,6 +63,7 @@ const MIN_BLOB_LEASE_TTL_MINUTES: u64 = 1;
 enum RemoteTreeScanMode {
     Bootstrap,
     StaleFallback,
+    CompactedFallback,
 }
 
 impl RemoteTreeScanMode {
@@ -70,22 +71,24 @@ impl RemoteTreeScanMode {
         match self {
             Self::Bootstrap => "bootstrap",
             Self::StaleFallback => "stale_fallback",
+            Self::CompactedFallback => "compacted_fallback",
         }
     }
 
     fn from_checkpoint(value: Option<&str>) -> Self {
         match value {
+            Some("compacted_fallback") => Self::CompactedFallback,
             Some("stale_fallback") => Self::StaleFallback,
             _ => Self::Bootstrap,
         }
     }
 
     fn should_advance_head(self) -> bool {
-        self == Self::Bootstrap
+        matches!(self, Self::Bootstrap | Self::CompactedFallback)
     }
 
     fn should_reconcile_existing(self) -> bool {
-        self == Self::StaleFallback
+        matches!(self, Self::StaleFallback | Self::CompactedFallback)
     }
 }
 
@@ -1821,6 +1824,7 @@ async fn poll_remote_changes(
     let mut ops = Vec::new();
     let mut cursor = current_head.clone();
     let mut reached_checkpoint = false;
+    let mut hit_compacted_op = false;
     for _ in 0..MAX_REMOTE_HEAD_WALK_OPS {
         if checkpoint.as_deref() == Some(cursor.as_str()) {
             reached_checkpoint = true;
@@ -1833,6 +1837,7 @@ async fn poll_remote_changes(
                     "Remote op {} is no longer available; falling back to remote tree scan",
                     cursor
                 );
+                hit_compacted_op = true;
                 break;
             }
             Err(error) => return Err(error),
@@ -1849,6 +1854,11 @@ async fn poll_remote_changes(
     if !reached_checkpoint {
         tracing::warn!("Remote op checkpoint is too far behind; falling back to remote tree scan");
         let restart = !remote_tree_bootstrap_in_progress(db)?;
+        let fallback_mode = if hit_compacted_op {
+            RemoteTreeScanMode::CompactedFallback
+        } else {
+            RemoteTreeScanMode::StaleFallback
+        };
         let remote_scan = queue_missing_remote_tree_entries_from(
             s3,
             db,
@@ -1856,7 +1866,7 @@ async fn poll_remote_changes(
             versions,
             _sync_folder,
             restart,
-            RemoteTreeScanMode::StaleFallback,
+            fallback_mode,
         )
         .await?;
         return Ok((remote_scan.queued, 0));
@@ -2977,6 +2987,18 @@ mod tests {
         assert!(should_ignore_sync("/tmp/file.txt~"));
         assert!(should_ignore_sync("/tmp/Thumbs.db"));
         assert!(!should_ignore_sync("/tmp/real-file.txt"));
+    }
+
+    #[test]
+    fn compacted_fallback_advances_head_after_full_tree_scan() {
+        assert!(RemoteTreeScanMode::Bootstrap.should_advance_head());
+        assert!(!RemoteTreeScanMode::StaleFallback.should_advance_head());
+        assert!(RemoteTreeScanMode::CompactedFallback.should_advance_head());
+        assert!(RemoteTreeScanMode::CompactedFallback.should_reconcile_existing());
+        assert_eq!(
+            RemoteTreeScanMode::from_checkpoint(Some("compacted_fallback")),
+            RemoteTreeScanMode::CompactedFallback
+        );
     }
 
     #[test]

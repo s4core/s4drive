@@ -92,7 +92,7 @@ impl SyncMaintenance {
         report.local = self.run_local_db_gc(db)?;
         report.remote_tombstones_deleted = self.collect_expired_remote_tombstones(s3, db).await?;
         if self.config.remote_op_compaction_enabled {
-            match self.maintain_remote_op_log(s3, metadata).await {
+            match self.maintain_remote_op_log(s3, metadata, db).await {
                 Ok(op_report) => {
                     report.remote_snapshots_written = op_report.snapshots_written;
                     report.remote_ops_deleted = op_report.ops_deleted;
@@ -132,6 +132,7 @@ impl SyncMaintenance {
         &self,
         s3: &S3Adapter,
         metadata: &MetadataEngine,
+        db: &LocalDatabase,
     ) -> CoreResult<RemoteOpMaintenanceReport> {
         let compactor = OpLogCompactor::new(s3);
         let snapshot_manager = SnapshotManager::new(s3);
@@ -139,6 +140,9 @@ impl SyncMaintenance {
             .upsert_device_registration(&current_device_name())
             .await?;
         let current_head = remote_head_for_maintenance(s3).await?;
+        let applied_head = db
+            .get_checkpoint(super::REMOTE_HEAD_CHECKPOINT)?
+            .unwrap_or_default();
         let mut latest_snapshot = compactor.latest_snapshot_metadata().await?;
         let mut report = RemoteOpMaintenanceReport::default();
 
@@ -150,20 +154,29 @@ impl SyncMaintenance {
                 .as_ref()
                 .map(|metadata| metadata.seq_num + 1)
                 .unwrap_or(1);
-            let entries = collect_remote_tree_entries_for_snapshot(s3).await?;
-            snapshot_manager
-                .write_snapshot_for_head(&entries, seq_num, Some(&current_head))
-                .await?;
-            latest_snapshot = Some(snapshot_manager.read_snapshot_metadata(seq_num).await?);
-            report.snapshots_written = 1;
+            let max_entries = self.config.remote_op_snapshot_max_entries.max(1);
+            match collect_remote_tree_entries_for_snapshot(s3, max_entries).await? {
+                Some(entries) => {
+                    snapshot_manager
+                        .write_snapshot_for_head(&entries, seq_num, Some(&current_head))
+                        .await?;
+                    latest_snapshot = Some(snapshot_manager.read_snapshot_metadata(seq_num).await?);
+                    report.snapshots_written = 1;
+                }
+                None => {
+                    tracing::warn!(
+                        "Remote op-log snapshot skipped: remote tree exceeds {} entries",
+                        max_entries
+                    );
+                }
+            }
         }
 
-        let applied_snapshot_seq = latest_snapshot
-            .as_ref()
-            .map(|metadata| metadata.seq_num)
-            .unwrap_or(0);
+        let applied_snapshot_seq = self
+            .applied_snapshot_seq_for_head(&compactor, &applied_head, latest_snapshot.as_ref())
+            .await?;
         DeviceWatermarks::new(s3)
-            .update(metadata.device_id(), applied_snapshot_seq, &current_head)
+            .update(metadata.device_id(), applied_snapshot_seq, &applied_head)
             .await?;
         report.watermarks_updated = 1;
 
@@ -205,6 +218,35 @@ impl SyncMaintenance {
             .op_count_since(current_head, stop_at, interval)
             .await?;
         Ok(ops_since_snapshot >= interval)
+    }
+
+    async fn applied_snapshot_seq_for_head(
+        &self,
+        compactor: &OpLogCompactor<'_, S3Adapter>,
+        applied_head: &str,
+        latest_snapshot: Option<&crate::metadata::types::SnapshotMetadata>,
+    ) -> CoreResult<u64> {
+        let Some(snapshot) = latest_snapshot else {
+            return Ok(0);
+        };
+        let Some(covered_head) = snapshot
+            .covered_head
+            .as_deref()
+            .filter(|head| !head.is_empty())
+        else {
+            return Ok(0);
+        };
+        if applied_head.is_empty() {
+            return Ok(0);
+        }
+        if compactor
+            .head_reaches(applied_head, covered_head, super::MAX_REMOTE_HEAD_WALK_OPS)
+            .await?
+        {
+            Ok(snapshot.seq_num)
+        } else {
+            Ok(0)
+        }
     }
 
     async fn reconcile_missing_local_files(
@@ -737,7 +779,10 @@ async fn remote_head_for_maintenance(s3: &S3Adapter) -> CoreResult<String> {
     Ok(ops_log.load_head().await?.unwrap_or_default())
 }
 
-async fn collect_remote_tree_entries_for_snapshot(s3: &S3Adapter) -> CoreResult<Vec<FileEntry>> {
+async fn collect_remote_tree_entries_for_snapshot(
+    s3: &S3Adapter,
+    max_entries: usize,
+) -> CoreResult<Option<Vec<FileEntry>>> {
     let tree = FileTree::new(s3);
     let mut cursor: Option<String> = None;
     let mut entries = Vec::new();
@@ -752,6 +797,9 @@ async fn collect_remote_tree_entries_for_snapshot(s3: &S3Adapter) -> CoreResult<
                 Err(CoreError::NotFound(_)) => {}
                 Err(error) => return Err(error),
             }
+            if entries.len() > max_entries {
+                return Ok(None);
+            }
         }
 
         if page.is_truncated {
@@ -765,7 +813,7 @@ async fn collect_remote_tree_entries_for_snapshot(s3: &S3Adapter) -> CoreResult<
         }
     }
 
-    Ok(entries)
+    Ok(Some(entries))
 }
 
 fn current_device_name() -> String {

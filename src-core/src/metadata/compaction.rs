@@ -168,6 +168,41 @@ impl<'a, S: S3ObjectStore + ?Sized> OpLogCompactor<'a, S> {
         Ok(count)
     }
 
+    pub async fn head_reaches(
+        &self,
+        head: &str,
+        ancestor: &str,
+        max_depth: usize,
+    ) -> CoreResult<bool> {
+        if ancestor.is_empty() || head == ancestor {
+            return Ok(true);
+        }
+        if head.is_empty() || max_depth == 0 {
+            return Ok(false);
+        }
+
+        let mut cursor = head.to_string();
+        for _ in 0..max_depth {
+            if cursor == ancestor {
+                return Ok(true);
+            }
+            let op = match self.read_operation(&cursor).await {
+                Ok(op) => op,
+                Err(CoreError::NotFound(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if op.base_head == ancestor {
+                return Ok(true);
+            }
+            if op.base_head.is_empty() {
+                return Ok(false);
+            }
+            cursor = op.base_head;
+        }
+
+        Ok(false)
+    }
+
     pub async fn compact(
         &self,
         snapshot: &SnapshotMetadata,
@@ -222,7 +257,8 @@ impl<'a, S: S3ObjectStore + ?Sized> OpLogCompactor<'a, S> {
             .compactable_ancestors(covered_head, batch_limit.max(1))
             .await?;
         if compactable.is_empty() {
-            report.skipped_reason = Some("no compactable ops before snapshot head".to_string());
+            report.skipped_reason =
+                Some("no compactable non-content ops before snapshot head".to_string());
             return Ok(report);
         }
 
@@ -251,15 +287,20 @@ impl<'a, S: S3ObjectStore + ?Sized> OpLogCompactor<'a, S> {
         };
         let mut cursor = head.base_head;
         let mut op_ids = Vec::new();
+        let mut scanned = 0usize;
 
-        while !cursor.is_empty() && op_ids.len() < batch_limit {
+        while !cursor.is_empty() && scanned < batch_limit {
             let op = match self.read_operation(&cursor).await {
                 Ok(op) => op,
                 Err(CoreError::NotFound(_)) => break,
                 Err(error) => return Err(error),
             };
-            op_ids.push(cursor);
-            cursor = op.base_head;
+            scanned += 1;
+            let previous = op.base_head;
+            if op.effects.new_content_ref.is_none() {
+                op_ids.push(cursor);
+            }
+            cursor = previous;
         }
 
         Ok(op_ids)
@@ -292,7 +333,7 @@ fn timestamp_is_stale(timestamp: &str, stale_days: u64, now: DateTime<Utc>) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::types::{Effects, OpType, Preconditions};
+    use crate::metadata::types::{ContentRef, Effects, OpType, Preconditions};
     use crate::s3::ObjectMeta;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -418,6 +459,18 @@ mod tests {
         }
     }
 
+    fn op_with_content(op_id: &str, base_head: &str, hash: &str) -> Operation {
+        let mut op = op(op_id, base_head);
+        op.effects.new_content_ref = Some(ContentRef {
+            blob_id: uuid::Uuid::now_v7(),
+            hash: hash.to_string(),
+            size: 7,
+            mime: "text/plain".to_string(),
+            storage_key: Serializer::blob_key(hash),
+        });
+        op
+    }
+
     #[tokio::test]
     async fn watermark_update_roundtrips_active_progress() {
         let store = FakeStore::default();
@@ -475,6 +528,64 @@ mod tests {
                 .unwrap(),
             third
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_content_ref_ops_for_blob_gc() {
+        let store = FakeStore::default();
+        let first = "device:1:first";
+        let second = "device:2:second";
+        let third = "device:3:third";
+        let hash = "5555555555555555555555555555555555555555555555555555555555555555";
+        store.put_json(
+            &Serializer::op_key(first),
+            &op_with_content(first, "", hash),
+        );
+        store.put_json(&Serializer::op_key(second), &op(second, first));
+        store.put_json(&Serializer::op_key(third), &op(third, second));
+
+        DeviceWatermarks::new(&store)
+            .update(uuid::Uuid::now_v7(), 5, third)
+            .await
+            .unwrap();
+        let snapshot = SnapshotMetadata {
+            schema_version: crate::metadata::SUPPORTED_SCHEMA_VERSION,
+            seq_num: 5,
+            created_at: Utc::now().to_rfc3339(),
+            entry_count: 0,
+            tree_key: Serializer::snapshot_key(5),
+            covered_head: Some(third.to_string()),
+        };
+
+        let report = OpLogCompactor::new(&store)
+            .compact(&snapshot, 10, 90)
+            .await
+            .unwrap();
+
+        assert_eq!(report.pruned_ops, 1);
+        assert!(store.contains(&Serializer::op_key(first)));
+        assert!(!store.contains(&Serializer::op_key(second)));
+        assert!(store.contains(&Serializer::op_key(third)));
+    }
+
+    #[tokio::test]
+    async fn head_reaches_returns_false_when_chain_was_compacted() {
+        let store = FakeStore::default();
+        let first = "device:1:first";
+        let second = "device:2:second";
+        let third = "device:3:third";
+        store.put_json(&Serializer::op_key(first), &op(first, ""));
+        store.put_json(&Serializer::op_key(second), &op(second, first));
+        store.put_json(&Serializer::op_key(third), &op(third, second));
+
+        let compactor = OpLogCompactor::new(&store);
+        assert!(compactor.head_reaches(third, first, 10).await.unwrap());
+
+        store
+            .delete_object(&Serializer::op_key(second))
+            .await
+            .unwrap();
+        assert!(!compactor.head_reaches(third, first, 10).await.unwrap());
     }
 
     #[tokio::test]
