@@ -23,6 +23,25 @@ pub struct LocalFileSnapshot {
     pub state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedLocalFile {
+    pub row_id: i64,
+    pub file_id: uuid::Uuid,
+    pub local_path: String,
+    pub s3_key: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalMaintenanceStats {
+    pub transfers_deleted: u64,
+    pub activity_deleted: u64,
+    pub conflict_records_deleted: u64,
+    pub conflicts_deleted: u64,
+    pub revisions_deleted: u64,
+    pub objects_deleted: u64,
+}
+
 impl LocalDatabase {
     /// Open (or create) the local database.
     pub fn new(config: &Config) -> CoreResult<Self> {
@@ -543,18 +562,283 @@ impl LocalDatabase {
     }
 
     pub fn clean_completed_transfers(&self, hours: u64) -> CoreResult<u64> {
+        self.clean_completed_transfers_batched(hours, usize::MAX)
+    }
+
+    pub fn clean_completed_transfers_batched(&self, hours: u64, limit: usize) -> CoreResult<u64> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         let deleted = conn
             .execute(
-                "DELETE FROM transfer_queue WHERE status IN ('completed', 'failed') 
-                 AND updated_at < datetime('now', ?1)",
-                rusqlite::params![format!("-{} hours", hours)],
+                "DELETE FROM transfer_queue
+                 WHERE id IN (
+                     SELECT id FROM transfer_queue
+                     WHERE status IN ('completed', 'failed')
+                       AND updated_at < datetime('now', ?1)
+                     ORDER BY updated_at ASC
+                     LIMIT ?2
+                 )",
+                rusqlite::params![format!("-{} hours", hours), sql_limit(limit)],
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(deleted as u64)
+    }
+
+    pub fn live_local_file_candidates(&self, limit: usize) -> CoreResult<Vec<IndexedLocalFile>> {
+        self.live_local_file_candidates_after(0, limit)
+    }
+
+    pub fn live_local_file_candidates_after(
+        &self,
+        after_row_id: i64,
+        limit: usize,
+    ) -> CoreResult<Vec<IndexedLocalFile>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, file_id, local_path, s3_key, state
+                 FROM objects
+                 WHERE id > ?1
+                   AND local_path != ''
+                   AND is_folder = 0
+                   AND state IN ('synced', 'modified_locally')
+                 ORDER BY id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(
+                rusqlite::params![after_row_id.max(0), sql_limit(limit)],
+                |row| {
+                    Ok(IndexedLocalFile {
+                        row_id: row.get::<_, i64>(0)?,
+                        file_id: parse_uuid_column(row.get::<_, String>(1)?, 1)?,
+                        local_path: row.get::<_, String>(2)?,
+                        s3_key: row.get::<_, String>(3)?,
+                        state: row.get::<_, String>(4)?,
+                    })
+                },
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row.map_err(|e| CoreError::Database(e.to_string()))?);
+        }
+        Ok(files)
+    }
+
+    pub fn cancel_active_transfers_for_file(
+        &self,
+        file_id: &uuid::Uuid,
+        reason: &str,
+    ) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let updated = conn
+            .execute(
+                "UPDATE transfer_queue
+                 SET status = 'failed',
+                     error_message = ?2,
+                     updated_at = datetime('now')
+                 WHERE file_id = ?1
+                   AND status IN ('queued', 'in_progress', 'paused')",
+                rusqlite::params![file_id.to_string(), reason],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(updated as u64)
+    }
+
+    pub fn prune_activity_log(
+        &self,
+        retention_days: u64,
+        keep_min: usize,
+        limit: usize,
+    ) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM activity_log
+             WHERE id IN (
+                 SELECT id FROM activity_log
+                 WHERE timestamp < datetime('now', ?1)
+                   AND id NOT IN (
+                       SELECT id FROM activity_log
+                       ORDER BY timestamp DESC, id DESC
+                       LIMIT ?2
+                   )
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?3
+             )",
+            rusqlite::params![
+                format!("-{} days", retention_days),
+                sql_limit(keep_min),
+                sql_limit(limit)
+            ],
+        )
+        .map(|deleted| deleted as u64)
+        .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    pub fn prune_resolved_conflicts(
+        &self,
+        retention_days: u64,
+        limit: usize,
+    ) -> CoreResult<(u64, u64)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let records = conn
+            .execute(
+                "DELETE FROM conflict_records
+                 WHERE id IN (
+                     SELECT id FROM conflict_records
+                     WHERE status != 'open'
+                       AND COALESCE(resolved_at, created_at) < datetime('now', ?1)
+                     ORDER BY COALESCE(resolved_at, created_at) ASC, id ASC
+                     LIMIT ?2
+                 )",
+                rusqlite::params![format!("-{} days", retention_days), sql_limit(limit)],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let conflicts = conn
+            .execute(
+                "DELETE FROM conflicts
+                 WHERE id IN (
+                     SELECT id FROM conflicts
+                     WHERE status != 'open'
+                       AND COALESCE(resolved_at, created_at) < datetime('now', ?1)
+                     ORDER BY COALESCE(resolved_at, created_at) ASC, id ASC
+                     LIMIT ?2
+                 )",
+                rusqlite::params![format!("-{} days", retention_days), sql_limit(limit)],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok((records as u64, conflicts as u64))
+    }
+
+    pub fn prune_old_revisions(
+        &self,
+        retention_days: u64,
+        min_revisions_per_file: u32,
+        limit: usize,
+    ) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM revisions
+             WHERE revision_id IN (
+                 SELECT r.revision_id
+                 FROM revisions r
+                 WHERE r.created_at < datetime('now', ?1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM objects o
+                       WHERE o.current_revision_id = r.revision_id
+                   )
+                   AND (
+                       SELECT COUNT(*) FROM revisions newer
+                       WHERE newer.file_id = r.file_id
+                         AND (
+                             newer.created_at > r.created_at
+                             OR (newer.created_at = r.created_at AND newer.revision_id > r.revision_id)
+                         )
+                   ) >= ?2
+                 ORDER BY r.created_at ASC, r.revision_id ASC
+                 LIMIT ?3
+             )",
+            rusqlite::params![
+                format!("-{} days", retention_days),
+                min_revisions_per_file as i64,
+                sql_limit(limit)
+            ],
+        )
+        .map(|deleted| deleted as u64)
+        .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    pub fn prune_deleted_objects(&self, retention_days: u64, limit: usize) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_id FROM objects
+                 WHERE state IN ('deleted_locally', 'deleted_remotely')
+                   AND updated_at < datetime('now', ?1)
+                 ORDER BY updated_at ASC, id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![format!("-{} days", retention_days), sql_limit(limit)],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let mut file_ids = Vec::new();
+        for row in rows {
+            file_ids.push(row.map_err(|e| CoreError::Database(e.to_string()))?);
+        }
+        drop(stmt);
+
+        let mut deleted = 0u64;
+        for file_id in file_ids {
+            conn.execute(
+                "DELETE FROM transfer_queue WHERE file_id = ?1 AND status IN ('completed', 'failed')",
+                rusqlite::params![file_id],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM conflict_records WHERE file_id = ?1 AND status != 'open'",
+                rusqlite::params![file_id],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM conflicts WHERE file_id = ?1 AND status != 'open'",
+                rusqlite::params![file_id],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM revisions WHERE file_id = ?1",
+                rusqlite::params![file_id],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+            deleted += conn
+                .execute(
+                    "DELETE FROM objects WHERE file_id = ?1",
+                    rusqlite::params![file_id],
+                )
+                .map_err(|e| CoreError::Database(e.to_string()))? as u64;
+        }
+        Ok(deleted)
+    }
+
+    pub fn run_sqlite_maintenance(&self) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute_batch(
+            "PRAGMA optimize;
+             PRAGMA wal_checkpoint(PASSIVE);",
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
     }
 
     pub fn get_checkpoint(&self, name: &str) -> CoreResult<Option<String>> {
@@ -1349,6 +1633,10 @@ fn local_file_mtime_millis(local_path: &str) -> Option<String> {
         .map(|duration| duration.as_millis().to_string())
 }
 
+fn sql_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
 // ─── Structs for Phase 5 ─────────────────────────────────────────
 
 /// A file revision stored in SQLite.
@@ -1495,6 +1783,109 @@ mod tests {
             db.get_checkpoint("remote_head").unwrap(),
             Some("op-2".to_string())
         );
+    }
+
+    #[test]
+    fn live_local_file_candidates_only_returns_synced_existing_states() {
+        let db = test_db();
+        let synced_path = temp_file("synced.txt", b"synced");
+        let pending_path = temp_file("pending.txt", b"pending");
+        let download_path = temp_file("download.txt", b"download");
+        let synced = file_entry("synced.txt", 6);
+        let pending = file_entry("pending.txt", 7);
+        let download = file_entry("download.txt", 8);
+
+        db.register_file_at_path_with_state(
+            &synced,
+            &synced_path.to_string_lossy(),
+            "synced.txt",
+            "synced",
+        )
+        .unwrap();
+        db.register_file_at_path_with_state(
+            &pending,
+            &pending_path.to_string_lossy(),
+            "pending.txt",
+            "pending_upload",
+        )
+        .unwrap();
+        db.register_file_at_path_with_state(
+            &download,
+            &download_path.to_string_lossy(),
+            "download.txt",
+            "pending_download",
+        )
+        .unwrap();
+
+        let candidates = db.live_local_file_candidates(10).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].file_id, synced.file_id);
+        assert_eq!(candidates[0].state, "synced");
+        assert!(db
+            .live_local_file_candidates_after(candidates[0].row_id, 10)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_file(synced_path);
+        let _ = std::fs::remove_file(pending_path);
+        let _ = std::fs::remove_file(download_path);
+    }
+
+    #[test]
+    fn maintenance_cleanup_prunes_old_rows_in_batches() {
+        let db = test_db();
+        let path = temp_file("deleted.txt", b"deleted");
+        let entry = file_entry("deleted.txt", 7);
+        let file_id = entry.file_id.to_string();
+
+        db.register_file_at_path_with_state(
+            &entry,
+            &path.to_string_lossy(),
+            "deleted.txt",
+            "synced",
+        )
+        .unwrap();
+        db.enqueue_transfer(
+            "upload",
+            &file_id,
+            &path.to_string_lossy(),
+            "deleted.txt",
+            7,
+        )
+        .unwrap();
+        db.update_transfer_status(1, "completed").unwrap();
+        db.mark_file_deleted(&entry.file_id).unwrap();
+        db.ensure_activity_table().unwrap();
+        db.insert_activity(&crate::sync::activity::ActivityEntry {
+            action: "old".to_string(),
+            file_id: file_id.clone(),
+            path: "deleted.txt".to_string(),
+            status: "done".to_string(),
+            timestamp: "2000-01-01T00:00:00Z".to_string(),
+        })
+        .unwrap();
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE transfer_queue SET updated_at = datetime('now', '-48 hours')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE objects SET updated_at = datetime('now', '-120 days') WHERE file_id = ?1",
+                rusqlite::params![file_id],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(db.clean_completed_transfers_batched(24, 10).unwrap(), 1);
+        assert_eq!(db.prune_activity_log(30, 0, 10).unwrap(), 1);
+        assert_eq!(db.prune_deleted_objects(90, 10).unwrap(), 1);
+        assert!(db.get_file(&entry.file_id).unwrap().is_none());
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

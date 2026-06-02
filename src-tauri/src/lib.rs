@@ -1711,6 +1711,7 @@ async fn run_sync_now_with_options(
         config.sync_folder.max_concurrent_uploads,
         config.sync_folder.max_concurrent_downloads,
         &config.sync_folder.exclude_patterns,
+        config.maintenance.clone(),
     );
 
     if !mark_sync_requested(&app, state, notify_user) {
@@ -1782,10 +1783,17 @@ async fn run_sync_now_with_options(
             pending_uploads, pending_downloads
         ));
     }
+    if result.maintenance_actions > 0 {
+        message.push_str(&format!(
+            "; {} maintenance action(s)",
+            result.maintenance_actions
+        ));
+    }
 
     let meaningful_activity = result.files_uploaded > 0
         || result.files_downloaded > 0
         || result.conflicts_detected > 0
+        || result.maintenance_actions > 0
         || bucket_initialized;
     if notify_user || meaningful_activity {
         if let Ok(activity) = ActivityLog::new(&activity_db) {

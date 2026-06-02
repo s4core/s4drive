@@ -9,6 +9,9 @@ pub struct Config {
     pub sync_folder: SyncFolderConfig,
     /// Core behavior settings
     pub core: CoreConfig,
+    /// Bounded lifecycle cleanup and reconciliation settings
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +45,44 @@ pub struct CoreConfig {
     pub max_retries: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaintenanceConfig {
+    pub enabled: bool,
+    pub local_delete_batch_size: usize,
+    pub transfer_retention_hours: u64,
+    pub activity_retention_days: u64,
+    pub activity_keep_min: usize,
+    pub resolved_conflict_retention_days: u64,
+    pub deleted_object_retention_days: u64,
+    pub revision_retention_days: u64,
+    pub min_revisions_per_file: u32,
+    pub remote_tombstone_retention_days: u32,
+    pub remote_tombstone_batch_size: usize,
+    pub remote_snapshot_keep: u32,
+    pub sqlite_maintenance: bool,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            local_delete_batch_size: 250,
+            transfer_retention_hours: 24,
+            activity_retention_days: 30,
+            activity_keep_min: 1_000,
+            resolved_conflict_retention_days: 30,
+            deleted_object_retention_days: 90,
+            revision_retention_days: 90,
+            min_revisions_per_file: 10,
+            remote_tombstone_retention_days: 90,
+            remote_tombstone_batch_size: 250,
+            remote_snapshot_keep: 5,
+            sqlite_maintenance: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -67,6 +108,7 @@ impl Default for Config {
                 log_level: "info".into(),
                 max_retries: 3,
             },
+            maintenance: MaintenanceConfig::default(),
         }
     }
 }
@@ -120,5 +162,36 @@ mod tests {
         assert_eq!(loaded.sync_folder.local_path, config.sync_folder.local_path);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_old_config_without_maintenance_uses_defaults() {
+        let text = r#"
+[s3]
+endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+bucket = "s4drive-test"
+access_key_id = "minioadmin"
+use_tls = false
+
+[sync_folder]
+local_path = "/tmp/s4drive"
+bucket_prefix = "/"
+polling_interval_sec = 30
+max_concurrent_uploads = 4
+max_concurrent_downloads = 4
+exclude_patterns = []
+
+[core]
+db_path = ":memory:"
+log_level = "info"
+max_retries = 3
+"#;
+
+        let config: Config = toml::from_str(text).unwrap();
+
+        assert!(config.maintenance.enabled);
+        assert_eq!(config.maintenance.local_delete_batch_size, 250);
+        assert_eq!(config.maintenance.remote_tombstone_retention_days, 90);
     }
 }

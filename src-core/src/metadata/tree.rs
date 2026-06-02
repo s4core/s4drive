@@ -19,6 +19,13 @@ pub struct FileTreePage {
     pub is_truncated: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct TombstonePage {
+    pub ids: Vec<FileId>,
+    pub next_continuation_token: Option<String>,
+    pub is_truncated: bool,
+}
+
 impl<'a> FileTree<'a> {
     pub fn new(s3: &'a S3Adapter) -> Self {
         Self { s3 }
@@ -172,13 +179,36 @@ impl<'a> TombstoneManager<'a> {
         let keys = self.s3.list_objects(&Self::tombstone_prefix()).await?;
         let ids: Vec<FileId> = keys
             .iter()
-            .filter_map(|k| {
-                k.strip_prefix(".s4drive/trash/tombstones/")
-                    .and_then(|s| s.strip_suffix(".json"))
-                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            })
+            .filter_map(|k| tombstone_key_to_file_id(k))
             .collect();
         Ok(ids)
+    }
+
+    /// One page of tombstone file_id values.
+    pub async fn list_tombstones_page(
+        &self,
+        continuation_token: Option<&str>,
+        max_keys: i32,
+    ) -> CoreResult<TombstonePage> {
+        let page = self
+            .s3
+            .list_objects_page(
+                &Self::tombstone_prefix(),
+                None,
+                max_keys,
+                continuation_token,
+            )
+            .await?;
+        let ids = page
+            .keys
+            .iter()
+            .filter_map(|key| tombstone_key_to_file_id(key))
+            .collect();
+        Ok(TombstonePage {
+            ids,
+            next_continuation_token: page.next_continuation_token,
+            is_truncated: page.is_truncated,
+        })
     }
 
     /// GC: удалить tombstones у которых истёк retention.
@@ -210,6 +240,12 @@ impl<'a> TombstoneManager<'a> {
     pub async fn tombstone_count(&self) -> CoreResult<usize> {
         self.list_tombstones().await.map(|v| v.len())
     }
+}
+
+fn tombstone_key_to_file_id(key: &str) -> Option<FileId> {
+    key.strip_prefix(".s4drive/trash/tombstones/")
+        .and_then(|s| s.strip_suffix(".json"))
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
 }
 
 #[cfg(test)]

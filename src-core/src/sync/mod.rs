@@ -11,6 +11,7 @@ pub mod activity;
 pub mod conflict;
 pub mod conflict_engine;
 pub mod download;
+pub mod maintenance;
 pub mod versions;
 
 pub use activity::ActivityLog;
@@ -19,6 +20,7 @@ pub use conflict_engine::{ConflictDetector, ConflictEngine, ConflictResolution, 
 pub use download::DownloadEngine;
 pub use versions::{VersionApi, VersionHistory, VersionInfo};
 
+use crate::config::MaintenanceConfig;
 use crate::db::LocalDatabase;
 use crate::error::{CoreError, CoreResult};
 use crate::metadata::blobs::{hash_file_blake3, BlobStore};
@@ -33,6 +35,7 @@ use crate::optimization::{clamp_concurrency, AdaptiveConcurrency, IdleBackoff};
 use crate::s3::S3Adapter;
 use crate::transfer::TransferQueue;
 use crate::watcher::{FsEvent, FsEventStream};
+use maintenance::SyncMaintenance;
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +99,7 @@ pub struct SyncEngine {
     max_concurrent_uploads: u32,
     max_concurrent_downloads: u32,
     exclude_patterns: Vec<String>,
+    maintenance_config: MaintenanceConfig,
 
     configured: bool,
     sync_folder: String,
@@ -128,6 +132,7 @@ impl SyncEngine {
             max_concurrent_uploads: crate::optimization::DEFAULT_MAX_CONCURRENT,
             max_concurrent_downloads: crate::optimization::DEFAULT_MAX_CONCURRENT,
             exclude_patterns: crate::config::default_exclude_patterns(),
+            maintenance_config: MaintenanceConfig::default(),
             configured: false,
             sync_folder: String::new(),
             event_stream: None,
@@ -156,6 +161,7 @@ impl SyncEngine {
         max_concurrent_uploads: u32,
         max_concurrent_downloads: u32,
         exclude_patterns: &[String],
+        maintenance_config: MaintenanceConfig,
     ) {
         self.event_stream = Some(Arc::new(Mutex::new(event_stream)));
         self.metadata = Some(metadata);
@@ -179,6 +185,7 @@ impl SyncEngine {
         self.max_concurrent_uploads = clamp_concurrency(max_concurrent_uploads);
         self.max_concurrent_downloads = clamp_concurrency(max_concurrent_downloads);
         self.exclude_patterns = exclude_patterns.to_vec();
+        self.maintenance_config = maintenance_config;
         self.conflict = Some(ConflictHandler::new());
         self.conflict_engine = Some(ConflictEngine::new(
             Some(db.clone()),
@@ -273,12 +280,14 @@ impl SyncEngine {
         let max_concurrent_uploads = self.max_concurrent_uploads;
         let max_concurrent_downloads = self.max_concurrent_downloads;
         let exclude_patterns = self.exclude_patterns.clone();
+        let maintenance_config = self.maintenance_config.clone();
         let handle = tokio::spawn(async move {
             let mut idle_backoff = IdleBackoff::new();
+            let maintenance = SyncMaintenance::new(maintenance_config);
             tracing::info!("Sync loop started");
             set_state(&state, SyncState::Idle);
 
-            if let Ok(result) = run_initial_sync(
+            if let Ok(mut result) = run_initial_sync(
                 &sync_folder,
                 &transfer,
                 &metadata,
@@ -297,12 +306,19 @@ impl SyncEngine {
             )
             .await
             {
+                apply_maintenance_report(
+                    &mut result,
+                    maintenance
+                        .run_once(download.s3(), &metadata, &db, &activity, &sync_folder)
+                        .await,
+                );
                 if result.has_activity() {
                     tracing::info!(
-                        "Initial sync: {} up, {} down, {} conflicts",
+                        "Initial sync: {} up, {} down, {} conflicts, {} maintenance actions",
                         result.files_uploaded,
                         result.files_downloaded,
                         result.conflicts_detected,
+                        result.maintenance_actions,
                     );
                 }
             };
@@ -333,13 +349,20 @@ impl SyncEngine {
                 )
                 .await
                 {
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        apply_maintenance_report(
+                            &mut result,
+                            maintenance
+                                .run_once(download.s3(), &metadata, &db, &activity, &sync_folder)
+                                .await,
+                        );
                         if result.has_activity() {
                             tracing::info!(
-                                "Sync cycle: {} up, {} down, {} conflicts",
+                                "Sync cycle: {} up, {} down, {} conflicts, {} maintenance actions",
                                 result.files_uploaded,
                                 result.files_downloaded,
                                 result.conflicts_detected,
+                                result.maintenance_actions,
                             );
                             idle_backoff.reset();
                             if let Ok(mut iv) = interval.lock() {
@@ -482,7 +505,7 @@ impl SyncEngine {
 
         self.running.store(true, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
-        let result = run_initial_sync(
+        let mut result = run_initial_sync(
             &self.sync_folder,
             &transfer,
             &metadata,
@@ -500,6 +523,15 @@ impl SyncEngine {
             &self.exclude_patterns,
         )
         .await;
+        if let Ok(result) = result.as_mut() {
+            let maintenance = SyncMaintenance::new(self.maintenance_config.clone());
+            apply_maintenance_report(
+                result,
+                maintenance
+                    .run_once(download.s3(), &metadata, &db, &activity, &self.sync_folder)
+                    .await,
+            );
+        }
         self.running.store(false, Ordering::Relaxed);
         set_state(&self.current_state, SyncState::Idle);
         result
@@ -518,6 +550,7 @@ impl Clone for SyncEngine {
             max_concurrent_uploads: self.max_concurrent_uploads,
             max_concurrent_downloads: self.max_concurrent_downloads,
             exclude_patterns: self.exclude_patterns.clone(),
+            maintenance_config: self.maintenance_config.clone(),
             configured: self.configured,
             sync_folder: self.sync_folder.clone(),
             event_stream: self.event_stream.clone(),
@@ -568,6 +601,7 @@ pub struct SyncResult {
     pub conflicts_detected: u32,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
+    pub maintenance_actions: u32,
     pub errors: Vec<String>,
 }
 
@@ -579,12 +613,33 @@ impl SyncResult {
             conflicts_detected: 0,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
+            maintenance_actions: 0,
             errors: Vec::new(),
         }
     }
 
     pub fn has_activity(&self) -> bool {
-        self.files_uploaded > 0 || self.files_downloaded > 0 || self.conflicts_detected > 0
+        self.files_uploaded > 0
+            || self.files_downloaded > 0
+            || self.conflicts_detected > 0
+            || self.maintenance_actions > 0
+    }
+}
+
+fn apply_maintenance_report(
+    result: &mut SyncResult,
+    report: CoreResult<maintenance::MaintenanceReport>,
+) {
+    match report {
+        Ok(report) => {
+            result.maintenance_actions = result
+                .maintenance_actions
+                .saturating_add(report.total_actions().min(u32::MAX as u64) as u32);
+        }
+        Err(error) => {
+            tracing::warn!("Maintenance pass failed: {}", error);
+            result.errors.push(format!("maintenance: {}", error));
+        }
     }
 }
 
