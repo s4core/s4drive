@@ -162,6 +162,7 @@ pub struct SyncStatus {
     pub paused: bool,
     pub state: String,
     pub conflicts: u32,
+    pub total_files: Option<usize>,
     pub last_sync: Option<String>,
     pub last_summary: Option<String>,
     pub detail: String,
@@ -942,6 +943,13 @@ fn pending_transfer_count(app: &AppHandle, settings: &DesktopSettings) -> usize 
         .unwrap_or(0)
 }
 
+fn local_live_file_count(app: &AppHandle, settings: &DesktopSettings) -> Option<usize> {
+    let config = app_local_config(app, settings);
+    LocalDatabase::new(&config)
+        .and_then(|db| db.count_live_objects())
+        .ok()
+}
+
 fn local_folder_signature(settings: &DesktopSettings, root: &Path) -> Result<String, String> {
     let mut entries = Vec::new();
     let files = local_scan(settings, root, DESKTOP_SYNC_SCAN_LIMIT)?;
@@ -1054,6 +1062,7 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
         }
         .to_string(),
         conflicts,
+        total_files: None,
         last_sync,
         last_summary,
         detail,
@@ -1481,8 +1490,14 @@ pub fn update_tray_status(
 // IPC Commands
 
 #[tauri::command]
-fn get_sync_status(state: tauri::State<'_, AppState>) -> Result<SyncStatus, String> {
-    current_sync_status(state.inner())
+fn get_sync_status(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<SyncStatus, String> {
+    let mut status = current_sync_status(state.inner())?;
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    status.total_files = local_live_file_count(&app, &settings);
+    Ok(status)
 }
 
 #[tauri::command]

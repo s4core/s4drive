@@ -31,7 +31,7 @@
       use_tls: true,
       large_sync_confirmed: false,
     },
-    sync: { running: false, paused: false, state: 'idle', conflicts: 0, lastSync: null, detail: 'Idle' },
+    sync: { running: false, paused: false, state: 'idle', conflicts: 0, total_files: null, lastSync: null, detail: 'Idle' },
     files: [],
     fileQuery: '',
     fileView: 'list',
@@ -148,6 +148,13 @@
     badge.title = status.detail || next;
   }
 
+  function updateTotalFiles() {
+    const total = Number.isFinite(state.sync?.total_files)
+      ? state.sync.total_files
+      : (state.files.length || 0);
+    document.getElementById('totalFiles').textContent = String(total);
+  }
+
   // ─── Dashboard ───────────────────────────────────────────────
   async function refreshDashboard() {
     try {
@@ -157,7 +164,7 @@
       syncState.textContent = sync.state || '—';
       syncState.title = sync.detail || sync.state || '';
       document.getElementById('conflictCount').textContent = sync.conflicts ?? 0;
-      document.getElementById('totalFiles').textContent = String(state.files.length || 0);
+      updateTotalFiles();
       document.getElementById('transferCount').textContent = String(state.transfers.length || 0);
       document.getElementById('btnPauseSync').textContent = sync.paused ? 'Resume Sync' : 'Pause Sync';
       updateStatusBadge(sync);
@@ -176,7 +183,7 @@
       }
       renderFiles();
       renderFileDetails();
-      document.getElementById('totalFiles').textContent = String(state.files.length || 0);
+      updateTotalFiles();
     } catch(e) {
       renderFileError(humanizeError(e));
     }
@@ -906,7 +913,11 @@
     });
 
     await listen('sync-status-changed', (event) => {
-      state.sync = event.payload;
+      const previousTotal = state.sync?.total_files;
+      state.sync = event.payload || {};
+      if (!Number.isFinite(state.sync.total_files)) {
+        state.sync.total_files = previousTotal;
+      }
       updateStatusBadge(state.sync);
       const syncState = document.getElementById('syncState');
       if (syncState) {

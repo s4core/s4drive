@@ -565,6 +565,22 @@ impl LocalDatabase {
         Ok(count as usize)
     }
 
+    pub fn count_live_objects(&self) -> CoreResult<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM objects
+                 WHERE state NOT IN ('deleted_locally', 'deleted_remotely', 'ignored')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(count as usize)
+    }
+
     pub fn sum_pending_bytes(&self, direction: &str) -> CoreResult<u64> {
         let conn = self
             .conn
@@ -1929,6 +1945,29 @@ mod tests {
         assert!(snapshot.local_mtime.is_some());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn count_live_objects_excludes_deleted_and_ignored() {
+        let db = test_db();
+        let live = file_entry("live.txt", 1);
+        let deleted = file_entry("deleted.txt", 1);
+        let ignored = file_entry("ignored.txt", 1);
+
+        db.register_file_at_path_with_state(&live, "/tmp/live.txt", "live.txt", "pending_upload")
+            .unwrap();
+        db.register_file_at_path_with_state(
+            &deleted,
+            "/tmp/deleted.txt",
+            "deleted.txt",
+            "deleted_locally",
+        )
+        .unwrap();
+        db.register_file_at_path_with_state(&ignored, "/tmp/ignored.txt", "ignored.txt", "ignored")
+            .unwrap();
+
+        assert_eq!(db.count_objects().unwrap(), 3);
+        assert_eq!(db.count_live_objects().unwrap(), 1);
     }
 
     #[test]
