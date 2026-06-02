@@ -9,6 +9,8 @@ use crate::sync::SyncEngine;
 use crate::transfer::TransferQueue;
 use crate::watcher::{FileWatcher, FsEventStream};
 
+const LOCAL_DEVICE_ID_CHECKPOINT: &str = "local_device_id";
+
 /// S4Drive Core lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CoreState {
@@ -138,7 +140,7 @@ impl S4DriveCore {
         self.diagnostics.log("S3 Level 2 prerequisites OK");
 
         // 5. Create MetadataEngine
-        let device_id = uuid::Uuid::now_v7();
+        let device_id = local_device_id(&db)?;
         let metadata = MetadataEngine::new(s3.clone(), device_id);
         self.diagnostics.log("MetadataEngine created");
 
@@ -291,5 +293,42 @@ impl S4DriveCore {
         self.state == CoreState::Running
             && self.s3.as_ref().map(|s| s.is_connected()).unwrap_or(false)
             && self.db.as_ref().map(|d| d.is_healthy()).unwrap_or(false)
+    }
+}
+
+fn local_device_id(db: &LocalDatabase) -> CoreResult<uuid::Uuid> {
+    if let Some(value) = db.get_checkpoint(LOCAL_DEVICE_ID_CHECKPOINT)? {
+        if let Ok(device_id) = uuid::Uuid::parse_str(&value) {
+            return Ok(device_id);
+        }
+        tracing::warn!("Ignoring invalid local device id checkpoint: {}", value);
+    }
+
+    let device_id = uuid::Uuid::now_v7();
+    db.set_checkpoint(LOCAL_DEVICE_ID_CHECKPOINT, &device_id.to_string())?;
+    Ok(device_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> LocalDatabase {
+        let mut config = Config::default();
+        config.core.db_path = ":memory:".to_string();
+        LocalDatabase::new(&config).unwrap()
+    }
+
+    #[test]
+    fn local_device_id_is_reused_from_checkpoint() {
+        let db = test_db();
+        let first = local_device_id(&db).unwrap();
+        let second = local_device_id(&db).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            db.get_checkpoint(LOCAL_DEVICE_ID_CHECKPOINT).unwrap(),
+            Some(first.to_string())
+        );
     }
 }

@@ -14,6 +14,7 @@
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 pub mod blobs;
+pub mod compaction;
 pub mod engine;
 pub mod graph;
 pub mod ops;

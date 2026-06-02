@@ -980,7 +980,9 @@ impl LocalDatabase {
     }
 
     pub fn local_content_references_blob(&self, raw_hash: &str) -> CoreResult<bool> {
-        let local_hash = format!("b3:{}", raw_hash);
+        let raw_hash = raw_hash.trim_start_matches("blake3:");
+        let local_hash = format!("blake3:{}", raw_hash);
+        let blob_key = crate::metadata::serializer::Serializer::blob_key(raw_hash);
         let conn = self
             .conn
             .lock()
@@ -989,19 +991,14 @@ impl LocalDatabase {
             .query_row(
                 "SELECT
                     (SELECT COUNT(*) FROM objects
-                     WHERE content_hash IN (?1, ?2)
-                        OR local_hash IN (?1, ?2)
+                     WHERE local_hash IN (?1, ?2)
                         OR s3_key = ?3)
                   + (SELECT COUNT(*) FROM revisions
                      WHERE content_hash IN (?1, ?2))
                   + (SELECT COUNT(*) FROM transfer_queue
                      WHERE s3_key = ?3
                        AND status IN ('queued', 'in_progress', 'paused'))",
-                rusqlite::params![
-                    raw_hash,
-                    local_hash,
-                    crate::metadata::serializer::Serializer::blob_key(raw_hash)
-                ],
+                rusqlite::params![raw_hash, local_hash, blob_key],
                 |row| row.get(0),
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
@@ -2082,6 +2079,55 @@ mod tests {
             .is_empty());
 
         db.remove_remote_blob_gc_candidate(&blob_key).unwrap();
+    }
+
+    #[test]
+    fn local_content_references_blob_matches_local_hash_revision_and_transfer() {
+        let db = test_db();
+        let object_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+        let revision_hash = "2222222222222222222222222222222222222222222222222222222222222222";
+        let transfer_hash = "3333333333333333333333333333333333333333333333333333333333333333";
+        let missing_hash = "4444444444444444444444444444444444444444444444444444444444444444";
+
+        let mut object_entry = file_entry("object.txt", 1);
+        object_entry.content_hash = Some(format!("blake3:{}", object_hash));
+        db.register_local_file_at_path(&object_entry, "/tmp/object.txt", "object.txt")
+            .unwrap();
+
+        let revision_entry = file_entry("revision.txt", 2);
+        db.register_local_file(&revision_entry).unwrap();
+        db.insert_revision(&RevisionRecord {
+            revision_id: uuid::Uuid::now_v7().to_string(),
+            file_id: revision_entry.file_id.to_string(),
+            parent_revision_id: None,
+            content_hash: Some(format!("blake3:{}", revision_hash)),
+            size: 2,
+            mime: None,
+            author_device_id: "device-1".to_string(),
+            author_name: "Device".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            merge_state: "clean".to_string(),
+            conflict_revision_id: None,
+        })
+        .unwrap();
+
+        let transfer_key = crate::metadata::serializer::Serializer::blob_key(transfer_hash);
+        db.enqueue_transfer(
+            "upload",
+            &uuid::Uuid::now_v7().to_string(),
+            "/tmp/transfer.txt",
+            &transfer_key,
+            3,
+        )
+        .unwrap();
+
+        assert!(db.local_content_references_blob(object_hash).unwrap());
+        assert!(db
+            .local_content_references_blob(&format!("blake3:{}", object_hash))
+            .unwrap());
+        assert!(db.local_content_references_blob(revision_hash).unwrap());
+        assert!(db.local_content_references_blob(transfer_hash).unwrap());
+        assert!(!db.local_content_references_blob(missing_hash).unwrap());
     }
 
     #[test]

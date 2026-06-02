@@ -165,6 +165,7 @@ impl SyncEngine {
         exclude_patterns: &[String],
         maintenance_config: MaintenanceConfig,
     ) {
+        let device_id = metadata.device_id().to_string();
         self.event_stream = Some(Arc::new(Mutex::new(event_stream)));
         self.metadata = Some(metadata);
         self.transfer = Some(transfer);
@@ -175,7 +176,6 @@ impl SyncEngine {
             ActivityLog::new_in_memory()
         });
 
-        let device_id = uuid::Uuid::now_v7().to_string();
         let device_name = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| "device".to_string());
@@ -1826,7 +1826,17 @@ async fn poll_remote_changes(
             reached_checkpoint = true;
             break;
         }
-        let op = ops_log.read_operation(&cursor).await?;
+        let op = match ops_log.read_operation(&cursor).await {
+            Ok(op) => op,
+            Err(CoreError::NotFound(_)) => {
+                tracing::warn!(
+                    "Remote op {} is no longer available; falling back to remote tree scan",
+                    cursor
+                );
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         let previous = op.base_head.clone();
         ops.push(op);
         if previous.is_empty() {

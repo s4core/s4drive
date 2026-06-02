@@ -30,7 +30,7 @@ pub use core::S4DriveCore;
 pub use error::CoreError;
 pub use metadata::types::{
     BlobId, BucketDescriptor, ContentBlob, ContentRef, Device, DeviceCapabilities, DeviceId,
-    Effects, EncryptionInfo, EntryType, FileAttributes, FileEntry, FileId, FileLock, LockMode,
-    LockState, MergeState, OpId, OpType, Operation, Preconditions, Revision, RevisionId, Timestamp,
-    Tombstone,
+    DeviceWatermark, DeviceWatermarkStatus, Effects, EncryptionInfo, EntryType, FileAttributes,
+    FileEntry, FileId, FileLock, LockMode, LockState, MergeState, OpId, OpType, Operation,
+    Preconditions, Revision, RevisionId, SnapshotMetadata, Timestamp, Tombstone,
 };

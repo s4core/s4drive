@@ -1,6 +1,6 @@
 use crate::error::{CoreError, CoreResult};
 use crate::metadata::serializer::Serializer;
-use crate::metadata::types::FileEntry;
+use crate::metadata::types::{FileEntry, SnapshotMetadata};
 use crate::s3::S3Adapter;
 use std::collections::BTreeMap;
 
@@ -20,21 +20,31 @@ impl<'a> SnapshotManager<'a> {
 
     /// Записать снепшот (полный дамп дерева).
     pub async fn write_snapshot(&self, entries: &[FileEntry], seq_num: u64) -> CoreResult<String> {
+        self.write_snapshot_for_head(entries, seq_num, None).await
+    }
+
+    /// Записать снепшот with the op head it compactly represents.
+    pub async fn write_snapshot_for_head(
+        &self,
+        entries: &[FileEntry],
+        seq_num: u64,
+        covered_head: Option<&str>,
+    ) -> CoreResult<String> {
         let json = Serializer::serialize_file_tree(entries)?;
         let key = Serializer::snapshot_key(seq_num);
         let etag = self.s3.put_metadata(&key, &json).await?;
-        let metadata = serde_json::json!({
-            "schema_version": crate::metadata::SUPPORTED_SCHEMA_VERSION,
-            "seq_num": seq_num,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "entry_count": entries.len(),
-            "tree_key": key,
-        });
+        let metadata = SnapshotMetadata {
+            schema_version: crate::metadata::SUPPORTED_SCHEMA_VERSION,
+            seq_num,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            entry_count: entries.len(),
+            tree_key: key,
+            covered_head: covered_head.map(ToString::to_string),
+        };
         self.s3
             .put_metadata(
                 &Serializer::snapshot_metadata_key(seq_num),
-                &serde_json::to_string_pretty(&metadata)
-                    .map_err(|e| CoreError::Protocol(e.to_string()))?,
+                &Serializer::serialize_snapshot_metadata(&metadata)?,
             )
             .await?;
         self.s3
@@ -50,6 +60,14 @@ impl<'a> SnapshotManager<'a> {
             etag
         );
         Ok(etag)
+    }
+
+    pub async fn read_snapshot_metadata(&self, seq_num: u64) -> CoreResult<SnapshotMetadata> {
+        let key = Serializer::snapshot_metadata_key(seq_num);
+        let data = self.s3.get_object(&key).await?;
+        let text = String::from_utf8(data)
+            .map_err(|e| CoreError::Protocol(format!("snapshot metadata UTF-8: {}", e)))?;
+        Serializer::deserialize_snapshot_metadata(&text)
     }
 
     /// Прочитать снепшот по номеру.
@@ -155,5 +173,22 @@ mod tests {
             Serializer::snapshot_latest_key(),
             ".s4drive/meta/snapshots/LATEST"
         );
+    }
+
+    #[test]
+    fn snapshot_metadata_preserves_covered_head() {
+        let metadata = SnapshotMetadata {
+            schema_version: crate::metadata::SUPPORTED_SCHEMA_VERSION,
+            seq_num: 42,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            entry_count: 7,
+            tree_key: Serializer::snapshot_key(42),
+            covered_head: Some("device:1:op".to_string()),
+        };
+
+        let json = Serializer::serialize_snapshot_metadata(&metadata).unwrap();
+        let parsed = Serializer::deserialize_snapshot_metadata(&json).unwrap();
+
+        assert_eq!(parsed, metadata);
     }
 }

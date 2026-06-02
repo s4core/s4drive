@@ -4,7 +4,9 @@ use super::{handle_local_delete, ActivityLog};
 use crate::config::MaintenanceConfig;
 use crate::db::{LocalDatabase, LocalMaintenanceStats, RemoteBlobGcCandidate};
 use crate::error::{CoreError, CoreResult};
+use crate::metadata::compaction::{DeviceWatermarks, OpLogCompactor};
 use crate::metadata::engine::MetadataEngine;
+use crate::metadata::ops::OperationLog;
 use crate::metadata::serializer::Serializer;
 use crate::metadata::snapshots::SnapshotManager;
 use crate::metadata::tree::{FileTree, TombstoneManager};
@@ -20,6 +22,7 @@ const BLOB_DISCOVERY_CURSOR_CHECKPOINT: &str = "maintenance_blob_discovery_curso
 const TOMBSTONE_PAGE_SIZE: i32 = 250;
 const TOMBSTONE_MAX_PAGES_PER_PASS: usize = 4;
 const BLOB_DISCOVERY_MAX_PAGES_PER_PASS: usize = 2;
+const REMOTE_SNAPSHOT_PAGE_SIZE: i32 = 1000;
 const SNAPSHOT_PREFIX: &str = ".s4drive/meta/snapshots/";
 const OPS_PREFIX: &str = ".s4drive/meta/ops/";
 
@@ -30,6 +33,10 @@ pub struct MaintenanceReport {
     pub local: LocalMaintenanceStats,
     pub remote_tombstones_deleted: u64,
     pub remote_snapshots_deleted: u64,
+    pub remote_snapshots_written: u64,
+    pub remote_ops_deleted: u64,
+    pub remote_op_watermarks_updated: u64,
+    pub remote_op_compaction_errors: u64,
     pub remote_blob_candidates_seen: u64,
     pub remote_blob_candidates_retained: u64,
     pub remote_blobs_deleted: u64,
@@ -49,6 +56,8 @@ impl MaintenanceReport {
             + self.local.objects_deleted
             + self.remote_tombstones_deleted
             + self.remote_snapshots_deleted
+            + self.remote_snapshots_written
+            + self.remote_ops_deleted
             + self.remote_blobs_deleted
     }
 }
@@ -82,8 +91,21 @@ impl SyncMaintenance {
         report.canceled_transfers = canceled;
         report.local = self.run_local_db_gc(db)?;
         report.remote_tombstones_deleted = self.collect_expired_remote_tombstones(s3, db).await?;
+        if self.config.remote_op_compaction_enabled {
+            match self.maintain_remote_op_log(s3, metadata).await {
+                Ok(op_report) => {
+                    report.remote_snapshots_written = op_report.snapshots_written;
+                    report.remote_ops_deleted = op_report.ops_deleted;
+                    report.remote_op_watermarks_updated = op_report.watermarks_updated;
+                }
+                Err(error) => {
+                    report.remote_op_compaction_errors = 1;
+                    tracing::warn!("Remote op-log compaction skipped: {}", error);
+                }
+            }
+        }
         report.remote_snapshots_deleted = SnapshotManager::new(s3)
-            .prune_snapshots(self.config.remote_snapshot_keep)
+            .prune_snapshots(self.config.remote_snapshot_keep.max(1))
             .await? as u64;
         if self.config.remote_blob_gc_enabled {
             report.remote_blob_candidates_seen =
@@ -104,6 +126,85 @@ impl SyncMaintenance {
         }
 
         Ok(report)
+    }
+
+    async fn maintain_remote_op_log(
+        &self,
+        s3: &S3Adapter,
+        metadata: &MetadataEngine,
+    ) -> CoreResult<RemoteOpMaintenanceReport> {
+        let compactor = OpLogCompactor::new(s3);
+        let snapshot_manager = SnapshotManager::new(s3);
+        metadata
+            .upsert_device_registration(&current_device_name())
+            .await?;
+        let current_head = remote_head_for_maintenance(s3).await?;
+        let mut latest_snapshot = compactor.latest_snapshot_metadata().await?;
+        let mut report = RemoteOpMaintenanceReport::default();
+
+        if self
+            .should_write_remote_snapshot(&compactor, &current_head, latest_snapshot.as_ref())
+            .await?
+        {
+            let seq_num = latest_snapshot
+                .as_ref()
+                .map(|metadata| metadata.seq_num + 1)
+                .unwrap_or(1);
+            let entries = collect_remote_tree_entries_for_snapshot(s3).await?;
+            snapshot_manager
+                .write_snapshot_for_head(&entries, seq_num, Some(&current_head))
+                .await?;
+            latest_snapshot = Some(snapshot_manager.read_snapshot_metadata(seq_num).await?);
+            report.snapshots_written = 1;
+        }
+
+        let applied_snapshot_seq = latest_snapshot
+            .as_ref()
+            .map(|metadata| metadata.seq_num)
+            .unwrap_or(0);
+        DeviceWatermarks::new(s3)
+            .update(metadata.device_id(), applied_snapshot_seq, &current_head)
+            .await?;
+        report.watermarks_updated = 1;
+
+        if let Some(snapshot) = latest_snapshot.as_ref() {
+            let compaction = compactor
+                .compact(
+                    snapshot,
+                    self.config.remote_op_compaction_batch_size.max(1),
+                    self.config.remote_op_watermark_stale_days,
+                )
+                .await?;
+            report.ops_deleted = compaction.pruned_ops;
+            if let Some(reason) = compaction.skipped_reason {
+                tracing::debug!("Remote op-log compaction skipped: {}", reason);
+            }
+        }
+
+        Ok(report)
+    }
+
+    async fn should_write_remote_snapshot(
+        &self,
+        compactor: &OpLogCompactor<'_, S3Adapter>,
+        current_head: &str,
+        latest_snapshot: Option<&crate::metadata::types::SnapshotMetadata>,
+    ) -> CoreResult<bool> {
+        if current_head.is_empty() {
+            return Ok(false);
+        }
+        if latest_snapshot.and_then(|metadata| metadata.covered_head.as_deref())
+            == Some(current_head)
+        {
+            return Ok(false);
+        }
+
+        let interval = self.config.remote_op_snapshot_interval_ops.max(1);
+        let stop_at = latest_snapshot.and_then(|metadata| metadata.covered_head.as_deref());
+        let ops_since_snapshot = compactor
+            .op_count_since(current_head, stop_at, interval)
+            .await?;
+        Ok(ops_since_snapshot >= interval)
     }
 
     async fn reconcile_missing_local_files(
@@ -301,13 +402,12 @@ impl SyncMaintenance {
             }
 
             if seen >= batch_limit {
-                if processed_full_page && page.is_truncated {
-                    let next = page.next_continuation_token.ok_or_else(|| {
-                        CoreError::S3(
-                            "blob LIST was truncated without ContinuationToken".to_string(),
-                        )
-                    })?;
-                    db.set_checkpoint(BLOB_DISCOVERY_CURSOR_CHECKPOINT, &next)?;
+                if let Some(checkpoint) = blob_discovery_checkpoint_after_limit(
+                    page.is_truncated,
+                    page.next_continuation_token.as_deref(),
+                    processed_full_page,
+                )? {
+                    db.set_checkpoint(BLOB_DISCOVERY_CURSOR_CHECKPOINT, &checkpoint)?;
                 }
                 break;
             }
@@ -617,10 +717,61 @@ struct BlobLease {
     expires_at: String,
 }
 
+#[derive(Debug, Default)]
+struct RemoteOpMaintenanceReport {
+    snapshots_written: u64,
+    ops_deleted: u64,
+    watermarks_updated: u64,
+}
+
 struct BlobIdentity {
     key: String,
     hash: String,
     blob_id: Uuid,
+}
+
+async fn remote_head_for_maintenance(s3: &S3Adapter) -> CoreResult<String> {
+    let mut clock = 0u64;
+    let device_id = Uuid::now_v7();
+    let mut ops_log = OperationLog::new(s3, device_id, &mut clock);
+    Ok(ops_log.load_head().await?.unwrap_or_default())
+}
+
+async fn collect_remote_tree_entries_for_snapshot(s3: &S3Adapter) -> CoreResult<Vec<FileEntry>> {
+    let tree = FileTree::new(s3);
+    let mut cursor: Option<String> = None;
+    let mut entries = Vec::new();
+
+    loop {
+        let page = tree
+            .list_entries_page(cursor.as_deref(), REMOTE_SNAPSHOT_PAGE_SIZE)
+            .await?;
+        for file_id in &page.ids {
+            match tree.get_entry(file_id).await {
+                Ok(entry) => entries.push(entry),
+                Err(CoreError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        if page.is_truncated {
+            cursor = Some(page.next_continuation_token.ok_or_else(|| {
+                CoreError::S3(
+                    "snapshot tree LIST was truncated without ContinuationToken".to_string(),
+                )
+            })?);
+        } else {
+            break;
+        }
+    }
+
+    Ok(entries)
+}
+
+fn current_device_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "device".to_string())
 }
 
 fn parse_blob_key(key: &str) -> Option<BlobIdentity> {
@@ -653,6 +804,25 @@ fn blob_id_from_hash(hash: &str) -> Option<Uuid> {
     Some(Uuid::from_bytes(bytes))
 }
 
+fn blob_discovery_checkpoint_after_limit(
+    page_is_truncated: bool,
+    next_continuation_token: Option<&str>,
+    processed_full_page: bool,
+) -> CoreResult<Option<String>> {
+    if !page_is_truncated {
+        return Ok(Some(String::new()));
+    }
+
+    if !processed_full_page {
+        return Ok(None);
+    }
+
+    let next = next_continuation_token.ok_or_else(|| {
+        CoreError::S3("blob LIST was truncated without ContinuationToken".to_string())
+    })?;
+    Ok(Some(next.to_string()))
+}
+
 fn parse_uuid(value: &str) -> CoreResult<Uuid> {
     Uuid::parse_str(value).map_err(|e| CoreError::Protocol(format!("invalid blob id: {}", e)))
 }
@@ -669,4 +839,34 @@ fn content_ref_matches_blob(content_ref: &ContentRef, candidate: &RemoteBlobGcCa
     content_ref.storage_key == candidate.blob_key
         || content_ref.hash == candidate.blob_hash
         || content_ref.blob_id.to_string() == candidate.blob_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_discovery_checkpoint_clears_when_limit_reaches_eof() {
+        assert_eq!(
+            blob_discovery_checkpoint_after_limit(false, Some("stale-token"), true).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            blob_discovery_checkpoint_after_limit(false, None, false).unwrap(),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn blob_discovery_checkpoint_advances_only_after_full_truncated_page() {
+        assert_eq!(
+            blob_discovery_checkpoint_after_limit(true, Some("next-token"), true).unwrap(),
+            Some("next-token".to_string())
+        );
+        assert_eq!(
+            blob_discovery_checkpoint_after_limit(true, Some("next-token"), false).unwrap(),
+            None
+        );
+        assert!(blob_discovery_checkpoint_after_limit(true, None, true).is_err());
+    }
 }

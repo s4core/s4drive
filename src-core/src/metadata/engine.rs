@@ -94,40 +94,7 @@ impl MetadataEngine {
             .await?;
 
         // Device registration.
-        let device = Device {
-            device_id: self.device_id,
-            device_name: device_name.to_string(),
-            platform: std::env::consts::OS.to_string(),
-            os_version: std::env::consts::ARCH.to_string(),
-            public_key: String::new(),
-            last_seen: chrono::Utc::now().to_rfc3339(),
-            capabilities: DeviceCapabilities {
-                cloud_files_api: true,
-                file_provider: false,
-                fuse: false,
-                background_sync: true,
-                encryption_at_rest: false,
-            },
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-        };
-        let device_id = self.device_id.to_string();
-        let device_json = Serializer::serialize_device(&device)?;
-        self.s3
-            .put_if_not_exists(
-                &Serializer::device_registration_key(&device_id),
-                device_json.into_bytes(),
-            )
-            .await?;
-
-        let capabilities_json = serde_json::to_vec_pretty(&device.capabilities)
-            .map_err(|e| CoreError::Protocol(e.to_string()))?;
-        self.s3
-            .put_if_not_exists(
-                &Serializer::device_capabilities_key(&device_id),
-                capabilities_json,
-            )
-            .await?;
-
+        let device = self.upsert_device_registration(device_name).await?;
         let registry = serde_json::json!({
             "schema_version": crate::metadata::SUPPORTED_SCHEMA_VERSION,
             "updated_at": chrono::Utc::now().to_rfc3339(),
@@ -163,6 +130,43 @@ impl MetadataEngine {
         );
 
         Ok(desc)
+    }
+
+    pub async fn upsert_device_registration(&self, device_name: &str) -> CoreResult<Device> {
+        let device = Device {
+            device_id: self.device_id,
+            device_name: device_name.to_string(),
+            platform: std::env::consts::OS.to_string(),
+            os_version: std::env::consts::ARCH.to_string(),
+            public_key: String::new(),
+            last_seen: chrono::Utc::now().to_rfc3339(),
+            capabilities: DeviceCapabilities {
+                cloud_files_api: true,
+                file_provider: false,
+                fuse: false,
+                background_sync: true,
+                encryption_at_rest: false,
+            },
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        let device_id = self.device_id.to_string();
+        let device_json = Serializer::serialize_device(&device)?;
+        self.s3
+            .put_object(
+                &Serializer::device_registration_key(&device_id),
+                device_json.into_bytes(),
+            )
+            .await?;
+
+        let capabilities_json = serde_json::to_vec_pretty(&device.capabilities)
+            .map_err(|e| CoreError::Protocol(e.to_string()))?;
+        self.s3
+            .put_object(
+                &Serializer::device_capabilities_key(&device_id),
+                capabilities_json,
+            )
+            .await?;
+        Ok(device)
     }
 
     /// Проверить, инициализирован ли бакет.

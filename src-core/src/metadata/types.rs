@@ -58,6 +58,36 @@ pub struct DeviceCapabilities {
     pub encryption_at_rest: bool,
 }
 
+/// Per-device progress marker used to decide when old ops are safe to compact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceWatermark {
+    pub device_id: DeviceId,
+    pub last_seen_at: Timestamp,
+    pub applied_snapshot_seq: u64,
+    pub applied_head: OpId,
+    pub client_version: String,
+    pub status: DeviceWatermarkStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceWatermarkStatus {
+    Active,
+    Retired,
+}
+
+/// Metadata stored beside each tree snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMetadata {
+    pub schema_version: u32,
+    pub seq_num: u64,
+    pub created_at: Timestamp,
+    pub entry_count: usize,
+    pub tree_key: String,
+    #[serde(default)]
+    pub covered_head: Option<OpId>,
+}
+
 // ─── File Entry ────────────────────────────────────────────────────────
 
 /// A file or folder in the S4Drive tree.

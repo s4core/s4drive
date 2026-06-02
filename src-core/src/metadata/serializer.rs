@@ -1,5 +1,8 @@
 use crate::error::{CoreError, CoreResult};
-use crate::metadata::types::{BucketDescriptor, Device, FileEntry, Operation, Revision, Tombstone};
+use crate::metadata::types::{
+    BucketDescriptor, Device, DeviceWatermark, FileEntry, Operation, Revision, SnapshotMetadata,
+    Tombstone,
+};
 
 /// S4 Metadata Protocol serializer/deserializer.
 /// Handles all `.s4drive/` JSON serialization.
@@ -46,6 +49,22 @@ impl Serializer {
         serde_json::to_string_pretty(device).map_err(|e| CoreError::Protocol(e.to_string()))
     }
 
+    pub fn serialize_device_watermark(watermark: &DeviceWatermark) -> CoreResult<String> {
+        serde_json::to_string_pretty(watermark).map_err(|e| CoreError::Protocol(e.to_string()))
+    }
+
+    pub fn deserialize_device_watermark(data: &str) -> CoreResult<DeviceWatermark> {
+        serde_json::from_str(data).map_err(|e| CoreError::Protocol(e.to_string()))
+    }
+
+    pub fn serialize_snapshot_metadata(metadata: &SnapshotMetadata) -> CoreResult<String> {
+        serde_json::to_string_pretty(metadata).map_err(|e| CoreError::Protocol(e.to_string()))
+    }
+
+    pub fn deserialize_snapshot_metadata(data: &str) -> CoreResult<SnapshotMetadata> {
+        serde_json::from_str(data).map_err(|e| CoreError::Protocol(e.to_string()))
+    }
+
     /// Serialize tombstone
     pub fn serialize_tombstone(tombstone: &Tombstone) -> CoreResult<String> {
         serde_json::to_string_pretty(tombstone).map_err(|e| CoreError::Protocol(e.to_string()))
@@ -68,12 +87,24 @@ impl Serializer {
         format!(".s4drive/devices/{}/capabilities.json", device_id)
     }
 
+    pub fn device_watermark_key(device_id: &str) -> String {
+        format!(".s4drive/devices/{}/watermark.json", device_id)
+    }
+
+    pub fn device_prefix() -> String {
+        ".s4drive/devices/".to_string()
+    }
+
     pub fn device_registry_key() -> String {
         ".s4drive/devices/registry.json".to_string()
     }
 
     pub fn op_key(op_id: &str) -> String {
         format!(".s4drive/meta/ops/{}.json", op_id)
+    }
+
+    pub fn op_prefix() -> String {
+        ".s4drive/meta/ops/".to_string()
     }
 
     pub fn head_key() -> String {
