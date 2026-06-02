@@ -60,6 +60,12 @@ pub struct MaintenanceConfig {
     pub remote_tombstone_retention_days: u32,
     pub remote_tombstone_batch_size: usize,
     pub remote_snapshot_keep: u32,
+    pub remote_blob_gc_enabled: bool,
+    pub remote_blob_quarantine_days: u64,
+    pub remote_blob_discovery_batch_size: usize,
+    pub remote_blob_delete_batch_size: usize,
+    pub remote_blob_reference_page_size: i32,
+    pub blob_lease_ttl_minutes: u64,
     pub sqlite_maintenance: bool,
 }
 
@@ -78,6 +84,12 @@ impl Default for MaintenanceConfig {
             remote_tombstone_retention_days: 90,
             remote_tombstone_batch_size: 250,
             remote_snapshot_keep: 5,
+            remote_blob_gc_enabled: true,
+            remote_blob_quarantine_days: 90,
+            remote_blob_discovery_batch_size: 250,
+            remote_blob_delete_batch_size: 2,
+            remote_blob_reference_page_size: 250,
+            blob_lease_ttl_minutes: 30,
             sqlite_maintenance: true,
         }
     }
@@ -193,5 +205,7 @@ max_retries = 3
         assert!(config.maintenance.enabled);
         assert_eq!(config.maintenance.local_delete_batch_size, 250);
         assert_eq!(config.maintenance.remote_tombstone_retention_days, 90);
+        assert!(config.maintenance.remote_blob_gc_enabled);
+        assert_eq!(config.maintenance.remote_blob_quarantine_days, 90);
     }
 }

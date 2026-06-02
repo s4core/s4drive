@@ -42,6 +42,15 @@ pub struct LocalMaintenanceStats {
     pub objects_deleted: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBlobGcCandidate {
+    pub blob_key: String,
+    pub blob_hash: String,
+    pub blob_id: String,
+    pub first_seen_at: String,
+    pub quarantine_until: String,
+}
+
 impl LocalDatabase {
     /// Open (or create) the local database.
     pub fn new(config: &Config) -> CoreResult<Self> {
@@ -150,6 +159,16 @@ impl LocalDatabase {
                 .map_err(|e| CoreError::Database(e.to_string()))?;
             conn.execute(
                 "INSERT INTO schema_version (version, applied_at) VALUES (4, datetime('now'))",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
+
+        if version < 5 {
+            conn.execute_batch(include_str!("../migrations/v005_remote_blob_gc.sql"))
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (5, datetime('now'))",
                 [],
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
@@ -839,6 +858,154 @@ impl LocalDatabase {
         )
         .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    pub fn upsert_remote_blob_gc_candidate(
+        &self,
+        blob_key: &str,
+        blob_hash: &str,
+        blob_id: &str,
+        quarantine_until: &str,
+    ) -> CoreResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO remote_blob_gc_candidates
+                 (blob_key, blob_hash, blob_id, first_seen_at, last_seen_at, quarantine_until)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+             ON CONFLICT(blob_key) DO UPDATE SET
+                 blob_hash = excluded.blob_hash,
+                 blob_id = excluded.blob_id,
+                 last_seen_at = excluded.last_seen_at,
+                 quarantine_until = CASE
+                     WHEN remote_blob_gc_candidates.deleted_at IS NOT NULL
+                     THEN excluded.quarantine_until
+                     ELSE remote_blob_gc_candidates.quarantine_until
+                 END,
+                 deleted_at = NULL,
+                 last_error = NULL,
+                 updated_at = datetime('now')",
+            rusqlite::params![blob_key, blob_hash, blob_id, now, quarantine_until],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn due_remote_blob_gc_candidates(
+        &self,
+        now: &str,
+        limit: usize,
+    ) -> CoreResult<Vec<RemoteBlobGcCandidate>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT blob_key, blob_hash, blob_id, first_seen_at, quarantine_until
+                 FROM remote_blob_gc_candidates
+                 WHERE deleted_at IS NULL
+                   AND quarantine_until <= ?1
+                 ORDER BY quarantine_until ASC, blob_key ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![now, sql_limit(limit)], |row| {
+                Ok(RemoteBlobGcCandidate {
+                    blob_key: row.get::<_, String>(0)?,
+                    blob_hash: row.get::<_, String>(1)?,
+                    blob_id: row.get::<_, String>(2)?,
+                    first_seen_at: row.get::<_, String>(3)?,
+                    quarantine_until: row.get::<_, String>(4)?,
+                })
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(row.map_err(|e| CoreError::Database(e.to_string()))?);
+        }
+        Ok(candidates)
+    }
+
+    pub fn remove_remote_blob_gc_candidate(&self, blob_key: &str) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM remote_blob_gc_candidates WHERE blob_key = ?1",
+            rusqlite::params![blob_key],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn mark_remote_blob_gc_deleted(&self, blob_key: &str) -> CoreResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE remote_blob_gc_candidates
+             SET deleted_at = ?2,
+                 last_error = NULL,
+                 updated_at = datetime('now')
+             WHERE blob_key = ?1",
+            rusqlite::params![blob_key, now],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn record_remote_blob_gc_error(&self, blob_key: &str, error: &str) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE remote_blob_gc_candidates
+             SET last_error = ?2,
+                 updated_at = datetime('now')
+             WHERE blob_key = ?1",
+            rusqlite::params![blob_key, error],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn local_content_references_blob(&self, raw_hash: &str) -> CoreResult<bool> {
+        let local_hash = format!("b3:{}", raw_hash);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM objects
+                     WHERE content_hash IN (?1, ?2)
+                        OR local_hash IN (?1, ?2)
+                        OR s3_key = ?3)
+                  + (SELECT COUNT(*) FROM revisions
+                     WHERE content_hash IN (?1, ?2))
+                  + (SELECT COUNT(*) FROM transfer_queue
+                     WHERE s3_key = ?3
+                       AND status IN ('queued', 'in_progress', 'paused'))",
+                rusqlite::params![
+                    raw_hash,
+                    local_hash,
+                    crate::metadata::serializer::Serializer::blob_key(raw_hash)
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(count > 0)
     }
 
     pub fn get_checkpoint(&self, name: &str) -> CoreResult<Option<String>> {
@@ -1886,6 +2053,35 @@ mod tests {
         assert!(db.get_file(&entry.file_id).unwrap().is_none());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_blob_gc_candidates_are_quarantined_and_removable() {
+        let db = test_db();
+        let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let blob_key = crate::metadata::serializer::Serializer::blob_key(hash);
+        let blob_id = uuid::Uuid::now_v7().to_string();
+        let quarantine_until = "2000-01-01T00:00:00+00:00";
+
+        db.upsert_remote_blob_gc_candidate(&blob_key, hash, &blob_id, quarantine_until)
+            .unwrap();
+
+        let due = db
+            .due_remote_blob_gc_candidates("2000-01-02T00:00:00+00:00", 10)
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].blob_key, blob_key);
+        assert_eq!(due[0].blob_hash, hash);
+
+        db.record_remote_blob_gc_error(&blob_key, "temporary")
+            .unwrap();
+        db.mark_remote_blob_gc_deleted(&blob_key).unwrap();
+        assert!(db
+            .due_remote_blob_gc_candidates("2000-01-02T00:00:00+00:00", 10)
+            .unwrap()
+            .is_empty());
+
+        db.remove_remote_blob_gc_candidate(&blob_key).unwrap();
     }
 
     #[test]

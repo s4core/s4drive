@@ -101,8 +101,20 @@ impl Serializer {
         format!(".s4drive/content/blobs/{}/{}", prefix, hash)
     }
 
+    pub fn blob_prefix() -> String {
+        ".s4drive/content/blobs/".to_string()
+    }
+
     pub fn blob_manifest_key() -> String {
         ".s4drive/content/blobs/manifest.json".to_string()
+    }
+
+    pub fn blob_lease_prefix(hash: &str) -> String {
+        format!(".s4drive/content/leases/{}/", hash)
+    }
+
+    pub fn blob_lease_key(hash: &str, device_id: &str) -> String {
+        format!(".s4drive/content/leases/{}/{}.json", hash, device_id)
     }
 
     pub fn tombstone_key(file_id: &str) -> String {

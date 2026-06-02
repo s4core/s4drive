@@ -26,6 +26,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::metadata::blobs::{hash_file_blake3, BlobStore};
 use crate::metadata::engine::MetadataEngine;
 use crate::metadata::ops::OperationLog;
+use crate::metadata::serializer::Serializer;
 use crate::metadata::tree::{FileTree, TombstoneManager};
 use crate::metadata::types::{
     ContentRef, Effects, EntryType, FileEntry, OpType, Operation, Preconditions,
@@ -56,6 +57,7 @@ const REMOTE_TREE_CURSOR_CHECKPOINT: &str = "remote_tree_cursor";
 const REMOTE_TREE_MODE_CHECKPOINT: &str = "remote_tree_mode";
 const REMOTE_TREE_TARGET_HEAD_CHECKPOINT: &str = "remote_tree_target_head";
 const REMOTE_TREE_CURSOR_DONE: &str = "__complete__";
+const MIN_BLOB_LEASE_TTL_MINUTES: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteTreeScanMode {
@@ -283,6 +285,9 @@ impl SyncEngine {
         let maintenance_config = self.maintenance_config.clone();
         let handle = tokio::spawn(async move {
             let mut idle_backoff = IdleBackoff::new();
+            let blob_lease_ttl_minutes = maintenance_config
+                .blob_lease_ttl_minutes
+                .max(MIN_BLOB_LEASE_TTL_MINUTES);
             let maintenance = SyncMaintenance::new(maintenance_config);
             tracing::info!("Sync loop started");
             set_state(&state, SyncState::Idle);
@@ -303,6 +308,7 @@ impl SyncEngine {
                 max_concurrent_uploads,
                 max_concurrent_downloads,
                 &exclude_patterns,
+                blob_lease_ttl_minutes,
             )
             .await
             {
@@ -346,6 +352,7 @@ impl SyncEngine {
                     max_concurrent_uploads,
                     max_concurrent_downloads,
                     &exclude_patterns,
+                    blob_lease_ttl_minutes,
                 )
                 .await
                 {
@@ -521,6 +528,9 @@ impl SyncEngine {
             self.max_concurrent_uploads,
             self.max_concurrent_downloads,
             &self.exclude_patterns,
+            self.maintenance_config
+                .blob_lease_ttl_minutes
+                .max(MIN_BLOB_LEASE_TTL_MINUTES),
         )
         .await;
         if let Ok(result) = result.as_mut() {
@@ -668,6 +678,7 @@ async fn run_initial_sync(
     max_concurrent_uploads: u32,
     max_concurrent_downloads: u32,
     exclude_patterns: &[String],
+    blob_lease_ttl_minutes: u64,
 ) -> CoreResult<SyncResult> {
     let mut result = SyncResult::empty();
     let sync_path = Path::new(sync_folder);
@@ -694,6 +705,7 @@ async fn run_initial_sync(
             max_retries,
             max_concurrent_uploads,
             exclude_patterns,
+            blob_lease_ttl_minutes,
         )
         .await?;
         result.files_uploaded = up;
@@ -755,6 +767,7 @@ async fn run_initial_sync(
             max_retries,
             max_concurrent_uploads,
             exclude_patterns,
+            blob_lease_ttl_minutes,
         )
         .await?;
         result.files_uploaded = up;
@@ -1211,6 +1224,7 @@ async fn run_sync_cycle(
     max_concurrent_uploads: u32,
     max_concurrent_downloads: u32,
     exclude_patterns: &[String],
+    blob_lease_ttl_minutes: u64,
 ) -> CoreResult<SyncResult> {
     let mut result = SyncResult::empty();
 
@@ -1332,6 +1346,7 @@ async fn run_sync_cycle(
             max_retries,
             max_concurrent_uploads,
             exclude_patterns,
+            blob_lease_ttl_minutes,
         )
         .await?;
         result.files_uploaded = up;
@@ -1427,6 +1442,7 @@ async fn process_upload_queue(
     max_retries: u32,
     max_concurrent_uploads: u32,
     exclude_patterns: &[String],
+    blob_lease_ttl_minutes: u64,
 ) -> CoreResult<(u32, u64, u32)> {
     let mut uploaded = 0u32;
     let mut total_bytes = 0u64;
@@ -1485,10 +1501,32 @@ async fn process_upload_queue(
                 }
             };
             let data_len = content_ref.size;
+            let lease_key = match create_blob_lease(
+                s3,
+                metadata.device_id(),
+                &content_ref,
+                blob_lease_ttl_minutes,
+            )
+            .await
+            {
+                Ok(lease_key) => lease_key,
+                Err(e) => {
+                    tracing::warn!("Blob lease creation failed: {}", e);
+                    concurrency.record_failure();
+                    let retry = transfer.increment_retry(job.id)?;
+                    if retry >= max_retries {
+                        transfer.mark_failed(job.id, &format!("max retries: {}", e))?;
+                    } else {
+                        requeue_with_backoff(transfer, job.id, retry).await?;
+                    }
+                    continue;
+                }
+            };
 
             let parsed_file_id = match uuid::Uuid::parse_str(&file_id) {
                 Ok(id) => id,
                 Err(e) => {
+                    let _ = release_blob_lease(s3, &lease_key).await;
                     transfer.mark_failed(job.id, &format!("invalid file_id: {}", e))?;
                     concurrency.record_failure();
                     continue;
@@ -1539,6 +1577,7 @@ async fn process_upload_queue(
             if let Some(remote_entry) = remote_entry.as_ref() {
                 if remote_revision_diverged(parent_revision_id, remote_entry, &local_hash) {
                     if has_open_conflict(db, &parsed_file_id, ConflictType::EditEdit.as_str())? {
+                        let _ = release_blob_lease(s3, &lease_key).await;
                         transfer.mark_failed(job.id, "conflict: remote revision diverged")?;
                         conflicts += 1;
                         concurrency.record_failure();
@@ -1574,6 +1613,7 @@ async fn process_upload_queue(
                         remote_rev.as_deref(),
                         &reason,
                     )?;
+                    let _ = release_blob_lease(s3, &lease_key).await;
                     transfer.mark_failed(job.id, "conflict: remote revision diverged")?;
                     activity.log("upload_conflict", &file_id, &s3_key, &reason)?;
                     conflicts += 1;
@@ -1647,10 +1687,42 @@ async fn process_upload_queue(
                     }
                 }
             }
+            let _ = release_blob_lease(s3, &lease_key).await;
         }
     }
 
     Ok((uploaded, total_bytes, conflicts))
+}
+
+async fn create_blob_lease(
+    s3: &S3Adapter,
+    device_id: uuid::Uuid,
+    content_ref: &ContentRef,
+    ttl_minutes: u64,
+) -> CoreResult<String> {
+    let ttl = chrono::Duration::minutes(ttl_minutes.max(MIN_BLOB_LEASE_TTL_MINUTES) as i64);
+    let now = chrono::Utc::now();
+    let lease_key = Serializer::blob_lease_key(&content_ref.hash, &device_id.to_string());
+    let lease = serde_json::json!({
+        "schema_version": 1,
+        "blob_hash": content_ref.hash,
+        "blob_key": content_ref.storage_key,
+        "blob_id": content_ref.blob_id,
+        "device_id": device_id,
+        "created_at": now.to_rfc3339(),
+        "expires_at": (now + ttl).to_rfc3339(),
+    });
+    let body =
+        serde_json::to_string_pretty(&lease).map_err(|e| CoreError::Protocol(e.to_string()))?;
+    s3.put_metadata(&lease_key, &body).await?;
+    Ok(lease_key)
+}
+
+async fn release_blob_lease(s3: &S3Adapter, lease_key: &str) -> CoreResult<()> {
+    match s3.delete_object(lease_key).await {
+        Ok(()) | Err(CoreError::NotFound(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 // ─── Download Processing ────────────────────────────────────────
