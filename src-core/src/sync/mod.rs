@@ -50,8 +50,39 @@ const MAX_REMOTE_TREE_PAGES_PER_PASS: usize = 8;
 const REMOTE_TREE_PAGE_SIZE: i32 = 250;
 const REMOTE_HEAD_CHECKPOINT: &str = "remote_head";
 const REMOTE_TREE_CURSOR_CHECKPOINT: &str = "remote_tree_cursor";
+const REMOTE_TREE_MODE_CHECKPOINT: &str = "remote_tree_mode";
 const REMOTE_TREE_TARGET_HEAD_CHECKPOINT: &str = "remote_tree_target_head";
 const REMOTE_TREE_CURSOR_DONE: &str = "__complete__";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteTreeScanMode {
+    Bootstrap,
+    StaleFallback,
+}
+
+impl RemoteTreeScanMode {
+    fn checkpoint_value(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::StaleFallback => "stale_fallback",
+        }
+    }
+
+    fn from_checkpoint(value: Option<&str>) -> Self {
+        match value {
+            Some("stale_fallback") => Self::StaleFallback,
+            _ => Self::Bootstrap,
+        }
+    }
+
+    fn should_advance_head(self) -> bool {
+        self == Self::Bootstrap
+    }
+
+    fn should_reconcile_existing(self) -> bool {
+        self == Self::StaleFallback
+    }
+}
 
 /// The sync engine orchestrates two-way synchronization.
 #[allow(clippy::too_many_arguments)]
@@ -908,7 +939,16 @@ async fn queue_missing_remote_tree_entries(
     versions: &VersionApi,
     sync_folder: &str,
 ) -> CoreResult<RemoteTreeScan> {
-    queue_missing_remote_tree_entries_from(s3, db, transfer, versions, sync_folder, false).await
+    queue_missing_remote_tree_entries_from(
+        s3,
+        db,
+        transfer,
+        versions,
+        sync_folder,
+        false,
+        RemoteTreeScanMode::Bootstrap,
+    )
+    .await
 }
 
 async fn queue_missing_remote_tree_entries_from(
@@ -918,28 +958,34 @@ async fn queue_missing_remote_tree_entries_from(
     versions: &VersionApi,
     sync_folder: &str,
     restart: bool,
+    requested_mode: RemoteTreeScanMode,
 ) -> CoreResult<RemoteTreeScan> {
     use crate::metadata::tree::FileTree;
 
-    if !restart
-        && db.get_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT)?.as_deref()
-            == Some(REMOTE_TREE_CURSOR_DONE)
-    {
+    let saved_cursor = db.get_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT)?;
+    if !restart && saved_cursor.as_deref() == Some(REMOTE_TREE_CURSOR_DONE) {
         return Ok(RemoteTreeScan {
             queued: 0,
             complete: true,
         });
     }
 
-    let mut continuation_token = if restart {
-        None
+    let continuing = !restart
+        && saved_cursor
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    let mode = if continuing {
+        RemoteTreeScanMode::from_checkpoint(
+            db.get_checkpoint(REMOTE_TREE_MODE_CHECKPOINT)?.as_deref(),
+        )
     } else {
-        db.get_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT)?
-            .filter(|value| !value.is_empty())
+        requested_mode
     };
-    let target_head = if restart || continuation_token.is_none() {
+    let mut continuation_token = if continuing { saved_cursor } else { None };
+    let target_head = if !continuing {
         let target_head = remote_head_for_checkpoint(s3).await?;
         db.set_checkpoint(REMOTE_TREE_TARGET_HEAD_CHECKPOINT, &target_head)?;
+        db.set_checkpoint(REMOTE_TREE_MODE_CHECKPOINT, mode.checkpoint_value())?;
         target_head
     } else {
         db.get_checkpoint(REMOTE_TREE_TARGET_HEAD_CHECKPOINT)?
@@ -960,38 +1006,18 @@ async fn queue_missing_remote_tree_entries_from(
             .await?;
 
         for file_id in &page.ids {
-            if db.get_file(file_id)?.is_some() {
-                continue;
-            }
             if let Ok(entry) = tree.get_entry(file_id).await {
-                if entry.entry_type == EntryType::File {
-                    if let Some(ref content_ref) = entry.content_ref {
-                        let local_path = safe_join_sync_path(sync_folder, &entry.name)?;
-                        let blob_key = content_ref.storage_key.clone();
-                        transfer.enqueue_download(
-                            &file_id.to_string(),
-                            &local_path.to_string_lossy(),
-                            &blob_key,
-                        )?;
-                        db.register_file_at_path_with_state(
-                            &entry,
-                            &local_path.to_string_lossy(),
-                            &entry.name,
-                            "pending_download",
-                        )?;
-                        record_entry_revision(
-                            versions,
-                            file_id,
-                            entry.current_revision_id,
-                            parent_revision_from_history(&entry),
-                            Some(content_ref),
-                            "remote",
-                            "remote",
-                            "clean",
-                            None,
-                        )?;
-                        queued += 1;
-                    }
+                if queue_remote_tree_entry(
+                    db,
+                    transfer,
+                    versions,
+                    sync_folder,
+                    &entry,
+                    mode.should_reconcile_existing(),
+                )
+                .await?
+                {
+                    queued += 1;
                 }
             }
         }
@@ -1006,7 +1032,9 @@ async fn queue_missing_remote_tree_entries_from(
             continuation_token = Some(next);
         } else {
             db.set_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT, REMOTE_TREE_CURSOR_DONE)?;
-            db.set_checkpoint(REMOTE_HEAD_CHECKPOINT, &target_head)?;
+            if mode.should_advance_head() {
+                db.set_checkpoint(REMOTE_HEAD_CHECKPOINT, &target_head)?;
+            }
             complete = true;
             break;
         }
@@ -1024,6 +1052,89 @@ async fn queue_missing_remote_tree_entries_from(
     }
 
     Ok(RemoteTreeScan { queued, complete })
+}
+
+async fn queue_remote_tree_entry(
+    db: &LocalDatabase,
+    transfer: &TransferQueue,
+    versions: &VersionApi,
+    sync_folder: &str,
+    entry: &FileEntry,
+    reconcile_existing: bool,
+) -> CoreResult<bool> {
+    if entry.entry_type != EntryType::File {
+        return Ok(false);
+    }
+    let Some(content_ref) = entry.content_ref.as_ref() else {
+        return Ok(false);
+    };
+
+    let file_id = entry.file_id;
+    let local_path = safe_join_sync_path(sync_folder, &entry.name)?;
+    let local_path_text = local_path.to_string_lossy().to_string();
+
+    if let Some(local_entry) = db.get_file(&file_id)? {
+        if !reconcile_existing {
+            return Ok(false);
+        }
+
+        let old_path = db.get_local_path(&file_id)?.unwrap_or_default();
+        let old_path_buf = if old_path.is_empty() {
+            local_path.clone()
+        } else {
+            PathBuf::from(&old_path)
+        };
+        let same_content =
+            content_hash_matches(local_entry.content_hash.as_deref(), &content_ref.hash);
+
+        if !same_content
+            && local_file_changed_since_sync(&old_path_buf, local_entry.content_hash.as_deref())
+                .await?
+        {
+            tracing::warn!(
+                "Remote tree fallback skipped changed local file during reconcile: {}",
+                old_path_buf.display()
+            );
+            return Ok(false);
+        }
+
+        if !old_path.is_empty() && old_path != local_path_text && old_path_buf.exists() {
+            if local_path.exists() && !same_path(&old_path_buf, &local_path) {
+                tracing::warn!(
+                    "Remote tree fallback skipped rename because target exists: {}",
+                    local_path.display()
+                );
+                return Ok(false);
+            }
+            if let Some(parent) = local_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| CoreError::FileSystem(format!("create rename parent: {}", e)))?;
+            }
+            std::fs::rename(&old_path_buf, &local_path)
+                .map_err(|e| CoreError::FileSystem(format!("remote tree rename apply: {}", e)))?;
+        }
+
+        if same_content {
+            db.register_file_at_path_with_state(entry, &local_path_text, &entry.name, "synced")?;
+            return Ok(false);
+        }
+    }
+
+    let blob_key = content_ref.storage_key.clone();
+    transfer.enqueue_download(&file_id.to_string(), &local_path_text, &blob_key)?;
+    db.register_file_at_path_with_state(entry, &local_path_text, &entry.name, "pending_download")?;
+    record_entry_revision(
+        versions,
+        &file_id,
+        entry.current_revision_id,
+        parent_revision_from_history(entry),
+        Some(content_ref),
+        "remote",
+        "remote",
+        "clean",
+        None,
+    )?;
+    Ok(true)
 }
 
 // ─── Incremental Sync Cycle ─────────────────────────────────────
@@ -1171,22 +1282,59 @@ async fn run_sync_cycle(
         result.files_uploaded = up;
         result.bytes_uploaded = bytes;
         result.conflicts_detected += conf;
+        let (remaining_uploads, _) = transfer.pending_count()?;
+        if remaining_uploads > 0 {
+            tracing::info!(
+                "Upload queue still has {} item(s); remote polling deferred to next pass",
+                remaining_uploads
+            );
+            return Ok(result);
+        }
     }
 
     // ── 3. Poll remote changes ──
-    set_state(state, SyncState::ScanningRemote);
-    let (download_jobs, remote_conflicts) = poll_remote_changes(
-        download.s3(),
-        db,
-        transfer,
-        activity,
-        conflict,
-        conflict_engine,
-        versions,
-        _sync_folder,
-    )
-    .await?;
-    result.conflicts_detected += remote_conflicts;
+    let (_, pending_downloads_before_remote) = transfer.pending_count()?;
+    let mut download_jobs = 0usize;
+    if pending_downloads_before_remote == 0 {
+        set_state(state, SyncState::ScanningRemote);
+        if remote_tree_bootstrap_in_progress(db)? {
+            let remote_scan = queue_missing_remote_tree_entries(
+                download.s3(),
+                db,
+                transfer,
+                versions,
+                _sync_folder,
+            )
+            .await?;
+            download_jobs = remote_scan.queued;
+            if remote_scan.queued > 0 {
+                tracing::info!(
+                    "Remote tree scan queued {} download(s); complete={}",
+                    remote_scan.queued,
+                    remote_scan.complete
+                );
+            }
+        } else {
+            let (queued, remote_conflicts) = poll_remote_changes(
+                download.s3(),
+                db,
+                transfer,
+                activity,
+                conflict,
+                conflict_engine,
+                versions,
+                _sync_folder,
+            )
+            .await?;
+            download_jobs = queued;
+            result.conflicts_detected += remote_conflicts;
+        }
+    } else {
+        tracing::info!(
+            "Download queue has {} item(s); remote polling deferred to next pass",
+            pending_downloads_before_remote
+        );
+    }
 
     // ── 4. Process download queue ──
     let (_, pending_downloads) = transfer.pending_count()?;
@@ -1563,9 +1711,17 @@ async fn poll_remote_changes(
 
     if !reached_checkpoint {
         tracing::warn!("Remote op checkpoint is too far behind; falling back to remote tree scan");
-        let remote_scan =
-            queue_missing_remote_tree_entries_from(s3, db, transfer, versions, _sync_folder, true)
-                .await?;
+        let restart = !remote_tree_bootstrap_in_progress(db)?;
+        let remote_scan = queue_missing_remote_tree_entries_from(
+            s3,
+            db,
+            transfer,
+            versions,
+            _sync_folder,
+            restart,
+            RemoteTreeScanMode::StaleFallback,
+        )
+        .await?;
         return Ok((remote_scan.queued, 0));
     }
 
