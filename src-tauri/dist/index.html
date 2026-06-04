@@ -38,6 +38,7 @@
           <button class="nav-btn" data-route="account" role="tab" aria-selected="false"><span class="nav-icon">●</span><span>Account</span></button>
           <button class="nav-btn" data-route="settings" role="tab" aria-selected="false"><span class="nav-icon">⚙</span><span>Settings</span></button>
           <button class="nav-btn" data-route="diagnostics" role="tab" aria-selected="false"><span class="nav-icon">?</span><span>Diagnostics</span></button>
+          <button class="nav-btn" data-route="logs" role="tab" aria-selected="false"><span class="nav-icon">≣</span><span>Logs</span></button>
           <button class="nav-btn" data-route="about" role="tab" aria-selected="false"><span class="nav-icon">i</span><span>About</span></button>
         </nav>
       </aside>
@@ -357,6 +358,46 @@
           <div class="empty-state">
             <div class="empty-icon">🩺</div>
             <div class="empty-title">No Diagnostics Yet</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== LOGS ===== -->
+      <section class="screen" id="screen-logs" role="tabpanel">
+        <div class="section-title">Logs</div>
+        <div class="card log-toolbar">
+          <div class="setting-row">
+            <div class="setting-label">
+              <div class="setting-name">Log Level</div>
+              <div class="setting-desc">Higher levels include more S4Drive detail; dependency request headers are excluded</div>
+            </div>
+            <select class="setting-input setting-input-sm" id="inputLogLevel">
+              <option value="error">Errors only</option>
+              <option value="warn">Warnings and errors</option>
+              <option value="info">Info</option>
+              <option value="debug">Debug</option>
+              <option value="trace">Trace</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <div class="setting-name">Visible Lines</div>
+              <div class="setting-desc">The log file keeps up to the last 10000 lines on disk</div>
+            </div>
+            <div class="setting-inline-inputs">
+              <select class="setting-input setting-input-sm" id="inputLogLimit">
+                <option value="1000">Last 1000</option>
+                <option value="2000">Last 2000</option>
+              </select>
+              <button class="btn btn-outline" id="btnRefreshLogs">Refresh</button>
+            </div>
+          </div>
+        </div>
+        <div class="card log-list" id="logList">
+          <div class="empty-state">
+            <div class="empty-icon">≣</div>
+            <div class="empty-title">No Logs Yet</div>
+            <div class="empty-desc">Warnings and errors will appear here after the app starts.</div>
           </div>
         </div>
       </section>

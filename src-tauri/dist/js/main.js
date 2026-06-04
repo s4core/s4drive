@@ -30,6 +30,7 @@
       autostart: false,
       use_tls: true,
       large_sync_confirmed: false,
+      log_level: 'warn',
     },
     sync: { running: false, paused: false, state: 'idle', conflicts: 0, total_files: null, lastSync: null, detail: 'Idle' },
     files: [],
@@ -43,6 +44,7 @@
     transfers: [],
     conflicts: [],
     activities: [],
+    logs: [],
     largeSyncPromptOpen: false,
     largeSyncPromptPending: false,
     syncRequestInFlight: false,
@@ -121,6 +123,7 @@
     if (route === 'versions') refreshVersions();
     if (route === 'account') refreshDevices();
     if (route === 'diagnostics') runDiagnostics();
+    if (route === 'logs') refreshLogs();
   }
 
   // ─── Toast ───────────────────────────────────────────────────
@@ -549,6 +552,7 @@
     document.getElementById('inputDarkMode').checked = Boolean(s.dark_mode);
     document.getElementById('inputUseSystemTheme').checked = Boolean(s.use_system_theme);
     document.getElementById('inputUseTls').checked = Boolean(s.use_tls);
+    document.getElementById('inputLogLevel').value = s.log_level || 'warn';
     applyThemeSettings();
   }
 
@@ -616,6 +620,7 @@
       use_system_theme: document.getElementById('inputUseSystemTheme').checked,
       use_tls: document.getElementById('inputUseTls').checked,
       large_sync_confirmed: Boolean(state.settings.large_sync_confirmed) && syncFolder === state.settings.sync_folder,
+      log_level: document.getElementById('inputLogLevel')?.value || state.settings.log_level || 'warn',
     };
   }
 
@@ -681,6 +686,66 @@
       renderDiagnostics(items || []);
     } catch(e) {
       renderDiagnostics([{ name: 'Diagnostics', status: 'error', detail: String(e) }]);
+    }
+  }
+
+  async function refreshLogs() {
+    try {
+      const level = document.getElementById('inputLogLevel')?.value || state.settings.log_level || 'warn';
+      const limit = parseInt(document.getElementById('inputLogLimit')?.value, 10) || 1000;
+      state.logs = await invoke('get_logs', { level, limit }) || [];
+      renderLogs();
+    } catch(e) {
+      renderLogError(humanizeError(e));
+    }
+  }
+
+  function renderLogs() {
+    const list = document.getElementById('logList');
+    if (!list) return;
+    if (!state.logs.length) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">≣</div>
+          <div class="empty-title">No Logs Yet</div>
+          <div class="empty-desc">No log entries match the selected level.</div>
+        </div>`;
+      return;
+    }
+
+    list.innerHTML = state.logs.map(entry => `
+      <div class="log-item ${escapeAttr(entry.level || 'warn')}">
+        <div class="log-meta">
+          <span class="log-level">${escapeHtml(entry.level || 'warn')}</span>
+          <span class="log-time">${escapeHtml(entry.timestamp || '')}</span>
+          <span class="log-target">${escapeHtml(entry.target || '')}</span>
+        </div>
+        <pre class="log-message">${escapeHtml(entry.raw || entry.message || '')}</pre>
+      </div>
+    `).join('');
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function renderLogError(message) {
+    const list = document.getElementById('logList');
+    if (!list) return;
+    list.innerHTML = `
+      <div class="error-state">
+        <div class="error-icon">!</div>
+        <div class="error-title">Cannot Load Logs</div>
+        <div class="error-desc">${escapeHtml(message)}</div>
+      </div>`;
+  }
+
+  async function changeLogLevel() {
+    const level = document.getElementById('inputLogLevel').value || 'warn';
+    try {
+      state.settings = normalizeSettings(await invoke('set_log_level', { level }));
+      document.getElementById('inputLogLevel').value = state.settings.log_level || 'warn';
+      showToast(`Log level: ${state.settings.log_level}`, 'info');
+      await refreshLogs();
+    } catch(e) {
+      showToast(`Log level update failed: ${humanizeError(e)}`, 'error');
     }
   }
 
@@ -836,6 +901,9 @@
       navigate('diagnostics');
       runDiagnostics();
     });
+    document.getElementById('btnRefreshLogs').addEventListener('click', refreshLogs);
+    document.getElementById('inputLogLimit').addEventListener('change', refreshLogs);
+    document.getElementById('inputLogLevel').addEventListener('change', changeLogLevel);
     document.getElementById('btnCheckUpdates').addEventListener('click', checkUpdates);
     document.getElementById('themeToggle').addEventListener('click', toggleTheme);
     ['inputAccountSyncFolder', 'inputSyncFolder'].forEach((id) => {
@@ -900,7 +968,7 @@
     // Wire keyboard navigation
     document.addEventListener('keydown', (e) => {
       if (e.altKey) {
-        const routes = ['overview', 'files', 'transfers', 'conflicts', 'versions', 'activity', 'account', 'settings', 'diagnostics', 'about'];
+        const routes = ['overview', 'files', 'transfers', 'conflicts', 'versions', 'activity', 'account', 'settings', 'diagnostics', 'logs', 'about'];
         const idx = '1234567890'.indexOf(e.key);
         if (idx >= 0) navigate(routes[idx]);
       }
@@ -972,6 +1040,7 @@
       refreshConflicts(),
       refreshVersions(),
       refreshDevices(),
+      refreshLogs(),
       refreshSettings(),
     ]);
 
@@ -995,6 +1064,9 @@
     setInterval(refreshActivity, 10000);
     setInterval(refreshTransfers, 10000);
     setInterval(refreshConflicts, 30000);
+    setInterval(() => {
+      if (document.getElementById('screen-logs')?.classList.contains('active')) refreshLogs();
+    }, 5000);
 
     // Show app
     document.body.classList.add('ready');

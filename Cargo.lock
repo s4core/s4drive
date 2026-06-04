@@ -4323,6 +4323,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

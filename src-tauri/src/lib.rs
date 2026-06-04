@@ -12,11 +12,14 @@ use s4drive_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     f64::consts::PI,
+    fs::{File, OpenOptions},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,6 +30,13 @@ use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_notification::NotificationExt;
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    fmt::MakeWriter,
+    layer::SubscriberExt,
+    reload,
+    util::SubscriberInitExt,
+};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "s4drive-main";
@@ -36,6 +46,14 @@ const TRAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(350);
 const DESKTOP_FILE_LIST_LIMIT: usize = 5_000;
 const DESKTOP_SYNC_SCAN_LIMIT: usize = 100_000;
 const LARGE_SYNC_CONFIRM_THRESHOLD: usize = 50_000;
+const LOG_FILE_NAME: &str = "s4drive.log";
+const LOG_MAX_LINES: usize = 10_000;
+const LOG_ROTATION_RETAIN_LINES: usize = 5_000;
+const LOG_DEFAULT_VISIBLE_LINES: usize = 1_000;
+const LOG_MAX_VISIBLE_LINES: usize = 2_000;
+const LOG_DEFAULT_LEVEL: &str = "warn";
+
+type LogReloadHandle = reload::Handle<Targets, tracing_subscriber::Registry>;
 
 // Application State
 
@@ -61,6 +79,8 @@ pub struct DesktopSettings {
     pub use_tls: bool,
     #[serde(default)]
     pub large_sync_confirmed: bool,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 }
 
 impl Default for DesktopSettings {
@@ -84,8 +104,13 @@ impl Default for DesktopSettings {
             use_system_theme: true,
             use_tls: core_defaults.s3.use_tls,
             large_sync_confirmed: false,
+            log_level: default_log_level(),
         }
     }
+}
+
+fn default_log_level() -> String {
+    LOG_DEFAULT_LEVEL.to_string()
 }
 
 impl DesktopSettings {
@@ -130,6 +155,7 @@ pub struct AppState {
     sync_detail: Mutex<String>,
     tray_status_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     large_sync_action_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    log_filter: Mutex<Option<LogReloadHandle>>,
     pending_route: Mutex<Option<String>>,
     device_id: Mutex<String>,
     settings: Mutex<DesktopSettings>,
@@ -151,6 +177,7 @@ impl Default for AppState {
             sync_detail: Mutex::new("Idle".to_string()),
             tray_status_item: Mutex::new(None),
             large_sync_action_item: Mutex::new(None),
+            log_filter: Mutex::new(None),
             pending_route: Mutex::new(None),
             device_id: Mutex::new(uuid::Uuid::now_v7().to_string()),
             settings: Mutex::new(DesktopSettings::default()),
@@ -286,11 +313,317 @@ struct DiagnosticItem {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct LogEntry {
+    timestamp: String,
+    level: String,
+    target: String,
+    message: String,
+    raw: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct UpdateInfo {
     current_version: String,
     update_available: bool,
     latest_version: Option<String>,
     message: String,
+}
+
+#[derive(Clone)]
+struct BoundedLogWriter {
+    inner: Arc<Mutex<BoundedLogState>>,
+}
+
+struct BoundedLogState {
+    file: Option<File>,
+    path: PathBuf,
+    max_lines: usize,
+    retain_lines: usize,
+    line_count: usize,
+}
+
+struct BoundedLogGuard {
+    inner: Arc<Mutex<BoundedLogState>>,
+}
+
+impl BoundedLogWriter {
+    fn new(path: PathBuf, max_lines: usize, retain_lines: usize) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let max_lines = max_lines.max(1);
+        let retain_lines = retain_lines.clamp(1, max_lines);
+        let line_count = rotate_log_file_if_needed(&path, max_lines, retain_lines)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(BoundedLogState {
+                file: Some(file),
+                path,
+                max_lines,
+                retain_lines,
+                line_count,
+            })),
+        })
+    }
+}
+
+impl<'a> MakeWriter<'a> for BoundedLogWriter {
+    type Writer = BoundedLogGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        BoundedLogGuard {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Write for BoundedLogGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("log writer mutex poisoned"))?;
+        state
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("log file is not open"))?
+            .write_all(buf)?;
+        let new_lines = buf.iter().filter(|byte| **byte == b'\n').count();
+        if new_lines > 0 {
+            state.line_count = state.line_count.saturating_add(new_lines);
+            if state.line_count > state.max_lines {
+                if let Some(mut file) = state.file.take() {
+                    file.flush()?;
+                }
+                let rotation =
+                    rotate_log_file_if_needed(&state.path, state.max_lines, state.retain_lines);
+                state.file = Some(
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&state.path)?,
+                );
+                state.line_count = rotation?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("log writer mutex poisoned"))?;
+        state
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("log file is not open"))?
+            .flush()
+    }
+}
+
+fn rotate_log_file_if_needed(
+    path: &Path,
+    max_lines: usize,
+    retain_lines: usize,
+) -> io::Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let max_lines = max_lines.max(1);
+    let retain_lines = retain_lines.clamp(1, max_lines);
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut line_count = 0usize;
+    let mut recent = VecDeque::with_capacity(retain_lines.min(1024));
+    for line in reader.lines() {
+        let line = line?;
+        line_count = line_count.saturating_add(1);
+        if recent.len() == retain_lines {
+            recent.pop_front();
+        }
+        recent.push_back(line);
+    }
+
+    if line_count <= max_lines {
+        return Ok(line_count);
+    }
+
+    let temp_path = path.with_extension("log.tmp");
+    {
+        let mut temp = File::create(&temp_path)?;
+        for line in &recent {
+            writeln!(temp, "{}", line)?;
+        }
+        temp.flush()?;
+    }
+    std::fs::rename(temp_path, path)?;
+    Ok(recent.len())
+}
+
+fn normalize_log_level(level: &str) -> &'static str {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "error" | "1" => "error",
+        "warn" | "warning" | "2" => "warn",
+        "info" | "3" => "info",
+        "debug" | "4" => "debug",
+        "trace" | "5" => "trace",
+        _ => LOG_DEFAULT_LEVEL,
+    }
+}
+
+fn log_level_filter(level: &str) -> LevelFilter {
+    match normalize_log_level(level) {
+        "error" => LevelFilter::ERROR,
+        "warn" => LevelFilter::WARN,
+        "info" => LevelFilter::INFO,
+        "debug" => LevelFilter::DEBUG,
+        "trace" => LevelFilter::TRACE,
+        _ => LevelFilter::WARN,
+    }
+}
+
+fn log_targets_filter(level: &str) -> Targets {
+    let level = log_level_filter(level);
+    Targets::new()
+        .with_default(LevelFilter::OFF)
+        .with_target("s4drive_core", level)
+        .with_target("s4drive_tauri", level)
+}
+
+fn log_level_rank(level: &str) -> u8 {
+    match normalize_log_level(level) {
+        "error" => 1,
+        "warn" => 2,
+        "info" => 3,
+        "debug" => 4,
+        "trace" => 5,
+        _ => 2,
+    }
+}
+
+fn log_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|dir| dir.join("logs").join(LOG_FILE_NAME))
+        .map_err(|e| e.to_string())
+}
+
+fn init_desktop_logging(app: &AppHandle, settings: &DesktopSettings) {
+    let path = match log_path(app) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("failed to resolve S4Drive log path: {}", error);
+            return;
+        }
+    };
+    let writer = match BoundedLogWriter::new(path.clone(), LOG_MAX_LINES, LOG_ROTATION_RETAIN_LINES)
+    {
+        Ok(writer) => writer,
+        Err(error) => {
+            eprintln!(
+                "failed to open S4Drive log file {}: {}",
+                path.display(),
+                error
+            );
+            return;
+        }
+    };
+
+    let (filter_layer, handle) = reload::Layer::new(log_targets_filter(&settings.log_level));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_level(true);
+
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer);
+    match subscriber.try_init() {
+        Ok(()) => {
+            if let Ok(mut current) = app.state::<AppState>().log_filter.lock() {
+                *current = Some(handle);
+            }
+            tracing::info!("S4Drive desktop logging initialized: {}", path.display());
+        }
+        Err(error) => {
+            eprintln!("failed to initialize S4Drive logging: {}", error);
+        }
+    }
+}
+
+fn apply_log_level(state: &AppState, level: &str) -> Result<(), String> {
+    let normalized = normalize_log_level(level);
+    let handle = state.log_filter.lock().map_err(|e| e.to_string())?.clone();
+    if let Some(handle) = handle {
+        handle
+            .modify(|filter| *filter = log_targets_filter(normalized))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn read_log_entries(path: &Path, level: &str, limit: usize) -> Result<Vec<LogEntry>, String> {
+    let limit = limit.clamp(1, LOG_MAX_VISIBLE_LINES);
+    let normalized_level = normalize_log_level(level);
+    let max_rank = log_level_rank(normalized_level);
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+
+    let reader = BufReader::new(file);
+    let mut recent = VecDeque::with_capacity(limit);
+    for line in reader.lines() {
+        let raw = line.map_err(|e| e.to_string())?;
+        let entry = parse_log_entry(&raw);
+        if log_level_rank(&entry.level) > max_rank {
+            continue;
+        }
+        if recent.len() == limit {
+            recent.pop_front();
+        }
+        recent.push_back(entry);
+    }
+    Ok(recent.into_iter().collect())
+}
+
+fn parse_log_entry(raw: &str) -> LogEntry {
+    let mut tokens = raw.split_whitespace();
+    let timestamp = tokens
+        .next()
+        .filter(|token| token.contains('-') || token.contains('T'))
+        .unwrap_or("")
+        .to_string();
+    let level = parse_log_level_token(tokens.next());
+    let target = tokens
+        .next()
+        .filter(|token| token.ends_with(':'))
+        .map(|token| token.trim_end_matches(':').to_string())
+        .unwrap_or_default();
+    LogEntry {
+        timestamp,
+        level,
+        target,
+        message: raw.to_string(),
+        raw: raw.to_string(),
+    }
+}
+
+fn parse_log_level_token(token: Option<&str>) -> String {
+    match token {
+        Some("ERROR") => "error",
+        Some("WARN") => "warn",
+        Some("INFO") => "info",
+        Some("DEBUG") => "debug",
+        Some("TRACE") => "trace",
+        _ => LOG_DEFAULT_LEVEL,
+    }
+    .to_string()
 }
 
 // Tauri Setup
@@ -306,6 +639,8 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
         .setup(|app| {
+            let logging_settings = load_settings_from_disk(app.handle()).unwrap_or_default();
+            init_desktop_logging(app.handle(), &logging_settings);
             load_settings_into_state(app.handle());
             let state = app.state::<AppState>();
             let needs_setup = state
@@ -354,6 +689,8 @@ pub fn run() {
             get_devices,
             resolve_conflict,
             run_diagnostics,
+            get_logs,
+            set_log_level,
             check_for_updates,
         ])
         .build(tauri::generate_context!());
@@ -1726,9 +2063,10 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Result<DesktopSettings, St
 fn save_settings(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
-    settings: DesktopSettings,
+    mut settings: DesktopSettings,
     secret_key: Option<String>,
 ) -> Result<DesktopSettings, String> {
+    settings.log_level = normalize_log_level(&settings.log_level).to_string();
     if let Some(secret) = secret_key.as_deref() {
         save_secret_for_settings(&app, &settings, secret)?;
     }
@@ -1748,6 +2086,7 @@ fn save_settings(
     } else if sync_folder_changed {
         clear_large_sync_attention(&app, state.inner(), "Idle");
     }
+    apply_log_level(state.inner(), &settings.log_level)?;
     ensure_auto_sync(&app);
     Ok(settings)
 }
@@ -2029,6 +2368,7 @@ async fn run_sync_now_with_options(
         *last_summary = Some(message.clone());
     }
     if notify_user || meaningful_activity {
+        tracing::info!("{}", message);
         eprintln!("S4Drive {}", message);
     }
 
@@ -2063,6 +2403,7 @@ fn record_sync_failure(app: &AppHandle, state: &AppState, error: &str) {
     set_sync_detail(app, state, format!("Sync failed: {}", error));
     set_tray_idle_icon(app);
     let summary = format!("Sync failed: {}", error);
+    tracing::warn!("{}", summary);
     eprintln!("S4Drive {}", summary);
     if let Ok(mut last_summary) = state.last_sync_summary.lock() {
         *last_summary = Some(summary);
@@ -2234,6 +2575,20 @@ async fn run_diagnostics(
             detail: settings_file,
         },
         DiagnosticItem {
+            name: "Log file".to_string(),
+            status: "ok".to_string(),
+            detail: log_path(&app)
+                .map(|path| {
+                    format!(
+                        "{} (up to {} lines retained, current level={})",
+                        path.display(),
+                        LOG_MAX_LINES,
+                        normalize_log_level(&settings.log_level)
+                    )
+                })
+                .unwrap_or_else(|error| format!("unavailable: {}", error)),
+        },
+        DiagnosticItem {
             name: "Sync state".to_string(),
             status: sync_diagnostic_status.to_string(),
             detail: format!(
@@ -2358,6 +2713,37 @@ async fn run_diagnostics(
 }
 
 #[tauri::command]
+fn get_logs(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    level: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<LogEntry>, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let level = level.unwrap_or(settings.log_level);
+    let limit = limit.unwrap_or(LOG_DEFAULT_VISIBLE_LINES);
+    read_log_entries(&log_path(&app)?, &level, limit)
+}
+
+#[tauri::command]
+fn set_log_level(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    level: String,
+) -> Result<DesktopSettings, String> {
+    let normalized = normalize_log_level(&level).to_string();
+    let mut settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    settings.log_level = normalized.clone();
+    save_settings_to_disk(&app, &settings)?;
+    let mut current = state.settings.lock().map_err(|e| e.to_string())?;
+    *current = settings.clone();
+    drop(current);
+    apply_log_level(state.inner(), &normalized)?;
+    tracing::info!("Log level changed to {}", normalized);
+    Ok(settings)
+}
+
+#[tauri::command]
 fn check_for_updates() -> Result<UpdateInfo, String> {
     Ok(UpdateInfo {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2459,5 +2845,80 @@ mod tests {
 
         assert_eq!(status.state, "attention");
         assert!(!status.running);
+    }
+
+    #[test]
+    fn log_level_normalization_defaults_to_warn() {
+        assert_eq!(normalize_log_level("error"), "error");
+        assert_eq!(normalize_log_level("warning"), "warn");
+        assert_eq!(normalize_log_level("4"), "debug");
+        assert_eq!(normalize_log_level("unexpected"), "warn");
+    }
+
+    #[test]
+    fn log_entry_detects_level_from_formatted_line() {
+        let entry =
+            parse_log_entry("2026-06-04T12:00:00Z WARN s4drive_tauri: Task join error: timeout");
+
+        assert_eq!(entry.level, "warn");
+        assert_eq!(entry.timestamp, "2026-06-04T12:00:00Z");
+        assert_eq!(entry.target, "s4drive_tauri");
+    }
+
+    #[test]
+    fn log_target_filter_excludes_dependencies_at_trace() {
+        let filter = log_targets_filter("trace");
+
+        assert!(filter.would_enable("s4drive_core::sync", &tracing::Level::TRACE));
+        assert!(filter.would_enable("s4drive_tauri", &tracing::Level::TRACE));
+        assert!(!filter.would_enable("aws_smithy_runtime", &tracing::Level::ERROR));
+        assert!(!filter.would_enable("hyper", &tracing::Level::TRACE));
+    }
+
+    #[test]
+    fn log_rotation_trims_in_chunks_instead_of_every_line() {
+        let root = std::env::temp_dir().join(format!("s4drive-log-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("s4drive.log");
+        let writer = BoundedLogWriter::new(path.clone(), 5, 3).unwrap();
+        let mut guard = writer.make_writer();
+        guard
+            .write_all(b"one\ntwo\nthree\nfour\nfive\nsix\n")
+            .unwrap();
+        guard.flush().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "four\nfive\nsix\n");
+
+        guard.write_all(b"seven\n").unwrap();
+        guard.flush().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "four\nfive\nsix\nseven\n"
+        );
+
+        drop(guard);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn errors_only_filter_does_not_include_warn_message_containing_error() {
+        let root = std::env::temp_dir().join(format!("s4drive-log-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("s4drive.log");
+        std::fs::write(
+            &path,
+            "2026-06-04T12:00:00Z WARN s4drive_core: Task join error: timeout\n\
+             2026-06-04T12:00:01Z ERROR s4drive_core: sync failed\n",
+        )
+        .unwrap();
+
+        let entries = read_log_entries(&path, "error", 100).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, "error");
+        assert!(entries[0].raw.contains("sync failed"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
