@@ -9,6 +9,7 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use rusqlite::OpenFlags;
 use s4drive_core::config::Config;
+use s4drive_core::metadata::compaction::DeviceWatermarks;
 use s4drive_core::metadata::engine::MetadataEngine;
 use s4drive_core::s3::S3Adapter;
 use std::io::Write;
@@ -177,6 +178,33 @@ enum MetadataAction {
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+
+    /// Исключить старое устройство из блокирующих GC watermarks
+    RetireDevice {
+        /// S3 endpoint URL
+        #[arg(short, long)]
+        endpoint: String,
+
+        /// S3 bucket name
+        #[arg(short, long)]
+        bucket: String,
+
+        /// Access key ID
+        #[arg(short, long)]
+        access_key: String,
+
+        /// Secret access key
+        #[arg(short = 's', long = "secret")]
+        secret_key: String,
+
+        /// AWS region (default: us-east-1)
+        #[arg(short, long, default_value = "us-east-1")]
+        region: String,
+
+        /// Device UUID to retire
+        #[arg(long)]
+        device_id: uuid::Uuid,
+    },
 }
 
 #[derive(Subcommand)]
@@ -328,6 +356,24 @@ async fn main() {
             } => {
                 run_metadata_ops(&endpoint, &bucket, &access_key, &secret_key, &region, limit)
                     .await;
+            }
+            MetadataAction::RetireDevice {
+                endpoint,
+                bucket,
+                access_key,
+                secret_key,
+                region,
+                device_id,
+            } => {
+                run_retire_device(
+                    &endpoint,
+                    &bucket,
+                    &access_key,
+                    &secret_key,
+                    &region,
+                    device_id,
+                )
+                .await;
             }
         },
         Commands::Sync { action } => match action {
@@ -748,6 +794,25 @@ async fn run_metadata_ops(
         Err(e) => println!("  ✗ Failed to list ops: {}", e),
     }
     println!();
+}
+
+async fn run_retire_device(
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    device_id: uuid::Uuid,
+) {
+    let engine = match create_engine(endpoint, bucket, access_key, secret_key, region).await {
+        Some(engine) => engine,
+        None => return,
+    };
+
+    match DeviceWatermarks::new(engine.s3()).retire(device_id).await {
+        Ok(_) => println!("Retired device {}", device_id),
+        Err(error) => println!("Failed to retire device {}: {}", device_id, error),
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────

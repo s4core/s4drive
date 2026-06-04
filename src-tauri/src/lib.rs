@@ -129,7 +129,7 @@ pub struct AppState {
     sync_detail: Mutex<String>,
     tray_status_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     pending_route: Mutex<Option<String>>,
-    device_id: String,
+    device_id: Mutex<String>,
     settings: Mutex<DesktopSettings>,
 }
 
@@ -148,7 +148,7 @@ impl Default for AppState {
             sync_detail: Mutex::new("Idle".to_string()),
             tray_status_item: Mutex::new(None),
             pending_route: Mutex::new(None),
-            device_id: uuid::Uuid::now_v7().to_string(),
+            device_id: Mutex::new(uuid::Uuid::now_v7().to_string()),
             settings: Mutex::new(DesktopSettings::default()),
         }
     }
@@ -881,6 +881,28 @@ fn app_local_config(app: &AppHandle, settings: &DesktopSettings) -> Config {
     config
 }
 
+fn state_device_id(state: &AppState) -> Result<String, String> {
+    state
+        .device_id
+        .lock()
+        .map_err(|e| e.to_string())
+        .map(|id| id.clone())
+}
+
+fn set_state_device_id(state: &AppState, device_id: uuid::Uuid) {
+    if let Ok(mut current) = state.device_id.lock() {
+        *current = device_id.to_string();
+    }
+}
+
+fn stable_device_id_from_db(db: &LocalDatabase, state: &AppState) -> Result<uuid::Uuid, String> {
+    let device_id = db
+        .get_or_create_local_device_id()
+        .map_err(|e| e.to_string())?;
+    set_state_device_id(state, device_id);
+    Ok(device_id)
+}
+
 async fn count_unmanaged_remote_objects(s3: &S3Adapter) -> Result<usize, String> {
     s3.list_objects("")
         .await
@@ -1506,7 +1528,7 @@ fn get_app_info(state: tauri::State<'_, AppState>) -> Result<AppInfo, String> {
     Ok(AppInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         core_version: env!("CARGO_PKG_VERSION").to_string(),
-        device_id: state.device_id.clone(),
+        device_id: state_device_id(state.inner())?,
         sync_folder: settings.sync_folder,
         bucket: settings.bucket,
         endpoint: settings.endpoint,
@@ -1689,9 +1711,10 @@ async fn run_sync_now_with_options(
         .await
         .map_err(|e| humanize_connection_error(&e.to_string()))?;
     let unmanaged_remote_objects = count_unmanaged_remote_objects(&s3).await.unwrap_or(0);
+    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let device_id = stable_device_id_from_db(&db, state)?;
 
     set_sync_detail(&app, state, "Preparing metadata");
-    let device_id = uuid::Uuid::parse_str(&state.device_id).map_err(|e| e.to_string())?;
     let metadata = MetadataEngine::new(s3.clone(), device_id);
     let mut bucket_initialized = false;
     if !metadata
@@ -1710,7 +1733,6 @@ async fn run_sync_now_with_options(
     }
 
     let (_watcher, event_stream) = FileWatcher::with_channel(&config).map_err(|e| e.to_string())?;
-    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
     let activity_db = db.clone();
     let transfer = TransferQueue::new(&db);
     let transfer_status = transfer.clone();
@@ -1968,7 +1990,7 @@ fn get_versions() -> Result<Vec<VersionItem>, String> {
 #[tauri::command]
 fn get_devices(state: tauri::State<'_, AppState>) -> Result<Vec<DeviceItem>, String> {
     Ok(vec![DeviceItem {
-        device_id: state.device_id.clone(),
+        device_id: state_device_id(state.inner())?,
         name: "This device".to_string(),
         role: "Desktop client".to_string(),
         last_seen: Some(chrono::Utc::now().to_rfc3339()),
@@ -2084,8 +2106,8 @@ async fn run_diagnostics(
                             .map(|item| item.status.as_str() == "ok")
                             .unwrap_or(false)
                         {
-                            let device_id = uuid::Uuid::parse_str(&state.device_id)
-                                .map_err(|e| e.to_string())?;
+                            let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+                            let device_id = stable_device_id_from_db(&db, state.inner())?;
                             let metadata = MetadataEngine::new(s3.clone(), device_id);
                             let initialized = metadata.check_initialized().await;
                             items.push(DiagnosticItem {

@@ -56,6 +56,7 @@ const REMOTE_HEAD_CHECKPOINT: &str = "remote_head";
 const REMOTE_TREE_CURSOR_CHECKPOINT: &str = "remote_tree_cursor";
 const REMOTE_TREE_MODE_CHECKPOINT: &str = "remote_tree_mode";
 const REMOTE_TREE_TARGET_HEAD_CHECKPOINT: &str = "remote_tree_target_head";
+const REMOTE_TREE_SCAN_ID_CHECKPOINT: &str = "remote_tree_scan_id";
 const REMOTE_TREE_CURSOR_DONE: &str = "__complete__";
 const MIN_BLOB_LEASE_TTL_MINUTES: u64 = 1;
 
@@ -81,10 +82,6 @@ impl RemoteTreeScanMode {
             Some("stale_fallback") => Self::StaleFallback,
             _ => Self::Bootstrap,
         }
-    }
-
-    fn should_advance_head(self) -> bool {
-        matches!(self, Self::Bootstrap | Self::CompactedFallback)
     }
 
     fn should_reconcile_existing(self) -> bool {
@@ -1041,27 +1038,44 @@ async fn queue_missing_remote_tree_entries_from(
         });
     }
 
-    let continuing = !restart
+    let saved_cursor_active = !restart
         && saved_cursor
             .as_deref()
             .is_some_and(|value| !value.is_empty());
-    let mode = if continuing {
+    let saved_scan_id = db
+        .get_checkpoint(REMOTE_TREE_SCAN_ID_CHECKPOINT)?
+        .filter(|value| !value.is_empty());
+    let mode = if saved_cursor_active {
         RemoteTreeScanMode::from_checkpoint(
             db.get_checkpoint(REMOTE_TREE_MODE_CHECKPOINT)?.as_deref(),
         )
     } else {
         requested_mode
     };
-    let mut continuation_token = if continuing { saved_cursor } else { None };
-    let target_head = if !continuing {
-        let target_head = remote_head_for_checkpoint(s3).await?;
-        db.set_checkpoint(REMOTE_TREE_TARGET_HEAD_CHECKPOINT, &target_head)?;
-        db.set_checkpoint(REMOTE_TREE_MODE_CHECKPOINT, mode.checkpoint_value())?;
-        target_head
-    } else {
-        db.get_checkpoint(REMOTE_TREE_TARGET_HEAD_CHECKPOINT)?
-            .unwrap_or_default()
-    };
+    let continuation =
+        remote_tree_scan_continuation(restart, saved_cursor.as_deref(), saved_scan_id.as_deref());
+    if saved_cursor_active && continuation.is_none() {
+        tracing::warn!(
+            "Remote tree scan checkpoint has no scan id; restarting scan from the beginning"
+        );
+    }
+
+    let (mut continuation_token, target_head, scan_id) =
+        if let Some((cursor, existing_scan_id)) = continuation {
+            (
+                Some(cursor),
+                db.get_checkpoint(REMOTE_TREE_TARGET_HEAD_CHECKPOINT)?
+                    .unwrap_or_default(),
+                existing_scan_id,
+            )
+        } else {
+            let target_head = remote_head_for_checkpoint(s3).await?;
+            db.set_checkpoint(REMOTE_TREE_TARGET_HEAD_CHECKPOINT, &target_head)?;
+            db.set_checkpoint(REMOTE_TREE_MODE_CHECKPOINT, mode.checkpoint_value())?;
+            let scan_id = uuid::Uuid::now_v7().to_string();
+            db.set_checkpoint(REMOTE_TREE_SCAN_ID_CHECKPOINT, &scan_id)?;
+            (None, target_head, scan_id)
+        };
 
     tracing::info!(
         "Initial sync: scanning remote tree page; continuation={}",
@@ -1078,7 +1092,7 @@ async fn queue_missing_remote_tree_entries_from(
 
         for file_id in &page.ids {
             if let Ok(entry) = tree.get_entry(file_id).await {
-                if queue_remote_tree_entry(
+                let result = queue_remote_tree_entry(
                     db,
                     transfer,
                     versions,
@@ -1086,9 +1100,12 @@ async fn queue_missing_remote_tree_entries_from(
                     &entry,
                     mode.should_reconcile_existing(),
                 )
-                .await?
-                {
+                .await?;
+                if result.queued {
                     queued += 1;
+                }
+                if result.checkpoint_safe {
+                    db.mark_remote_tree_entry_seen(file_id, &scan_id)?;
                 }
             }
         }
@@ -1103,8 +1120,14 @@ async fn queue_missing_remote_tree_entries_from(
             continuation_token = Some(next);
         } else {
             db.set_checkpoint(REMOTE_TREE_CURSOR_CHECKPOINT, REMOTE_TREE_CURSOR_DONE)?;
-            if mode.should_advance_head() {
+            let blockers = db.remote_tree_scan_blocker_count(&scan_id)?;
+            if blockers == 0 {
                 db.set_checkpoint(REMOTE_HEAD_CHECKPOINT, &target_head)?;
+            } else {
+                tracing::warn!(
+                    "Remote tree fallback cannot advance head: {} local remote-managed entry(s) were absent from scan",
+                    blockers
+                );
             }
             complete = true;
             break;
@@ -1125,6 +1148,22 @@ async fn queue_missing_remote_tree_entries_from(
     Ok(RemoteTreeScan { queued, complete })
 }
 
+fn remote_tree_scan_continuation(
+    restart: bool,
+    saved_cursor: Option<&str>,
+    saved_scan_id: Option<&str>,
+) -> Option<(String, String)> {
+    if restart {
+        return None;
+    }
+    let cursor = saved_cursor.filter(|value| !value.is_empty())?;
+    if cursor == REMOTE_TREE_CURSOR_DONE {
+        return None;
+    }
+    let scan_id = saved_scan_id.filter(|value| !value.is_empty())?;
+    Some((cursor.to_string(), scan_id.to_string()))
+}
+
 async fn queue_remote_tree_entry(
     db: &LocalDatabase,
     transfer: &TransferQueue,
@@ -1132,12 +1171,12 @@ async fn queue_remote_tree_entry(
     sync_folder: &str,
     entry: &FileEntry,
     reconcile_existing: bool,
-) -> CoreResult<bool> {
+) -> CoreResult<RemoteTreeEntryResult> {
     if entry.entry_type != EntryType::File {
-        return Ok(false);
+        return Ok(RemoteTreeEntryResult::checkpoint_safe());
     }
     let Some(content_ref) = entry.content_ref.as_ref() else {
-        return Ok(false);
+        return Ok(RemoteTreeEntryResult::blocked());
     };
 
     let file_id = entry.file_id;
@@ -1146,7 +1185,7 @@ async fn queue_remote_tree_entry(
 
     if let Some(local_entry) = db.get_file(&file_id)? {
         if !reconcile_existing {
-            return Ok(false);
+            return Ok(RemoteTreeEntryResult::blocked());
         }
 
         let old_path = db.get_local_path(&file_id)?.unwrap_or_default();
@@ -1166,7 +1205,7 @@ async fn queue_remote_tree_entry(
                 "Remote tree fallback skipped changed local file during reconcile: {}",
                 old_path_buf.display()
             );
-            return Ok(false);
+            return Ok(RemoteTreeEntryResult::blocked());
         }
 
         if !old_path.is_empty() && old_path != local_path_text && old_path_buf.exists() {
@@ -1175,7 +1214,7 @@ async fn queue_remote_tree_entry(
                     "Remote tree fallback skipped rename because target exists: {}",
                     local_path.display()
                 );
-                return Ok(false);
+                return Ok(RemoteTreeEntryResult::blocked());
             }
             if let Some(parent) = local_path.parent() {
                 std::fs::create_dir_all(parent)
@@ -1187,7 +1226,7 @@ async fn queue_remote_tree_entry(
 
         if same_content {
             db.register_file_at_path_with_state(entry, &local_path_text, &entry.name, "synced")?;
-            return Ok(false);
+            return Ok(RemoteTreeEntryResult::checkpoint_safe());
         }
     }
 
@@ -1205,7 +1244,35 @@ async fn queue_remote_tree_entry(
         "clean",
         None,
     )?;
-    Ok(true)
+    Ok(RemoteTreeEntryResult::queued())
+}
+
+struct RemoteTreeEntryResult {
+    queued: bool,
+    checkpoint_safe: bool,
+}
+
+impl RemoteTreeEntryResult {
+    fn queued() -> Self {
+        Self {
+            queued: true,
+            checkpoint_safe: true,
+        }
+    }
+
+    fn checkpoint_safe() -> Self {
+        Self {
+            queued: false,
+            checkpoint_safe: true,
+        }
+    }
+
+    fn blocked() -> Self {
+        Self {
+            queued: false,
+            checkpoint_safe: false,
+        }
+    }
 }
 
 // ─── Incremental Sync Cycle ─────────────────────────────────────
@@ -2990,14 +3057,32 @@ mod tests {
     }
 
     #[test]
-    fn compacted_fallback_advances_head_after_full_tree_scan() {
-        assert!(RemoteTreeScanMode::Bootstrap.should_advance_head());
-        assert!(!RemoteTreeScanMode::StaleFallback.should_advance_head());
-        assert!(RemoteTreeScanMode::CompactedFallback.should_advance_head());
+    fn remote_tree_fallback_reconciles_existing_entries() {
+        assert!(RemoteTreeScanMode::StaleFallback.should_reconcile_existing());
         assert!(RemoteTreeScanMode::CompactedFallback.should_reconcile_existing());
         assert_eq!(
             RemoteTreeScanMode::from_checkpoint(Some("compacted_fallback")),
             RemoteTreeScanMode::CompactedFallback
+        );
+    }
+
+    #[test]
+    fn legacy_remote_tree_scan_without_scan_id_restarts() {
+        assert_eq!(
+            remote_tree_scan_continuation(false, Some("page-token"), Some("scan-id")),
+            Some(("page-token".to_string(), "scan-id".to_string()))
+        );
+        assert_eq!(
+            remote_tree_scan_continuation(false, Some("page-token"), None),
+            None
+        );
+        assert_eq!(
+            remote_tree_scan_continuation(false, Some(REMOTE_TREE_CURSOR_DONE), None),
+            None
+        );
+        assert_eq!(
+            remote_tree_scan_continuation(true, Some("page-token"), Some("scan-id")),
+            None
         );
     }
 

@@ -186,6 +186,7 @@ impl SyncMaintenance {
                     snapshot,
                     self.config.remote_op_compaction_batch_size.max(1),
                     self.config.remote_op_watermark_stale_days,
+                    self.config.remote_op_retention_days,
                 )
                 .await?;
             report.ops_deleted = compaction.pruned_ops;

@@ -67,6 +67,7 @@ pub struct MaintenanceConfig {
     pub remote_blob_reference_page_size: i32,
     pub remote_op_compaction_enabled: bool,
     pub remote_op_compaction_batch_size: usize,
+    pub remote_op_retention_days: u64,
     pub remote_op_snapshot_interval_ops: usize,
     pub remote_op_snapshot_max_entries: usize,
     pub remote_op_watermark_stale_days: u64,
@@ -96,6 +97,7 @@ impl Default for MaintenanceConfig {
             remote_blob_reference_page_size: 250,
             remote_op_compaction_enabled: true,
             remote_op_compaction_batch_size: 250,
+            remote_op_retention_days: 90,
             remote_op_snapshot_interval_ops: 1_000,
             remote_op_snapshot_max_entries: 50_000,
             remote_op_watermark_stale_days: 90,
@@ -219,6 +221,7 @@ max_retries = 3
         assert_eq!(config.maintenance.remote_blob_quarantine_days, 90);
         assert!(config.maintenance.remote_op_compaction_enabled);
         assert_eq!(config.maintenance.remote_op_compaction_batch_size, 250);
+        assert_eq!(config.maintenance.remote_op_retention_days, 90);
         assert_eq!(config.maintenance.remote_op_snapshot_interval_ops, 1_000);
         assert_eq!(config.maintenance.remote_op_snapshot_max_entries, 50_000);
     }

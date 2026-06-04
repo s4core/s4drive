@@ -7,6 +7,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
+const LOCAL_DEVICE_ID_CHECKPOINT: &str = "local_device_id";
+
 /// Local SQLite database for metadata index and transfer queue.
 #[derive(Clone)]
 pub struct LocalDatabase {
@@ -169,6 +171,16 @@ impl LocalDatabase {
                 .map_err(|e| CoreError::Database(e.to_string()))?;
             conn.execute(
                 "INSERT INTO schema_version (version, applied_at) VALUES (5, datetime('now'))",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
+
+        if version < 6 {
+            conn.execute_batch(include_str!("../migrations/v006_remote_tree_scan.sql"))
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (6, datetime('now'))",
                 [],
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
@@ -641,7 +653,7 @@ impl LocalDatabase {
                  WHERE id > ?1
                    AND local_path != ''
                    AND is_folder = 0
-                   AND state IN ('synced', 'modified_locally')
+                   AND state IN ('synced', 'modified_locally', 'pending_upload')
                  ORDER BY id ASC
                  LIMIT ?2",
             )
@@ -1054,6 +1066,56 @@ impl LocalDatabase {
         )
         .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    pub fn get_or_create_local_device_id(&self) -> CoreResult<uuid::Uuid> {
+        if let Some(value) = self.get_checkpoint(LOCAL_DEVICE_ID_CHECKPOINT)? {
+            if let Ok(device_id) = uuid::Uuid::parse_str(&value) {
+                return Ok(device_id);
+            }
+        }
+
+        let device_id = uuid::Uuid::now_v7();
+        self.set_checkpoint(LOCAL_DEVICE_ID_CHECKPOINT, &device_id.to_string())?;
+        Ok(device_id)
+    }
+
+    pub fn mark_remote_tree_entry_seen(
+        &self,
+        file_id: &uuid::Uuid,
+        scan_id: &str,
+    ) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE objects
+             SET remote_seen_scan_id = ?2
+             WHERE file_id = ?1",
+            rusqlite::params![file_id.to_string(), scan_id],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn remote_tree_scan_blocker_count(&self, scan_id: &str) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM objects
+                 WHERE state NOT IN ('deleted_locally', 'ignored')
+                   AND NOT (state = 'pending_upload' AND current_revision_id IS NULL)
+                   AND COALESCE(remote_seen_scan_id, '') != ?1",
+                rusqlite::params![scan_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(count.max(0) as u64)
     }
 
     // ─── Extended File Operations (Phase 4) ────────────────────────
@@ -1989,7 +2051,73 @@ mod tests {
     }
 
     #[test]
-    fn live_local_file_candidates_only_returns_synced_existing_states() {
+    fn local_device_id_is_reused_from_checkpoint() {
+        let db = test_db();
+        let first = db.get_or_create_local_device_id().unwrap();
+        let second = db.get_or_create_local_device_id().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            db.get_checkpoint(LOCAL_DEVICE_ID_CHECKPOINT).unwrap(),
+            Some(first.to_string())
+        );
+    }
+
+    #[test]
+    fn remote_tree_scan_only_advances_when_remote_managed_entries_were_seen() {
+        let db = test_db();
+        let seen = file_entry("seen.txt", 1);
+        let missing = file_entry("missing.txt", 1);
+        let mut local_only = file_entry("local-only.txt", 1);
+        local_only.current_revision_id = None;
+        let modified_remote = file_entry("modified-remote.txt", 1);
+        let deleted = file_entry("deleted.txt", 1);
+
+        db.register_file_at_path_with_state(&seen, "/tmp/seen.txt", "seen.txt", "synced")
+            .unwrap();
+        db.register_file_at_path_with_state(
+            &missing,
+            "/tmp/missing.txt",
+            "missing.txt",
+            "pending_download",
+        )
+        .unwrap();
+        db.register_file_at_path_with_state(
+            &local_only,
+            "/tmp/local-only.txt",
+            "local-only.txt",
+            "pending_upload",
+        )
+        .unwrap();
+        db.register_file_at_path_with_state(
+            &modified_remote,
+            "/tmp/modified-remote.txt",
+            "modified-remote.txt",
+            "pending_upload",
+        )
+        .unwrap();
+        db.register_file_at_path_with_state(
+            &deleted,
+            "/tmp/deleted.txt",
+            "deleted.txt",
+            "deleted_locally",
+        )
+        .unwrap();
+
+        db.mark_remote_tree_entry_seen(&seen.file_id, "scan-1")
+            .unwrap();
+        assert_eq!(db.remote_tree_scan_blocker_count("scan-1").unwrap(), 2);
+
+        db.mark_remote_tree_entry_seen(&missing.file_id, "scan-1")
+            .unwrap();
+        assert_eq!(db.remote_tree_scan_blocker_count("scan-1").unwrap(), 1);
+
+        db.mark_remote_tree_entry_seen(&modified_remote.file_id, "scan-1")
+            .unwrap();
+        assert_eq!(db.remote_tree_scan_blocker_count("scan-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn live_local_file_candidates_returns_states_safe_for_missing_file_delete() {
         let db = test_db();
         let synced_path = temp_file("synced.txt", b"synced");
         let pending_path = temp_file("pending.txt", b"pending");
@@ -2022,11 +2150,13 @@ mod tests {
 
         let candidates = db.live_local_file_candidates(10).unwrap();
 
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].file_id, synced.file_id);
         assert_eq!(candidates[0].state, "synced");
+        assert_eq!(candidates[1].file_id, pending.file_id);
+        assert_eq!(candidates[1].state, "pending_upload");
         assert!(db
-            .live_local_file_candidates_after(candidates[0].row_id, 10)
+            .live_local_file_candidates_after(candidates[1].row_id, 10)
             .unwrap()
             .is_empty());
 

@@ -5,7 +5,10 @@ use crate::metadata::types::{
 };
 use crate::s3::S3ObjectStore;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+
+const OP_COMPACTION_CURSOR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpCompactionReport {
@@ -86,7 +89,18 @@ impl<'a, S: S3ObjectStore + ?Sized> DeviceWatermarks<'a, S> {
     ) -> CoreResult<BTreeSet<DeviceId>> {
         let keys = self.s3.list_objects(&Serializer::device_prefix()).await?;
         let now = Utc::now();
+        let mut retired = BTreeSet::new();
         let mut devices = BTreeSet::new();
+
+        for key in keys.iter().filter(|key| key.ends_with("/watermark.json")) {
+            let data = self.s3.get_object(key).await?;
+            let text = String::from_utf8(data)
+                .map_err(|e| CoreError::Protocol(format!("device watermark UTF-8: {}", e)))?;
+            let watermark = Serializer::deserialize_device_watermark(&text)?;
+            if watermark.status == DeviceWatermarkStatus::Retired {
+                retired.insert(watermark.device_id);
+            }
+        }
 
         for key in keys
             .iter()
@@ -100,11 +114,49 @@ impl<'a, S: S3ObjectStore + ?Sized> DeviceWatermarks<'a, S> {
             if timestamp_is_stale(&device.last_seen, stale_days, now)? {
                 continue;
             }
+            if retired.contains(&device.device_id) {
+                continue;
+            }
             devices.insert(device.device_id);
         }
 
         Ok(devices)
     }
+
+    pub async fn retire(&self, device_id: DeviceId) -> CoreResult<DeviceWatermark> {
+        let key = Serializer::device_watermark_key(&device_id.to_string());
+        let mut watermark = match self.s3.get_object(&key).await {
+            Ok(data) => {
+                let text = String::from_utf8(data)
+                    .map_err(|e| CoreError::Protocol(format!("device watermark UTF-8: {}", e)))?;
+                Serializer::deserialize_device_watermark(&text)?
+            }
+            Err(CoreError::NotFound(_)) => DeviceWatermark {
+                device_id,
+                last_seen_at: String::new(),
+                applied_snapshot_seq: 0,
+                applied_head: String::new(),
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                status: DeviceWatermarkStatus::Retired,
+            },
+            Err(error) => return Err(error),
+        };
+        watermark.last_seen_at = Utc::now().to_rfc3339();
+        watermark.status = DeviceWatermarkStatus::Retired;
+        let json = Serializer::serialize_device_watermark(&watermark)?;
+        self.s3.put_object(&key, json.into_bytes()).await?;
+        Ok(watermark)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OpCompactionCursor {
+    schema_version: u32,
+    snapshot_seq: u64,
+    covered_head: String,
+    next_op: String,
+    #[serde(default)]
+    pending_delete: Vec<String>,
 }
 
 pub struct OpLogCompactor<'a, S: S3ObjectStore + ?Sized> {
@@ -208,6 +260,7 @@ impl<'a, S: S3ObjectStore + ?Sized> OpLogCompactor<'a, S> {
         snapshot: &SnapshotMetadata,
         batch_limit: usize,
         stale_days: u64,
+        retention_days: u64,
     ) -> CoreResult<OpCompactionReport> {
         let Some(covered_head) = snapshot
             .covered_head
@@ -253,57 +306,148 @@ impl<'a, S: S3ObjectStore + ?Sized> OpLogCompactor<'a, S> {
             return Ok(report);
         }
 
-        let compactable = self
-            .compactable_ancestors(covered_head, batch_limit.max(1))
+        let mut cursor = self
+            .load_or_initialize_cursor(snapshot, covered_head)
             .await?;
-        if compactable.is_empty() {
-            report.skipped_reason =
-                Some("no compactable non-content ops before snapshot head".to_string());
+        if !cursor.pending_delete.is_empty() {
+            let pending = std::mem::take(&mut cursor.pending_delete);
+            for op_id in pending {
+                self.s3.delete_object(&Serializer::op_key(&op_id)).await?;
+                report.pruned_ops += 1;
+            }
+            self.write_cursor(&cursor).await?;
+            return Ok(report);
+        }
+        if cursor.next_op.is_empty() {
+            report.skipped_reason = Some("no compactable ops before snapshot head".to_string());
             return Ok(report);
         }
 
-        for op_id in compactable {
+        let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
+        let scan = self
+            .compactable_ancestors(&cursor.next_op, batch_limit.max(1), cutoff)
+            .await?;
+        cursor.next_op = scan.next_op;
+        if scan.op_ids.is_empty() {
+            self.write_cursor(&cursor).await?;
+            report.skipped_reason = Some(if scan.retention_blocked {
+                "oldest compactable op is still inside retention window".to_string()
+            } else {
+                "no compactable ops before snapshot head".to_string()
+            });
+            return Ok(report);
+        }
+
+        cursor.pending_delete = scan.op_ids.clone();
+        self.write_cursor(&cursor).await?;
+        for op_id in scan.op_ids {
             self.s3.delete_object(&Serializer::op_key(&op_id)).await?;
             report.pruned_ops += 1;
         }
-        self.s3
-            .put_object(
-                &Serializer::ops_tail_key(),
-                covered_head.as_bytes().to_vec(),
-            )
-            .await?;
+        cursor.pending_delete.clear();
+        self.write_cursor(&cursor).await?;
         Ok(report)
+    }
+
+    async fn load_or_initialize_cursor(
+        &self,
+        snapshot: &SnapshotMetadata,
+        covered_head: &str,
+    ) -> CoreResult<OpCompactionCursor> {
+        if let Some(cursor) = self.read_cursor().await? {
+            if cursor.snapshot_seq <= snapshot.seq_num
+                && (!cursor.next_op.is_empty() || !cursor.pending_delete.is_empty())
+            {
+                return Ok(cursor);
+            }
+            if cursor.snapshot_seq == snapshot.seq_num {
+                return Ok(cursor);
+            }
+        }
+
+        let head = match self.read_operation(covered_head).await {
+            Ok(op) => op,
+            Err(CoreError::NotFound(_)) => {
+                return Ok(OpCompactionCursor {
+                    schema_version: OP_COMPACTION_CURSOR_SCHEMA_VERSION,
+                    snapshot_seq: snapshot.seq_num,
+                    covered_head: covered_head.to_string(),
+                    next_op: String::new(),
+                    pending_delete: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(OpCompactionCursor {
+            schema_version: OP_COMPACTION_CURSOR_SCHEMA_VERSION,
+            snapshot_seq: snapshot.seq_num,
+            covered_head: covered_head.to_string(),
+            next_op: head.base_head,
+            pending_delete: Vec::new(),
+        })
+    }
+
+    async fn read_cursor(&self) -> CoreResult<Option<OpCompactionCursor>> {
+        let data = match self.s3.get_object(&Serializer::ops_tail_key()).await {
+            Ok(data) => data,
+            Err(CoreError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let text = String::from_utf8(data)
+            .map_err(|e| CoreError::Protocol(format!("op compaction cursor UTF-8: {}", e)))?;
+        match serde_json::from_str::<OpCompactionCursor>(&text) {
+            Ok(cursor) if cursor.schema_version == OP_COMPACTION_CURSOR_SCHEMA_VERSION => {
+                Ok(Some(cursor))
+            }
+            Ok(_) | Err(_) => Ok(None),
+        }
+    }
+
+    async fn write_cursor(&self, cursor: &OpCompactionCursor) -> CoreResult<()> {
+        let json = serde_json::to_vec_pretty(cursor)
+            .map_err(|e| CoreError::Protocol(format!("op compaction cursor: {}", e)))?;
+        self.s3
+            .put_object(&Serializer::ops_tail_key(), json)
+            .await?;
+        Ok(())
     }
 
     async fn compactable_ancestors(
         &self,
-        covered_head: &str,
+        start_op: &str,
         batch_limit: usize,
-    ) -> CoreResult<Vec<String>> {
-        let head = match self.read_operation(covered_head).await {
-            Ok(op) => op,
-            Err(CoreError::NotFound(_)) => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
-        let mut cursor = head.base_head;
+        cutoff: DateTime<Utc>,
+    ) -> CoreResult<CompactableScan> {
+        let mut cursor = start_op.to_string();
         let mut op_ids = Vec::new();
-        let mut scanned = 0usize;
+        let mut retention_blocked = false;
 
-        while !cursor.is_empty() && scanned < batch_limit {
+        while !cursor.is_empty() && op_ids.len() < batch_limit {
             let op = match self.read_operation(&cursor).await {
                 Ok(op) => op,
-                Err(CoreError::NotFound(_)) => break,
+                Err(CoreError::NotFound(_)) => {
+                    cursor.clear();
+                    break;
+                }
                 Err(error) => return Err(error),
             };
-            scanned += 1;
-            let previous = op.base_head;
-            if op.effects.new_content_ref.is_none() {
-                op_ids.push(cursor);
+            let timestamp = DateTime::parse_from_rfc3339(&op.timestamp)
+                .map_err(|e| CoreError::Protocol(format!("operation timestamp: {}", e)))?
+                .with_timezone(&Utc);
+            if timestamp > cutoff {
+                retention_blocked = true;
+                break;
             }
+            let previous = op.base_head;
+            op_ids.push(cursor);
             cursor = previous;
         }
 
-        Ok(op_ids)
+        Ok(CompactableScan {
+            op_ids,
+            next_op: cursor,
+            retention_blocked,
+        })
     }
 
     async fn read_operation(&self, op_id: &str) -> CoreResult<Operation> {
@@ -312,6 +456,12 @@ impl<'a, S: S3ObjectStore + ?Sized> OpLogCompactor<'a, S> {
             .map_err(|e| CoreError::Protocol(format!("operation UTF-8: {}", e)))?;
         Serializer::deserialize_operation(&text)
     }
+}
+
+struct CompactableScan {
+    op_ids: Vec<String>,
+    next_op: String,
+    retention_blocked: bool,
 }
 
 fn snapshot_metadata_seq(key: &str) -> Option<u64> {
@@ -454,9 +604,15 @@ mod tests {
                 new_parent_id: None,
                 deleted: false,
             },
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: (Utc::now() - chrono::Duration::days(100)).to_rfc3339(),
             signature: None,
         }
+    }
+
+    fn young_op(op_id: &str, base_head: &str) -> Operation {
+        let mut op = op(op_id, base_head);
+        op.timestamp = Utc::now().to_rfc3339();
+        op
     }
 
     fn op_with_content(op_id: &str, base_head: &str, hash: &str) -> Operation {
@@ -491,6 +647,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_device_is_not_active_or_required_for_compaction() {
+        let store = FakeStore::default();
+        let device_id = uuid::Uuid::now_v7();
+        let device = Device {
+            device_id,
+            device_name: "old-device".to_string(),
+            platform: "linux".to_string(),
+            os_version: "x86_64".to_string(),
+            public_key: String::new(),
+            last_seen: Utc::now().to_rfc3339(),
+            capabilities: crate::metadata::types::DeviceCapabilities {
+                cloud_files_api: false,
+                file_provider: false,
+                fuse: false,
+                background_sync: true,
+                encryption_at_rest: false,
+            },
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        store.put_json(
+            &Serializer::device_registration_key(&device_id.to_string()),
+            &device,
+        );
+        DeviceWatermarks::new(&store)
+            .update(device_id, 0, "")
+            .await
+            .unwrap();
+        DeviceWatermarks::new(&store)
+            .retire(device_id)
+            .await
+            .unwrap();
+
+        assert!(DeviceWatermarks::new(&store)
+            .active_watermarks(90)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(DeviceWatermarks::new(&store)
+            .active_registered_device_ids(90)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn compaction_deletes_only_snapshot_head_ancestors() {
         let store = FakeStore::default();
         let first = "device:1:first";
@@ -515,7 +716,7 @@ mod tests {
         };
 
         let report = OpLogCompactor::new(&store)
-            .compact(&snapshot, 10, 90)
+            .compact(&snapshot, 10, 90, 90)
             .await
             .unwrap();
 
@@ -523,15 +724,17 @@ mod tests {
         assert!(!store.contains(&Serializer::op_key(first)));
         assert!(!store.contains(&Serializer::op_key(second)));
         assert!(store.contains(&Serializer::op_key(third)));
-        assert_eq!(
-            String::from_utf8(store.get_object(&Serializer::ops_tail_key()).await.unwrap())
-                .unwrap(),
-            third
-        );
+        let cursor: OpCompactionCursor =
+            serde_json::from_slice(&store.get_object(&Serializer::ops_tail_key()).await.unwrap())
+                .unwrap();
+        assert_eq!(cursor.snapshot_seq, 5);
+        assert_eq!(cursor.covered_head, third);
+        assert!(cursor.next_op.is_empty());
+        assert!(cursor.pending_delete.is_empty());
     }
 
     #[tokio::test]
-    async fn compaction_preserves_content_ref_ops_for_blob_gc() {
+    async fn compaction_deletes_expired_content_ref_ops() {
         let store = FakeStore::default();
         let first = "device:1:first";
         let second = "device:2:second";
@@ -558,12 +761,83 @@ mod tests {
         };
 
         let report = OpLogCompactor::new(&store)
-            .compact(&snapshot, 10, 90)
+            .compact(&snapshot, 10, 90, 90)
             .await
             .unwrap();
 
-        assert_eq!(report.pruned_ops, 1);
+        assert_eq!(report.pruned_ops, 2);
+        assert!(!store.contains(&Serializer::op_key(first)));
+        assert!(!store.contains(&Serializer::op_key(second)));
+        assert!(store.contains(&Serializer::op_key(third)));
+    }
+
+    #[tokio::test]
+    async fn compaction_waits_for_operation_retention() {
+        let store = FakeStore::default();
+        let first = "device:1:first";
+        let second = "device:2:second";
+        store.put_json(&Serializer::op_key(first), &young_op(first, ""));
+        store.put_json(&Serializer::op_key(second), &op(second, first));
+        DeviceWatermarks::new(&store)
+            .update(uuid::Uuid::now_v7(), 5, second)
+            .await
+            .unwrap();
+        let snapshot = SnapshotMetadata {
+            schema_version: crate::metadata::SUPPORTED_SCHEMA_VERSION,
+            seq_num: 5,
+            created_at: Utc::now().to_rfc3339(),
+            entry_count: 0,
+            tree_key: Serializer::snapshot_key(5),
+            covered_head: Some(second.to_string()),
+        };
+
+        let report = OpLogCompactor::new(&store)
+            .compact(&snapshot, 10, 90, 90)
+            .await
+            .unwrap();
+
+        assert_eq!(report.pruned_ops, 0);
+        assert_eq!(
+            report.skipped_reason.as_deref(),
+            Some("oldest compactable op is still inside retention window")
+        );
         assert!(store.contains(&Serializer::op_key(first)));
+    }
+
+    #[tokio::test]
+    async fn compaction_cursor_continues_after_prior_batch_deleted_chain_link() {
+        let store = FakeStore::default();
+        let first = "device:1:first";
+        let second = "device:2:second";
+        let third = "device:3:third";
+        store.put_json(&Serializer::op_key(first), &op(first, ""));
+        store.put_json(&Serializer::op_key(second), &op(second, first));
+        store.put_json(&Serializer::op_key(third), &op(third, second));
+        DeviceWatermarks::new(&store)
+            .update(uuid::Uuid::now_v7(), 5, third)
+            .await
+            .unwrap();
+        let snapshot = SnapshotMetadata {
+            schema_version: crate::metadata::SUPPORTED_SCHEMA_VERSION,
+            seq_num: 5,
+            created_at: Utc::now().to_rfc3339(),
+            entry_count: 0,
+            tree_key: Serializer::snapshot_key(5),
+            covered_head: Some(third.to_string()),
+        };
+
+        let first_report = OpLogCompactor::new(&store)
+            .compact(&snapshot, 1, 90, 90)
+            .await
+            .unwrap();
+        let second_report = OpLogCompactor::new(&store)
+            .compact(&snapshot, 1, 90, 90)
+            .await
+            .unwrap();
+
+        assert_eq!(first_report.pruned_ops, 1);
+        assert_eq!(second_report.pruned_ops, 1);
+        assert!(!store.contains(&Serializer::op_key(first)));
         assert!(!store.contains(&Serializer::op_key(second)));
         assert!(store.contains(&Serializer::op_key(third)));
     }
@@ -630,7 +904,7 @@ mod tests {
         };
 
         let report = OpLogCompactor::new(&store)
-            .compact(&snapshot, 10, 90)
+            .compact(&snapshot, 10, 90, 90)
             .await
             .unwrap();
 
