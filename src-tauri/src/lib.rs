@@ -119,6 +119,7 @@ impl DesktopSettings {
 pub struct AppState {
     sync_running: AtomicBool,
     sync_paused: AtomicBool,
+    large_sync_attention: AtomicBool,
     auto_sync_started: AtomicBool,
     tray_animation_started: AtomicBool,
     conflict_count: AtomicU32,
@@ -128,6 +129,7 @@ pub struct AppState {
     last_sync_summary: Mutex<Option<String>>,
     sync_detail: Mutex<String>,
     tray_status_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    large_sync_action_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     pending_route: Mutex<Option<String>>,
     device_id: Mutex<String>,
     settings: Mutex<DesktopSettings>,
@@ -138,6 +140,7 @@ impl Default for AppState {
         Self {
             sync_running: AtomicBool::new(false),
             sync_paused: AtomicBool::new(false),
+            large_sync_attention: AtomicBool::new(false),
             auto_sync_started: AtomicBool::new(false),
             tray_animation_started: AtomicBool::new(false),
             conflict_count: AtomicU32::new(0),
@@ -147,6 +150,7 @@ impl Default for AppState {
             last_sync_summary: Mutex::new(None),
             sync_detail: Mutex::new("Idle".to_string()),
             tray_status_item: Mutex::new(None),
+            large_sync_action_item: Mutex::new(None),
             pending_route: Mutex::new(None),
             device_id: Mutex::new(uuid::Uuid::now_v7().to_string()),
             settings: Mutex::new(DesktopSettings::default()),
@@ -406,6 +410,13 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let status_separator = PredefinedMenuItem::separator(app)?;
     let open = MenuItem::with_id(app, "open", "Open S4Drive", true, None::<&str>)?;
     let sync_now = MenuItem::with_id(app, "sync_now", "Sync Now", true, None::<&str>)?;
+    let confirm_large_sync = MenuItem::with_id(
+        app,
+        "confirm_large_sync",
+        "Confirm Large Sync...",
+        false,
+        None::<&str>,
+    )?;
     let pause = MenuItem::with_id(app, "pause", "Pause Sync", true, None::<&str>)?;
     let separator1 = PredefinedMenuItem::separator(app)?;
     let activity = MenuItem::with_id(app, "activity", "Recent Activity", true, None::<&str>)?;
@@ -421,6 +432,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             &status_separator,
             &open,
             &sync_now,
+            &confirm_large_sync,
             &pause,
             &separator1,
             &activity,
@@ -434,6 +446,9 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let pause_for_handler = pause.clone();
     if let Ok(mut tray_status_item) = app.state::<AppState>().tray_status_item.lock() {
         *tray_status_item = Some(status.clone());
+    }
+    if let Ok(mut action_item) = app.state::<AppState>().large_sync_action_item.lock() {
+        *action_item = Some(confirm_large_sync.clone());
     }
 
     let icon = app.default_window_icon().cloned().ok_or_else(|| {
@@ -450,6 +465,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "sync_now" => {
                 spawn_sync_now(app);
             }
+            "confirm_large_sync" => spawn_show_large_sync_confirmation(app),
             "pause" => {
                 if let Err(error) = toggle_pause_from_tray(app, &pause_for_handler) {
                     tracing::warn!("failed to toggle sync pause state: {}", error);
@@ -469,8 +485,17 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             } = event
             {
                 let app = tray.app_handle().clone();
+                let requires_confirmation = app
+                    .state::<AppState>()
+                    .large_sync_attention
+                    .load(Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    if let Err(error) = toggle_main_window(&app) {
+                    let result = if requires_confirmation {
+                        show_large_sync_confirmation(&app)
+                    } else {
+                        toggle_main_window(&app)
+                    };
+                    if let Err(error) = result {
                         tracing::warn!("failed to toggle S4Drive window: {}", error);
                     }
                 });
@@ -538,13 +563,20 @@ fn ensure_auto_sync(app: &AppHandle) {
                 }
             };
             if inspection.requires_confirmation && !settings.large_sync_confirmed {
-                set_sync_detail(
-                    &app,
-                    state.inner(),
-                    "Large sync folder waiting for confirmation",
-                );
+                request_large_sync_confirmation(&app, state.inner(), &inspection);
                 tokio::time::sleep(remote_interval).await;
                 continue;
+            }
+            if state.large_sync_attention.load(Ordering::Relaxed) {
+                clear_large_sync_attention(
+                    &app,
+                    state.inner(),
+                    if inspection.requires_confirmation {
+                        "Large sync confirmed; preparing sync"
+                    } else {
+                        "Idle"
+                    },
+                );
             }
 
             let signature = match local_folder_signature(&settings, &sync_folder) {
@@ -602,7 +634,7 @@ fn ensure_tray_sync_animation(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut frame = 0usize;
-        let mut showing_sync_icon = false;
+        let mut showing_animated_icon = false;
 
         loop {
             tokio::time::sleep(TRAY_ANIMATION_INTERVAL).await;
@@ -612,26 +644,41 @@ fn ensure_tray_sync_animation(app: &AppHandle) {
                 break;
             }
 
-            if state.sync_running.load(Ordering::Relaxed) {
+            if state.large_sync_attention.load(Ordering::Relaxed) {
+                set_tray_warning_icon(&app, frame);
+                frame = frame.wrapping_add(1);
+                showing_animated_icon = true;
+            } else if state.sync_running.load(Ordering::Relaxed) {
                 set_tray_sync_icon(&app, frame);
                 frame = frame.wrapping_add(1);
-                showing_sync_icon = true;
-            } else if showing_sync_icon {
+                showing_animated_icon = true;
+            } else if showing_animated_icon {
                 set_tray_idle_icon(&app);
                 frame = 0;
-                showing_sync_icon = false;
+                showing_animated_icon = false;
             }
         }
     });
 }
 
 fn spawn_sync_now(app: &AppHandle) {
+    if app
+        .state::<AppState>()
+        .large_sync_attention
+        .load(Ordering::Relaxed)
+    {
+        spawn_show_large_sync_confirmation(app);
+        return;
+    }
+
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         if let Err(error) = run_sync_now(app.clone(), state.inner()).await {
             tracing::warn!("sync from tray failed: {}", error);
-            send_sync_notification(&app, "error", &error);
+            if !state.large_sync_attention.load(Ordering::Relaxed) {
+                send_sync_notification(&app, "error", &error);
+            }
         }
     });
 }
@@ -645,6 +692,23 @@ fn spawn_show_main_window(app: &AppHandle, route: Option<&'static str>) {
             tracing::warn!("failed to show S4Drive window: {}", error);
         }
     });
+}
+
+fn spawn_show_large_sync_confirmation(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = show_large_sync_confirmation(&app) {
+            tracing::warn!("failed to show large sync confirmation: {}", error);
+        }
+    });
+}
+
+fn show_large_sync_confirmation(app: &AppHandle) -> Result<(), String> {
+    show_main_window(app, None)?;
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.emit("large-sync-confirmation-required", ());
+    }
+    Ok(())
 }
 
 fn show_main_window(app: &AppHandle, route: Option<&str>) -> Result<(), String> {
@@ -957,6 +1021,42 @@ fn inspect_sync_folder_inner(
     })
 }
 
+fn request_large_sync_confirmation(
+    app: &AppHandle,
+    state: &AppState,
+    inspection: &FolderInspection,
+) {
+    let first_request = !state.large_sync_attention.swap(true, Ordering::SeqCst);
+    if let Ok(action_item) = state.large_sync_action_item.lock() {
+        if let Some(item) = action_item.as_ref() {
+            let _ = item.set_enabled(true);
+        }
+    }
+
+    set_tray_warning_icon(app, 0);
+    set_sync_detail(app, state, inspection.message.clone());
+
+    if first_request {
+        send_sync_notification(app, "action_required", &inspection.message);
+        spawn_show_large_sync_confirmation(app);
+    }
+}
+
+fn clear_large_sync_attention(app: &AppHandle, state: &AppState, detail: &str) {
+    if !state.large_sync_attention.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(action_item) = state.large_sync_action_item.lock() {
+        if let Some(item) = action_item.as_ref() {
+            let _ = item.set_enabled(false);
+        }
+    }
+    if !state.sync_running.load(Ordering::Relaxed) {
+        set_tray_idle_icon(app);
+    }
+    set_sync_detail(app, state, detail);
+}
+
 fn pending_transfer_count(app: &AppHandle, settings: &DesktopSettings) -> usize {
     let config = app_local_config(app, settings);
     LocalDatabase::new(&config)
@@ -1063,6 +1163,7 @@ fn list_local_files_with_db(
 fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
     let running = state.sync_running.load(Ordering::Relaxed);
     let paused = state.sync_paused.load(Ordering::Relaxed);
+    let attention = state.large_sync_attention.load(Ordering::Relaxed);
     let conflicts = state.conflict_count.load(Ordering::Relaxed);
     let last_sync = state.last_sync.lock().map_err(|e| e.to_string())?.clone();
     let last_summary = state
@@ -1075,7 +1176,9 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
     Ok(SyncStatus {
         running,
         paused,
-        state: if paused {
+        state: if attention {
+            "attention"
+        } else if paused {
             "paused"
         } else if running {
             "syncing"
@@ -1127,7 +1230,9 @@ fn compact_tray_status(detail: &str) -> String {
 
 fn refresh_tray_tooltip(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let sync_state = if state.sync_paused.load(Ordering::Relaxed) {
+    let sync_state = if state.large_sync_attention.load(Ordering::Relaxed) {
+        "action required"
+    } else if state.sync_paused.load(Ordering::Relaxed) {
         "paused"
     } else if state.sync_running.load(Ordering::Relaxed) {
         "syncing"
@@ -1182,6 +1287,7 @@ fn mark_sync_requested(app: &AppHandle, state: &AppState, resume_if_paused: bool
             return false;
         }
     }
+    clear_large_sync_attention(app, state, "Preparing sync");
 
     let now = chrono::Utc::now().to_rfc3339();
     if let Ok(mut last_sync) = state.last_sync.lock() {
@@ -1271,6 +1377,7 @@ pub fn send_sync_notification(app: &AppHandle, kind: &str, body: &str) {
         "sync_started" => "S4Drive Syncing",
         "conflict" => "S4Drive Conflict Detected",
         "error" => "S4Drive Sync Error",
+        "action_required" => "S4Drive Action Required",
         "paused" => "S4Drive Sync Paused",
         "resumed" => "S4Drive Sync Resumed",
         _ => "S4Drive",
@@ -1278,6 +1385,7 @@ pub fn send_sync_notification(app: &AppHandle, kind: &str, body: &str) {
     let full_body = match kind {
         "conflict" => format!("{} - click to resolve", body),
         "error" => format!("{} - open diagnostics", body),
+        "action_required" => format!("{} Click the S4Drive tray icon to confirm.", body),
         _ => body.to_string(),
     };
     send_notification(app, title, &full_body);
@@ -1307,12 +1415,82 @@ fn set_tray_sync_icon(app: &AppHandle, frame: usize) {
     }
 }
 
+fn set_tray_warning_icon(app: &AppHandle, frame: usize) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let Some(base_icon) = app.default_window_icon() else {
+        return;
+    };
+    if let Err(error) = tray.set_icon(Some(warning_tray_icon(base_icon, frame))) {
+        tracing::warn!("failed to update warning tray icon: {}", error);
+    }
+}
+
 fn sync_tray_icon(base_icon: &Image<'_>, frame: usize) -> Image<'static> {
     let width = base_icon.width();
     let height = base_icon.height();
     let mut rgba = base_icon.rgba().to_vec();
     draw_sync_overlay(&mut rgba, width, height, frame);
     Image::new_owned(rgba, width, height)
+}
+
+fn warning_tray_icon(base_icon: &Image<'_>, frame: usize) -> Image<'static> {
+    let width = base_icon.width();
+    let height = base_icon.height();
+    let mut rgba = base_icon.rgba().to_vec();
+    draw_warning_overlay(&mut rgba, width, height, frame);
+    Image::new_owned(rgba, width, height)
+}
+
+fn draw_warning_overlay(rgba: &mut [u8], width: u32, height: u32, frame: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let size = f64::from(width.min(height));
+    let center_x = f64::from(width) * 0.72;
+    let center_y = f64::from(height) * 0.72;
+    let pulse = if frame.is_multiple_of(2) { 1.0 } else { 0.88 };
+    let radius = size * 0.24 * pulse;
+    let stroke = (size * 0.035).max(1.5);
+    let yellow = [255, 193, 7, 255];
+    let dark = [35, 30, 18, 255];
+
+    draw_circle(
+        rgba,
+        width,
+        height,
+        center_x,
+        center_y,
+        radius + stroke,
+        dark,
+    );
+    draw_circle(rgba, width, height, center_x, center_y, radius, yellow);
+
+    let line_start = center_y - radius * 0.55;
+    let line_end = center_y + radius * 0.15;
+    for step in 0..=8 {
+        let progress = f64::from(step) / 8.0;
+        draw_circle(
+            rgba,
+            width,
+            height,
+            center_x,
+            line_start + (line_end - line_start) * progress,
+            stroke,
+            dark,
+        );
+    }
+    draw_circle(
+        rgba,
+        width,
+        height,
+        center_x,
+        center_y + radius * 0.55,
+        stroke * 1.35,
+        dark,
+    );
 }
 
 fn draw_sync_overlay(rgba: &mut [u8], width: u32, height: u32, frame: usize) {
@@ -1558,8 +1736,18 @@ fn save_settings(
     ensure_sync_folder(&settings)?;
     save_settings_to_disk(&app, &settings)?;
     let mut current = state.settings.lock().map_err(|e| e.to_string())?;
+    let sync_folder_changed = current.sync_folder != settings.sync_folder;
     *current = settings.clone();
     drop(current);
+    if settings.large_sync_confirmed {
+        clear_large_sync_attention(
+            &app,
+            state.inner(),
+            "Large sync confirmed; sync will start automatically",
+        );
+    } else if sync_folder_changed {
+        clear_large_sync_attention(&app, state.inner(), "Idle");
+    }
     ensure_auto_sync(&app);
     Ok(settings)
 }
@@ -1693,7 +1881,7 @@ async fn run_sync_now_with_options(
             "{} Open S4Drive and confirm this large folder before syncing.",
             inspection.message
         );
-        set_sync_detail(&app, state, "Large sync folder waiting for confirmation");
+        request_large_sync_confirmation(&app, state, &inspection);
         return Err(message);
     }
     let local_files_seen = if inspection.requires_confirmation {
@@ -2013,6 +2201,12 @@ async fn run_diagnostics(
     let settings_file = settings_path(&app)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("unavailable: {}", error));
+    let sync_status = current_sync_status(state.inner())?;
+    let sync_diagnostic_status = if sync_status.state == "attention" {
+        "warning"
+    } else {
+        sync_status.state.as_str()
+    };
 
     let mut items = vec![
         DiagnosticItem {
@@ -2041,9 +2235,10 @@ async fn run_diagnostics(
         },
         DiagnosticItem {
             name: "Sync state".to_string(),
-            status: current_sync_status(state.inner())?.state,
+            status: sync_diagnostic_status.to_string(),
             detail: format!(
-                "paused={}, conflicts={}",
+                "{}; paused={}, conflicts={}",
+                sync_status.detail,
                 state.sync_paused.load(Ordering::Relaxed),
                 state.conflict_count.load(Ordering::Relaxed)
             ),
@@ -2241,5 +2436,28 @@ mod tests {
         assert_eq!(frame.width(), 64);
         assert_eq!(frame.height(), 64);
         assert_ne!(frame.rgba(), base.rgba());
+    }
+
+    #[test]
+    fn warning_tray_icon_adds_animated_overlay_without_resizing() {
+        let base = Image::new_owned(vec![220, 50, 40, 255].repeat(64 * 64), 64, 64);
+        let first = warning_tray_icon(&base, 0);
+        let second = warning_tray_icon(&base, 1);
+
+        assert_eq!(first.width(), 64);
+        assert_eq!(first.height(), 64);
+        assert_ne!(first.rgba(), base.rgba());
+        assert_ne!(first.rgba(), second.rgba());
+    }
+
+    #[test]
+    fn sync_status_reports_required_attention() {
+        let state = AppState::default();
+        state.large_sync_attention.store(true, Ordering::Relaxed);
+
+        let status = current_sync_status(&state).unwrap();
+
+        assert_eq!(status.state, "attention");
+        assert!(!status.running);
     }
 }

@@ -43,6 +43,10 @@
     transfers: [],
     conflicts: [],
     activities: [],
+    largeSyncPromptOpen: false,
+    largeSyncPromptPending: false,
+    syncRequestInFlight: false,
+    initialized: false,
   };
 
   const FILE_ROW_HEIGHT = 42;
@@ -140,12 +144,17 @@
   // ─── Status Badge ────────────────────────────────────────────
   function updateStatusBadge(status) {
     const badge = document.getElementById('statusBadge');
-    const cls = ['syncing', 'paused', 'error', 'idle'].find(c => badge.classList.contains(c));
+    const cls = ['syncing', 'paused', 'attention', 'error', 'idle'].find(c => badge.classList.contains(c));
     if (cls) badge.classList.remove(cls);
     const next = status.state || 'idle';
     badge.classList.add(next);
-    badge.textContent = next.charAt(0).toUpperCase() + next.slice(1);
+    badge.textContent = syncStateLabel(next);
     badge.title = status.detail || next;
+  }
+
+  function syncStateLabel(value) {
+    if (value === 'attention') return 'Action required';
+    return value.charAt(0).toUpperCase() + value.slice(1);
   }
 
   function updateTotalFiles() {
@@ -161,7 +170,7 @@
       const sync = await invoke('get_sync_status');
       state.sync = sync;
       const syncState = document.getElementById('syncState');
-      syncState.textContent = sync.state || '—';
+      syncState.textContent = sync.state ? syncStateLabel(sync.state) : '—';
       syncState.title = sync.detail || sync.state || '';
       document.getElementById('conflictCount').textContent = sync.conflicts ?? 0;
       updateTotalFiles();
@@ -615,26 +624,55 @@
   }
 
   async function confirmLargeSyncIfNeeded() {
-    const inspection = await invoke('inspect_sync_folder');
-    if (!inspection?.requires_confirmation || state.settings.large_sync_confirmed) {
+    if (state.largeSyncPromptOpen) return false;
+    state.largeSyncPromptOpen = true;
+    try {
+      const inspection = await invoke('inspect_sync_folder');
+      if (!inspection?.requires_confirmation || state.settings.large_sync_confirmed) {
+        return true;
+      }
+
+      const accepted = window.confirm(
+        `${inspection.message}\n\nS4Drive will process this folder in staged batches so the desktop app stays responsive.`
+      );
+      if (!accepted) {
+        showToast('Large sync still requires confirmation. Click the warning tray icon to review it again.', 'warning', 7000);
+        return false;
+      }
+
+      state.settings.large_sync_confirmed = true;
+      state.settings = normalizeSettings(await invoke('save_settings', {
+        settings: collectSettings(),
+        secretKey: null,
+      }));
+      showToast('Large sync confirmed', 'success');
       return true;
+    } finally {
+      state.largeSyncPromptOpen = false;
     }
+  }
 
-    const accepted = window.confirm(
-      `${inspection.message}\n\nS4Drive will process this folder in staged batches so the desktop app stays responsive.`
-    );
-    if (!accepted) {
-      showToast('Large sync cancelled', 'info');
-      return false;
+  async function startSyncNow() {
+    if (state.syncRequestInFlight) return;
+    state.syncRequestInFlight = true;
+    const button = document.getElementById('btnSyncNow');
+    button.disabled = true;
+    try {
+      const canSync = await confirmLargeSyncIfNeeded();
+      if (!canSync) return;
+      const result = await invoke('sync_now');
+      showToast(result?.message || 'Sync complete', 'success', 7000);
+      await Promise.all([refreshDashboard(), refreshFiles(), refreshActivity(), refreshTransfers()]);
+    } catch(e) {
+      if (String(e).toLowerCase().includes('already running')) {
+        await refreshDashboard();
+      } else {
+        showToast(`Sync failed: ${humanizeError(e)}`, 'error');
+      }
+    } finally {
+      button.disabled = false;
+      state.syncRequestInFlight = false;
     }
-
-    state.settings.large_sync_confirmed = true;
-    state.settings = normalizeSettings(await invoke('save_settings', {
-      settings: collectSettings(),
-      secretKey: null,
-    }));
-    showToast('Large sync confirmed', 'success');
-    return true;
   }
 
   async function runDiagnostics() {
@@ -779,21 +817,7 @@
     });
 
     // Wire dashboard actions
-    document.getElementById('btnSyncNow').addEventListener('click', async () => {
-      const button = document.getElementById('btnSyncNow');
-      button.disabled = true;
-      try {
-        const canSync = await confirmLargeSyncIfNeeded();
-        if (!canSync) return;
-        const result = await invoke('sync_now');
-        showToast(result?.message || 'Sync complete', 'success', 7000);
-        await Promise.all([refreshDashboard(), refreshFiles(), refreshActivity(), refreshTransfers()]);
-      } catch(e) {
-        showToast(`Sync failed: ${humanizeError(e)}`, 'error');
-      } finally {
-        button.disabled = false;
-      }
-    });
+    document.getElementById('btnSyncNow').addEventListener('click', startSyncNow);
     document.getElementById('btnPauseSync').addEventListener('click', async () => {
       try {
         const paused = await invoke('toggle_pause');
@@ -921,8 +945,16 @@
       updateStatusBadge(state.sync);
       const syncState = document.getElementById('syncState');
       if (syncState) {
-        syncState.textContent = state.sync.state || '—';
+        syncState.textContent = state.sync.state ? syncStateLabel(state.sync.state) : '—';
         syncState.title = state.sync.detail || state.sync.state || '';
+      }
+    });
+
+    await listen('large-sync-confirmation-required', () => {
+      if (state.initialized) {
+        startSyncNow();
+      } else {
+        state.largeSyncPromptPending = true;
       }
     });
 
@@ -950,6 +982,11 @@
       if (pendingRoute === 'account') {
         showToast('Connect storage and choose a sync folder before syncing', 'warning', 6000);
       }
+    }
+    state.initialized = true;
+    if (state.largeSyncPromptPending || state.sync?.state === 'attention') {
+      state.largeSyncPromptPending = false;
+      startSyncNow();
     }
 
     // Auto-refresh

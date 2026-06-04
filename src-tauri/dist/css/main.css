@@ -279,10 +279,20 @@ body {
 .status-badge.syncing::before { background: var(--info); }
 .status-badge.paused { color: var(--warning); border-color: var(--warning); }
 .status-badge.paused::before { background: var(--warning); }
+.status-badge.attention { color: var(--warning); border-color: var(--warning); }
+.status-badge.attention::before {
+  background: var(--warning);
+  animation: attentionPulse 900ms ease-in-out infinite alternate;
+}
 .status-badge.error { color: var(--error); border-color: var(--error); }
 .status-badge.error::before { background: var(--error); }
 .status-badge.idle { color: var(--success); }
 .status-badge.idle::before { background: var(--success); }
+
+@keyframes attentionPulse {
+  from { opacity: 0.45; transform: scale(0.8); }
+  to { opacity: 1; transform: scale(1.25); }
+}
 
 /* Sync badge variants */
 .sync-badge {
