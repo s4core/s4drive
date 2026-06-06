@@ -697,9 +697,23 @@ body {
   align-items: center;
   margin-bottom: var(--space-xs);
 }
-.transfer-name { font-size: 13px; font-weight: 500; }
+.transfer-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 500;
+}
 .transfer-status { font-size: 11px; color: var(--text-secondary); }
 .transfer-details { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); }
+.transfer-error {
+  margin-top: var(--space-xs);
+  color: var(--error);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
+}
 
 .progress-bar {
   height: 4px;
@@ -920,6 +934,12 @@ body {
   border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 0 0 4px var(--accent-soft);
+}
+.timeline-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space);
 }
 .timeline-title { font-size: 13px; font-weight: 700; }
 .timeline-meta,

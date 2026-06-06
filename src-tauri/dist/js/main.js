@@ -40,6 +40,7 @@
     fileScrollFrame: null,
     selectedFileId: null,
     versions: [],
+    restoringRevisionId: null,
     devices: [],
     transfers: [],
     conflicts: [],
@@ -371,37 +372,48 @@
   function renderTransfers() {
     const active = document.getElementById('activeTransfers');
     const completed = document.getElementById('completedTransfers');
-    const activeItems = state.transfers.filter(t => !['complete', 'completed'].includes(t.status));
-    const completedItems = state.transfers.filter(t => ['complete', 'completed'].includes(t.status));
-    active.innerHTML = renderTransferList(activeItems, 'No Active Transfers');
+    const completedStatuses = ['complete', 'completed'];
+    const activeItems = state.transfers.filter(t => !completedStatuses.includes(t.status));
+    const completedItems = state.transfers.filter(t => completedStatuses.includes(t.status));
+    active.innerHTML = renderTransferList(activeItems, 'No Active Transfers', 'Queued, running, paused, and failed transfers will show here.');
     completed.innerHTML = renderTransferList(completedItems, 'No Completed Transfers');
     document.getElementById('transferCount').textContent = String(activeItems.length);
   }
 
-  function renderTransferList(items, emptyTitle) {
+  function renderTransferList(items, emptyTitle, emptyDesc = '') {
     if (!items.length) {
       return `
         <div class="empty-state">
           <div class="empty-icon">⬆️</div>
           <div class="empty-title">${emptyTitle}</div>
+          ${emptyDesc ? `<div class="empty-desc">${escapeHtml(emptyDesc)}</div>` : ''}
         </div>`;
     }
 
     return items.map(t => {
       const total = Number(t.bytes_total || 0);
       const done = Number(t.bytes_done || 0);
-      const progress = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+      const status = String(t.status || 'queued');
+      const isCompleted = ['complete', 'completed'].includes(status);
+      const progress = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : (isCompleted ? 100 : 0);
+      const bytes = total > 0
+        ? `${formatBytes(done)} / ${formatBytes(total)}`
+        : (isCompleted ? 'completed' : 'size unknown');
+      const error = t.error_message ? `<div class="transfer-error">${escapeHtml(t.error_message)}</div>` : '';
+      const retry = Number(t.retry_count || 0) > 0 ? ` · retry ${Number(t.retry_count)}` : '';
+      const updated = formatTime(t.updated_at || t.created_at);
       return `
         <div class="transfer-item">
           <div class="transfer-header">
             <div class="transfer-name">${escapeHtml(t.path || t.id)}</div>
-            <div class="transfer-status">${escapeHtml(t.status || '')}</div>
+            <div class="sync-badge ${escapeAttr(status)}">${escapeHtml(formatStatus(status))}</div>
           </div>
           <div class="progress-bar"><div class="progress-fill" style="width:${progress}%"></div></div>
           <div class="transfer-details">
-            <span>${escapeHtml(t.direction || '')}</span>
-            <span>${progress}%</span>
+            <span>${escapeHtml(t.direction || '')}${retry}</span>
+            <span>${escapeHtml(bytes)} · ${progress}%${updated ? ` · ${escapeHtml(updated)}` : ''}</span>
           </div>
+          ${error}
         </div>`;
     }).join('');
   }
@@ -469,16 +481,29 @@
       return;
     }
 
-    timeline.innerHTML = state.versions.map(version => `
+    timeline.innerHTML = state.versions.map(version => {
+      const isRestoring = state.restoringRevisionId === version.revision_id;
+      return `
       <div class="timeline-item">
         <div class="timeline-dot"></div>
         <div class="timeline-content">
-          <div class="timeline-title">${escapeHtml(version.label || version.revision_id)}</div>
-          <div class="timeline-meta">${escapeHtml(version.author || 'Unknown device')} · ${formatDate(version.created_at)}</div>
+          <div class="timeline-header">
+            <div>
+              <div class="timeline-title">${escapeHtml(version.label || version.revision_id)}</div>
+              <div class="timeline-meta">${escapeHtml(version.author || 'Unknown device')} · changed ${formatDate(version.created_at) || 'Unknown date'}</div>
+            </div>
+            <button
+              class="btn btn-outline btn-sm"
+              data-version-restore
+              data-revision-id="${escapeAttr(version.revision_id)}"
+              ${isRestoring ? 'disabled' : ''}
+            >${isRestoring ? 'Restoring...' : 'Restore'}</button>
+          </div>
           <div class="timeline-detail">${formatBytes(version.size_bytes)} · ${escapeHtml(version.status || 'saved')}</div>
         </div>
       </div>
-    `).join('');
+    `;
+    }).join('');
   }
 
   function renderTimelineError(message) {
@@ -488,6 +513,38 @@
         <div class="error-title">Cannot Load Versions</div>
         <div class="error-desc">${escapeHtml(message)}</div>
       </div>`;
+  }
+
+  async function restoreVersion(revisionId) {
+    const version = state.versions.find(v => v.revision_id === revisionId);
+    const label = version?.label || revisionId;
+    const changedAt = formatDate(version?.created_at) || 'unknown date';
+    const confirmed = window.confirm(
+      `Restore "${label}" from ${changedAt}?\n\nThis will overwrite the local file and queue the restored content for upload.`
+    );
+    if (!confirmed) return;
+
+    state.restoringRevisionId = revisionId;
+    renderVersions();
+    try {
+      const result = await invoke('restore_version', { revisionId });
+      showToast(`Restored ${label}; upload queued`, 'success', 6000);
+      await Promise.all([
+        refreshVersions(),
+        refreshFiles(),
+        refreshActivity(),
+        refreshTransfers(),
+        refreshDashboard(),
+      ]);
+      if (result?.path) {
+        console.info('Restored version to', result.path);
+      }
+    } catch(e) {
+      showToast(`Restore failed: ${humanizeError(e)}`, 'error', 7000);
+    } finally {
+      state.restoringRevisionId = null;
+      renderVersions();
+    }
   }
 
   async function refreshDevices() {
@@ -964,6 +1021,11 @@
       if (!button) return;
       window.__resolveConflict(button.dataset.conflictId, button.dataset.resolution);
     });
+    document.getElementById('versionTimeline').addEventListener('click', (event) => {
+      const button = event.target.closest('[data-version-restore]');
+      if (!button) return;
+      restoreVersion(button.dataset.revisionId);
+    });
 
     // Wire keyboard navigation
     document.addEventListener('keydown', (e) => {
@@ -996,6 +1058,7 @@
       refreshFiles();
       refreshActivity();
       refreshTransfers();
+      refreshVersions();
     });
 
     await listen('files-changed', () => {

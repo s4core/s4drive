@@ -421,8 +421,6 @@ impl LocalDatabase {
         direction: &str,
         limit: u32,
     ) -> CoreResult<Vec<crate::transfer::TransferJob>> {
-        use crate::transfer::{TransferDirection, TransferStatus};
-
         let conn = self
             .conn
             .lock()
@@ -430,8 +428,8 @@ impl LocalDatabase {
         let mut stmt = conn
             .prepare(
                 "SELECT id, direction, file_id, local_path, s3_key, 
-                        total_bytes, transferred_bytes, status, 
-                        retry_count, error_message, created_at
+                        total_bytes, transferred_bytes, status,
+                        retry_count, error_message, created_at, updated_at
                  FROM transfer_queue 
                  WHERE direction = ?1 AND status = 'queued' 
                  ORDER BY priority DESC, created_at ASC LIMIT ?2",
@@ -439,39 +437,7 @@ impl LocalDatabase {
             .map_err(|e| CoreError::Database(e.to_string()))?;
 
         let rows = stmt
-            .query_map(rusqlite::params![direction, limit], |row| {
-                let status = match row.get::<_, String>(7)?.as_str() {
-                    "queued" => TransferStatus::Queued,
-                    "in_progress" => TransferStatus::InProgress,
-                    "paused" => TransferStatus::Paused,
-                    "completed" => TransferStatus::Completed,
-                    "failed" => TransferStatus::Failed,
-                    other => {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            7,
-                            Type::Text,
-                            format!("invalid transfer status '{}'", other).into(),
-                        ));
-                    }
-                };
-                Ok(crate::transfer::TransferJob {
-                    id: row.get::<_, i64>(0)?,
-                    direction: if row.get::<_, String>(1)? == "upload" {
-                        TransferDirection::Upload
-                    } else {
-                        TransferDirection::Download
-                    },
-                    file_id: row.get::<_, String>(2)?,
-                    local_path: row.get::<_, String>(3)?,
-                    s3_key: row.get::<_, String>(4)?,
-                    total_bytes: row.get::<_, i64>(5)? as u64,
-                    transferred_bytes: row.get::<_, i64>(6)? as u64,
-                    status,
-                    retry_count: row.get::<_, i32>(8)? as u32,
-                    error_message: row.get::<_, Option<String>>(9)?,
-                    created_at: row.get::<_, String>(10)?,
-                })
-            })
+            .query_map(rusqlite::params![direction, limit], transfer_job_from_row)
             .map_err(|e| CoreError::Database(e.to_string()))?;
 
         let mut results = Vec::new();
@@ -482,16 +448,95 @@ impl LocalDatabase {
         Ok(results)
     }
 
+    /// Get active transfers plus recently finished transfers for desktop monitoring.
+    pub fn get_recent_transfers(
+        &self,
+        active_limit: u32,
+        completed_limit: u32,
+    ) -> CoreResult<Vec<crate::transfer::TransferJob>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut results = Vec::new();
+
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, direction, file_id, local_path, s3_key,
+                            total_bytes, transferred_bytes, status,
+                            retry_count, error_message, created_at, updated_at
+                     FROM transfer_queue
+                     WHERE status IN ('queued', 'in_progress', 'paused', 'failed')
+                     ORDER BY
+                       CASE status
+                         WHEN 'in_progress' THEN 0
+                         WHEN 'failed' THEN 1
+                         WHEN 'queued' THEN 2
+                         WHEN 'paused' THEN 3
+                         ELSE 4
+                       END,
+                       priority DESC,
+                       created_at ASC
+                     LIMIT ?1",
+                )
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![active_limit], transfer_job_from_row)
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            for row in rows {
+                results.push(row.map_err(|e| CoreError::Database(e.to_string()))?);
+            }
+        }
+
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, direction, file_id, local_path, s3_key,
+                            total_bytes, transferred_bytes, status,
+                            retry_count, error_message, created_at, updated_at
+                     FROM transfer_queue
+                     WHERE status = 'completed'
+                     ORDER BY updated_at DESC, id DESC
+                     LIMIT ?1",
+                )
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![completed_limit], transfer_job_from_row)
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            for row in rows {
+                results.push(row.map_err(|e| CoreError::Database(e.to_string()))?);
+            }
+        }
+
+        Ok(results)
+    }
+
     pub fn update_transfer_status(&self, job_id: i64, status: &str) -> CoreResult<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
-        conn.execute(
-            "UPDATE transfer_queue SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
-            rusqlite::params![status, job_id],
-        )
-        .map_err(|e| CoreError::Database(e.to_string()))?;
+        if status == "completed" {
+            conn.execute(
+                "UPDATE transfer_queue
+                 SET status = ?1,
+                     transferred_bytes = CASE
+                       WHEN total_bytes > 0 THEN total_bytes
+                       ELSE transferred_bytes
+                     END,
+                     updated_at = datetime('now')
+                 WHERE id = ?2",
+                rusqlite::params![status, job_id],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        } else {
+            conn.execute(
+                "UPDATE transfer_queue SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
+                rusqlite::params![status, job_id],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
 
         if conn.changes() == 0 {
             return Err(CoreError::NotFound(format!(
@@ -1501,6 +1546,49 @@ impl LocalDatabase {
         Ok(results)
     }
 
+    /// Get recent revisions across all files, newest first.
+    pub fn get_recent_revisions(&self, limit: usize) -> CoreResult<Vec<RevisionRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT revision_id, file_id, parent_revision_id, content_hash,
+                        size, mime, author_device_id, author_name, created_at,
+                        merge_state, conflict_revision_id
+                 FROM revisions
+                 ORDER BY created_at DESC, revision_id DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![sql_limit(limit)], |row| {
+                Ok(RevisionRecord {
+                    revision_id: row.get::<_, String>(0)?,
+                    file_id: row.get::<_, String>(1)?,
+                    parent_revision_id: row.get::<_, Option<String>>(2)?,
+                    content_hash: row.get::<_, Option<String>>(3)?,
+                    size: row.get::<_, i64>(4)? as u64,
+                    mime: row.get::<_, Option<String>>(5)?,
+                    author_device_id: row.get::<_, String>(6)?,
+                    author_name: row.get::<_, String>(7)?,
+                    created_at: row.get::<_, String>(8)?,
+                    merge_state: row.get::<_, String>(9)?,
+                    conflict_revision_id: row.get::<_, Option<String>>(10)?,
+                })
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CoreError::Database(e.to_string()))?);
+        }
+
+        Ok(results)
+    }
+
     /// Get a single revision by ID.
     pub fn get_revision(&self, revision_id: &str) -> CoreResult<Option<RevisionRecord>> {
         let conn = self
@@ -1873,6 +1961,53 @@ fn local_file_mtime_millis(local_path: &str) -> Option<String> {
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis().to_string())
+}
+
+fn transfer_job_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::transfer::TransferJob> {
+    use crate::transfer::{TransferDirection, TransferStatus};
+
+    let direction = match row.get::<_, String>(1)?.as_str() {
+        "upload" => TransferDirection::Upload,
+        "download" => TransferDirection::Download,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                1,
+                Type::Text,
+                format!("invalid transfer direction '{}'", other).into(),
+            ));
+        }
+    };
+    let status = match row.get::<_, String>(7)?.as_str() {
+        "queued" => TransferStatus::Queued,
+        "in_progress" => TransferStatus::InProgress,
+        "paused" => TransferStatus::Paused,
+        "completed" => TransferStatus::Completed,
+        "failed" => TransferStatus::Failed,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                7,
+                Type::Text,
+                format!("invalid transfer status '{}'", other).into(),
+            ));
+        }
+    };
+
+    Ok(crate::transfer::TransferJob {
+        id: row.get::<_, i64>(0)?,
+        direction,
+        file_id: row.get::<_, String>(2)?,
+        local_path: row.get::<_, String>(3)?,
+        s3_key: row.get::<_, String>(4)?,
+        total_bytes: row.get::<_, i64>(5)?.max(0) as u64,
+        transferred_bytes: row.get::<_, i64>(6)?.max(0) as u64,
+        status,
+        retry_count: row.get::<_, i32>(8)?.max(0) as u32,
+        error_message: row.get::<_, Option<String>>(9)?,
+        created_at: row.get::<_, String>(10)?,
+        updated_at: row.get::<_, String>(11)?,
+    })
 }
 
 fn sql_limit(limit: usize) -> i64 {
@@ -2365,6 +2500,51 @@ mod tests {
             db.insert_revision(&conflicting),
             Err(CoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn get_recent_revisions_returns_newest_first_with_limit() {
+        let db = test_db();
+        let first_entry = file_entry("first.txt", 10);
+        let second_entry = file_entry("second.txt", 20);
+        db.register_local_file(&first_entry).unwrap();
+        db.register_local_file(&second_entry).unwrap();
+
+        let first_revision_id = first_entry.current_revision_id.unwrap().to_string();
+        let second_revision_id = second_entry.current_revision_id.unwrap().to_string();
+        db.insert_revision(&RevisionRecord {
+            revision_id: first_revision_id.clone(),
+            file_id: first_entry.file_id.to_string(),
+            parent_revision_id: None,
+            content_hash: Some("blake3:first".to_string()),
+            size: 10,
+            mime: Some("text/plain".to_string()),
+            author_device_id: "device-1".to_string(),
+            author_name: "Device".to_string(),
+            created_at: "2026-06-04T10:00:00Z".to_string(),
+            merge_state: "clean".to_string(),
+            conflict_revision_id: None,
+        })
+        .unwrap();
+        db.insert_revision(&RevisionRecord {
+            revision_id: second_revision_id.clone(),
+            file_id: second_entry.file_id.to_string(),
+            parent_revision_id: None,
+            content_hash: Some("blake3:second".to_string()),
+            size: 20,
+            mime: Some("text/plain".to_string()),
+            author_device_id: "device-1".to_string(),
+            author_name: "Device".to_string(),
+            created_at: "2026-06-04T10:01:00Z".to_string(),
+            merge_state: "clean".to_string(),
+            conflict_revision_id: None,
+        })
+        .unwrap();
+
+        let recent = db.get_recent_revisions(1).unwrap();
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].revision_id, second_revision_id);
     }
 
     #[test]

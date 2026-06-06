@@ -3,10 +3,10 @@
 use s4drive_core::{
     config::{default_exclude_patterns, Config},
     credentials::{resolve_secret, CredentialStore},
-    db::LocalDatabase,
+    db::{LocalDatabase, RevisionRecord},
     metadata::engine::MetadataEngine,
     s3::S3Adapter,
-    sync::{scan_folder_recursive_bounded, ActivityLog, SyncEngine, SyncState},
+    sync::{scan_folder_recursive_bounded, ActivityLog, SyncEngine, SyncState, VersionApi},
     transfer::TransferQueue,
     watcher::FileWatcher,
 };
@@ -16,7 +16,7 @@ use std::{
     f64::consts::PI,
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
@@ -45,6 +45,7 @@ const MIN_REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TRAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(350);
 const DESKTOP_FILE_LIST_LIMIT: usize = 5_000;
 const DESKTOP_SYNC_SCAN_LIMIT: usize = 100_000;
+const DESKTOP_VERSION_LIST_LIMIT: usize = 100;
 const LARGE_SYNC_CONFIRM_THRESHOLD: usize = 50_000;
 const LOG_FILE_NAME: &str = "s4drive.log";
 const LOG_MAX_LINES: usize = 10_000;
@@ -274,6 +275,10 @@ struct TransferItem {
     status: String,
     bytes_done: u64,
     bytes_total: u64,
+    retry_count: u32,
+    error_message: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -294,6 +299,14 @@ struct VersionItem {
     created_at: String,
     size_bytes: Option<u64>,
     status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RestoreVersionResult {
+    revision_id: String,
+    path: String,
+    bytes_restored: u64,
+    upload_queued: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -686,6 +699,7 @@ pub fn run() {
             get_transfers,
             get_conflicts,
             get_versions,
+            restore_version,
             get_devices,
             resolve_conflict,
             run_diagnostics,
@@ -1493,6 +1507,277 @@ fn list_local_files_with_db(
     }
     items.sort_by_key(|item| item.path.to_lowercase());
     Ok(items)
+}
+
+fn version_item_from_revision(db: &LocalDatabase, revision: RevisionRecord) -> VersionItem {
+    let label = revision_label_for_file(db, &revision.file_id);
+    let author = version_author(&revision);
+    let status = version_status_label(&revision.merge_state);
+
+    VersionItem {
+        revision_id: revision.revision_id,
+        file_id: revision.file_id,
+        label,
+        author,
+        created_at: revision.created_at,
+        size_bytes: Some(revision.size),
+        status,
+    }
+}
+
+fn revision_label_for_file(db: &LocalDatabase, file_id: &str) -> String {
+    let Ok(file_uuid) = uuid::Uuid::parse_str(file_id) else {
+        return file_id.to_string();
+    };
+
+    if let Some(remote_path) = db
+        .get_s3_key(&file_uuid)
+        .ok()
+        .flatten()
+        .and_then(non_empty_string)
+    {
+        return remote_path;
+    }
+
+    db.get_local_path(&file_uuid)
+        .ok()
+        .flatten()
+        .and_then(local_file_name)
+        .unwrap_or_else(|| file_id.to_string())
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn local_file_name(path: String) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.to_string())
+        .or_else(|| Some(trimmed.to_string()))
+}
+
+fn version_author(revision: &RevisionRecord) -> String {
+    let name = revision.author_name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+
+    let device = revision.author_device_id.trim();
+    if device.is_empty() {
+        "Unknown device".to_string()
+    } else {
+        device.to_string()
+    }
+}
+
+fn version_status_label(merge_state: &str) -> String {
+    match merge_state {
+        "clean" => "saved".to_string(),
+        "merged" => "merged".to_string(),
+        "conflicted" => "conflicted".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn restore_target_path_for_revision(
+    settings: &DesktopSettings,
+    db: &LocalDatabase,
+    revision: &RevisionRecord,
+) -> Result<PathBuf, String> {
+    let file_id = uuid::Uuid::parse_str(&revision.file_id)
+        .map_err(|e| format!("invalid version file id: {}", e))?;
+    let sync_folder = ensure_sync_folder(settings)?;
+
+    if let Some(local_path) = db
+        .get_local_path(&file_id)
+        .map_err(|e| e.to_string())?
+        .and_then(non_empty_string)
+    {
+        let candidate = PathBuf::from(&local_path);
+        let target = if candidate.is_absolute() {
+            candidate
+        } else {
+            safe_join_desktop_sync_path(&sync_folder, &local_path)?
+        };
+        if target.starts_with(&sync_folder) {
+            return Ok(target);
+        }
+    }
+
+    if let Some(s3_key) = db
+        .get_s3_key(&file_id)
+        .map_err(|e| e.to_string())?
+        .and_then(non_empty_string)
+    {
+        return safe_join_desktop_sync_path(&sync_folder, &s3_key);
+    }
+
+    Err(format!(
+        "cannot determine restore path for file {}",
+        revision.file_id
+    ))
+}
+
+fn restore_s3_key_for_revision(
+    settings: &DesktopSettings,
+    db: &LocalDatabase,
+    revision: &RevisionRecord,
+    target_path: &Path,
+) -> Result<String, String> {
+    let file_id = uuid::Uuid::parse_str(&revision.file_id)
+        .map_err(|e| format!("invalid version file id: {}", e))?;
+
+    if let Some(s3_key) = db
+        .get_s3_key(&file_id)
+        .map_err(|e| e.to_string())?
+        .and_then(non_empty_string)
+    {
+        return Ok(s3_key);
+    }
+
+    let sync_folder = ensure_sync_folder(settings)?;
+    let relative = target_path
+        .strip_prefix(&sync_folder)
+        .map_err(|_| "restore target is outside sync folder".to_string())?;
+    Ok(path_to_s3_key_desktop(relative))
+}
+
+fn safe_join_desktop_sync_path(sync_folder: &Path, remote_path: &str) -> Result<PathBuf, String> {
+    let mut path = sync_folder.to_path_buf();
+    for component in Path::new(remote_path).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("remote path escapes sync folder: {}", remote_path));
+            }
+        }
+    }
+    Ok(path)
+}
+
+fn path_to_s3_key_desktop(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+async fn write_restored_version(target_path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = target_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create restore parent: {}", e))?;
+    }
+
+    let tmp_path = restore_sidecar_path(target_path, "restore");
+    tokio::fs::write(&tmp_path, data)
+        .await
+        .map_err(|e| format!("write restore temp: {}", e))?;
+    if let Err(error) = finish_restore_replace(&tmp_path, target_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn finish_restore_replace(tmp_path: &Path, target_path: &Path) -> Result<(), String> {
+    match tokio::fs::rename(tmp_path, target_path).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let target_exists =
+                tokio::fs::try_exists(target_path)
+                    .await
+                    .map_err(|exists_error| {
+                        format!("finish restore: {}; check target: {}", error, exists_error)
+                    })?;
+            if !target_exists {
+                return Err(format!("finish restore: {}", error));
+            }
+            replace_existing_restore_target(tmp_path, target_path, error.to_string()).await
+        }
+    }
+}
+
+async fn replace_existing_restore_target(
+    tmp_path: &Path,
+    target_path: &Path,
+    initial_error: String,
+) -> Result<(), String> {
+    let metadata = tokio::fs::metadata(target_path).await.map_err(|e| {
+        format!(
+            "prepare restore target after rename failed ({}): {}",
+            initial_error, e
+        )
+    })?;
+    if metadata.is_dir() {
+        return Err(format!(
+            "restore target is a directory: {}",
+            target_path.display()
+        ));
+    }
+
+    let backup_path = restore_sidecar_path(target_path, "backup");
+    tokio::fs::rename(target_path, &backup_path)
+        .await
+        .map_err(|e| {
+            format!(
+                "prepare restore target after rename failed ({}): {}",
+                initial_error, e
+            )
+        })?;
+
+    match tokio::fs::rename(tmp_path, target_path).await {
+        Ok(()) => {
+            if let Err(error) = tokio::fs::remove_file(&backup_path).await {
+                tracing::warn!(
+                    "restored version but failed to remove restore backup {}: {}",
+                    backup_path.display(),
+                    error
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tokio::fs::rename(&backup_path, target_path).await {
+                return Err(format!(
+                    "finish restore: {}; rollback failed: {}",
+                    error, rollback_error
+                ));
+            }
+            Err(format!("finish restore: {}", error))
+        }
+    }
+}
+
+fn restore_sidecar_path(target_path: &Path, label: &str) -> PathBuf {
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("restore");
+    target_path.with_file_name(format!(
+        ".{}.s4drive-{}-{}.tmp",
+        file_name,
+        label,
+        uuid::Uuid::now_v7()
+    ))
 }
 
 // Sync State
@@ -2480,30 +2765,25 @@ fn get_transfers(
     let config = app_local_config(&app, &settings);
     let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
     let transfer = TransferQueue::new(&db);
-    let mut items = Vec::new();
+    let jobs = transfer
+        .recent_transfers(200, 100)
+        .map_err(|e| e.to_string())?;
 
-    for job in transfer.pending_uploads(100).map_err(|e| e.to_string())? {
-        items.push(TransferItem {
+    Ok(jobs
+        .into_iter()
+        .map(|job| TransferItem {
             id: job.id.to_string(),
             direction: job.direction.as_str().to_string(),
             path: job.local_path,
-            status: "queued".to_string(),
+            status: job.status.as_str().to_string(),
             bytes_done: job.transferred_bytes,
             bytes_total: job.total_bytes,
-        });
-    }
-    for job in transfer.pending_downloads(100).map_err(|e| e.to_string())? {
-        items.push(TransferItem {
-            id: job.id.to_string(),
-            direction: job.direction.as_str().to_string(),
-            path: job.local_path,
-            status: "queued".to_string(),
-            bytes_done: job.transferred_bytes,
-            bytes_total: job.total_bytes,
-        });
-    }
-
-    Ok(items)
+            retry_count: job.retry_count,
+            error_message: job.error_message,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -2512,8 +2792,94 @@ fn get_conflicts() -> Result<Vec<ConflictItem>, String> {
 }
 
 #[tauri::command]
-fn get_versions() -> Result<Vec<VersionItem>, String> {
-    Ok(Vec::new())
+fn get_versions(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<VersionItem>, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let config = app_local_config(&app, &settings);
+    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let revisions = db
+        .get_recent_revisions(DESKTOP_VERSION_LIST_LIMIT)
+        .map_err(|e| e.to_string())?;
+
+    Ok(revisions
+        .into_iter()
+        .map(|revision| version_item_from_revision(&db, revision))
+        .collect())
+}
+
+#[tauri::command]
+async fn restore_version(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    revision_id: String,
+) -> Result<RestoreVersionResult, String> {
+    let revision_id = revision_id.trim().to_string();
+    if revision_id.is_empty() {
+        return Err("revision id is required".to_string());
+    }
+
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    if !settings.account_is_complete() {
+        return Err("connect storage before restoring versions".to_string());
+    }
+
+    let secret = resolve_desktop_secret(&app, &settings, None)?;
+    let config = app_core_config(&app, &settings, secret);
+    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let version_api = VersionApi::new(
+        Some(db.clone()),
+        &state_device_id(state.inner())?,
+        "This device",
+    );
+    let revision = version_api
+        .get_revision(&revision_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("version not found: {}", revision_id))?;
+    let file_id = uuid::Uuid::parse_str(&revision.file_id)
+        .map_err(|e| format!("invalid version file id: {}", e))?;
+    let target_path = restore_target_path_for_revision(&settings, &db, &revision)?;
+    let s3_key = restore_s3_key_for_revision(&settings, &db, &revision, &target_path)?;
+    let blob_key = version_api
+        .content_key_for_revision(&revision_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("version has no content blob: {}", revision_id))?;
+
+    let s3 = S3Adapter::new(&config).await.map_err(|e| e.to_string())?;
+    let data = s3.get_object(&blob_key).await.map_err(|e| e.to_string())?;
+    write_restored_version(&target_path, &data).await?;
+
+    let target_text = target_path.to_string_lossy().to_string();
+    let mut entry = db
+        .get_file(&file_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("file not found for version: {}", revision.file_id))?;
+    entry.size = revision.size;
+    entry.content_hash = revision.content_hash.clone();
+    entry.updated_at = chrono::Utc::now().to_rfc3339();
+    db.register_file_at_path_with_state(&entry, &target_text, &s3_key, "pending_upload")
+        .map_err(|e| e.to_string())?;
+    let transfer = TransferQueue::new(&db);
+    transfer
+        .enqueue_upload(&revision.file_id, &target_text, &s3_key)
+        .map_err(|e| e.to_string())?;
+    if let Ok(activity) = ActivityLog::new(&db) {
+        let _ = activity.log(
+            "restore_version",
+            &revision.file_id,
+            &s3_key,
+            "upload_queued",
+        );
+    }
+    let _ = app.emit("files-changed", ());
+
+    Ok(RestoreVersionResult {
+        revision_id,
+        path: target_text,
+        bytes_restored: data.len() as u64,
+        upload_queued: true,
+    })
 }
 
 #[tauri::command]
@@ -2845,6 +3211,85 @@ mod tests {
 
         assert_eq!(status.state, "attention");
         assert!(!status.running);
+    }
+
+    #[test]
+    fn version_helpers_format_author_status_and_local_label() {
+        let revision = RevisionRecord {
+            revision_id: "rev-1".to_string(),
+            file_id: "file-1".to_string(),
+            parent_revision_id: None,
+            content_hash: Some("blake3:test".to_string()),
+            size: 25,
+            mime: Some("text/plain".to_string()),
+            author_device_id: "device-1".to_string(),
+            author_name: "This device".to_string(),
+            created_at: "2026-06-04T10:00:00Z".to_string(),
+            merge_state: "clean".to_string(),
+            conflict_revision_id: None,
+        };
+
+        assert_eq!(version_author(&revision), "This device");
+        assert_eq!(version_status_label(&revision.merge_state), "saved");
+        assert_eq!(
+            local_file_name("/home/ubuntu/S4Drive/file.txt".to_string()).as_deref(),
+            Some("file.txt")
+        );
+    }
+
+    #[test]
+    fn restore_path_join_rejects_paths_outside_sync_folder() {
+        let root = PathBuf::from("/tmp/s4drive");
+
+        let path = safe_join_desktop_sync_path(&root, "folder/file.txt").unwrap();
+        assert_eq!(path, root.join("folder").join("file.txt"));
+
+        assert!(safe_join_desktop_sync_path(&root, "../escape.txt").is_err());
+        assert!(safe_join_desktop_sync_path(&root, "/tmp/escape.txt").is_err());
+    }
+
+    #[tokio::test]
+    async fn write_restored_version_replaces_existing_file() {
+        let root = std::env::temp_dir().join(format!("s4drive-restore-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("file.txt");
+        std::fs::write(&target, b"old").unwrap();
+
+        write_restored_version(&target, b"new").await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replace_existing_restore_target_uses_backup_strategy() {
+        let root = std::env::temp_dir().join(format!("s4drive-restore-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("file.txt");
+        let tmp = root.join(".file.txt.s4drive-restore-test.tmp");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+
+        replace_existing_restore_target(&tmp, &target, "simulated existing target".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!tmp.exists());
+        let sidecar_count = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".s4drive-backup-")
+            })
+            .count();
+        assert_eq!(sidecar_count, 0);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

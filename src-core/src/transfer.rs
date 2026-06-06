@@ -15,6 +15,7 @@ pub struct TransferJob {
     pub retry_count: u32,
     pub error_message: Option<String>,
     pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Direction of a transfer job.
@@ -41,6 +42,18 @@ pub enum TransferStatus {
     Paused,
     Completed,
     Failed,
+}
+
+impl TransferStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransferStatus::Queued => "queued",
+            TransferStatus::InProgress => "in_progress",
+            TransferStatus::Paused => "paused",
+            TransferStatus::Completed => "completed",
+            TransferStatus::Failed => "failed",
+        }
+    }
 }
 
 /// Persistent transfer queue for upload/download jobs.
@@ -95,6 +108,15 @@ impl TransferQueue {
     /// Get pending download jobs (up to `limit`).
     pub fn pending_downloads(&self, limit: u32) -> CoreResult<Vec<TransferJob>> {
         self.pending_jobs(TransferDirection::Download, limit)
+    }
+
+    /// Get active and recently completed jobs for desktop transfer monitoring.
+    pub fn recent_transfers(
+        &self,
+        active_limit: u32,
+        completed_limit: u32,
+    ) -> CoreResult<Vec<TransferJob>> {
+        self.db.get_recent_transfers(active_limit, completed_limit)
     }
 
     /// Internal: get pending jobs for a direction.
@@ -259,6 +281,34 @@ mod tests {
     }
 
     #[test]
+    fn mark_completed_sets_progress_to_total_bytes() {
+        let db = test_db();
+        let queue = TransferQueue::new(&db);
+        let path = temp_file("complete-size.txt", b"hello");
+        queue
+            .enqueue_upload(
+                "file-complete-size",
+                &path.to_string_lossy(),
+                "complete-size.txt",
+            )
+            .unwrap();
+        let job_id = queue.pending_uploads(10).unwrap()[0].id;
+
+        queue.mark_completed(job_id).unwrap();
+        let recent = queue.recent_transfers(10, 10).unwrap();
+        let completed = recent
+            .iter()
+            .find(|job| job.id == job_id)
+            .expect("completed transfer should be included");
+
+        assert_eq!(completed.status, TransferStatus::Completed);
+        assert_eq!(completed.total_bytes, 5);
+        assert_eq!(completed.transferred_bytes, 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn test_mark_failed() {
         let db = test_db();
         let queue = TransferQueue::new(&db);
@@ -271,6 +321,31 @@ mod tests {
         queue.mark_failed(job_id, "connection timeout").unwrap();
         let remaining = queue.pending_uploads(10).unwrap();
         assert_eq!(remaining.len(), 0);
+    }
+
+    #[test]
+    fn recent_transfers_include_failed_and_completed_jobs() {
+        let db = test_db();
+        let queue = TransferQueue::new(&db);
+        queue
+            .enqueue_upload("failed-file", "/tmp/failed.txt", "failed.txt")
+            .unwrap();
+        queue
+            .enqueue_download("completed-file", "/tmp/completed.txt", "completed.txt")
+            .unwrap();
+        let failed_id = queue.pending_uploads(10).unwrap()[0].id;
+        let completed_id = queue.pending_downloads(10).unwrap()[0].id;
+
+        queue.mark_failed(failed_id, "network timeout").unwrap();
+        queue.mark_completed(completed_id).unwrap();
+        let recent = queue.recent_transfers(10, 10).unwrap();
+
+        assert!(recent.iter().any(|job| job.id == failed_id
+            && job.status == TransferStatus::Failed
+            && job.error_message.as_deref() == Some("network timeout")));
+        assert!(recent
+            .iter()
+            .any(|job| job.id == completed_id && job.status == TransferStatus::Completed));
     }
 
     #[test]
