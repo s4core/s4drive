@@ -245,6 +245,7 @@ jobs:
 
       - name: Build universal .app bundle
         run: |
+          VERSION="$(jq -r '.version' src-tauri/tauri.conf.json)"
           APP="target/release/S4Drive.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/release/s4drive-universal "$APP/Contents/MacOS/s4drive"
@@ -259,8 +260,8 @@ jobs:
             '<key>CFBundleExecutable</key><string>s4drive</string>' \
             '<key>CFBundleIdentifier</key><string>com.s4drive.app</string>' \
             '<key>CFBundleName</key><string>S4Drive</string>' \
-            '<key>CFBundleVersion</key><string>0.1.0</string>' \
-            '<key>CFBundleShortVersionString</key><string>0.1.0</string>' \
+            "<key>CFBundleVersion</key><string>${VERSION}</string>" \
+            "<key>CFBundleShortVersionString</key><string>${VERSION}</string>" \
             '<key>CFBundlePackageType</key><string>APPL</string>' \
             '<key>LSMinimumSystemVersion</key><string>10.15</string>' \
             '<key>NSHighResolutionCapable</key><true/>' \
@@ -270,7 +271,8 @@ jobs:
 
       - name: Create universal DMG
         run: |
-          DMG="target/release/S4Drive-0.1.0-universal.dmg"
+          VERSION="$(jq -r '.version' src-tauri/tauri.conf.json)"
+          DMG="target/release/S4Drive-${VERSION}-universal.dmg"
           APP="target/release/S4Drive.app"
           hdiutil create -volname "S4Drive" -srcfolder "$APP" -ov -format UDZO "$DMG"
           ls -lh "$DMG"

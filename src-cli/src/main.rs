@@ -6,12 +6,20 @@
 ///   cargo run -p s4drive-cli -- metadata status ...
 ///   cargo run -p s4drive-cli -- metadata tree ...
 ///   cargo run -p s4drive-cli -- metadata ops ...
+///   cargo run -p s4drive-cli -- restore-bucket --input .s4drive --output ./restored-files
 use clap::{CommandFactory, Parser, Subcommand};
 use rusqlite::OpenFlags;
 use s4drive_core::config::Config;
 use s4drive_core::metadata::compaction::DeviceWatermarks;
 use s4drive_core::metadata::engine::MetadataEngine;
+use s4drive_core::metadata::serializer::Serializer;
+use s4drive_core::metadata::types::{
+    ContentRef, EntryType, FileEntry, FileId, OpType, Operation, SnapshotMetadata,
+};
+use s4drive_core::metadata::validator::Validator;
 use s4drive_core::s3::S3Adapter;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -73,6 +81,21 @@ enum Commands {
         /// Device name (default: hostname)
         #[arg(short, long, default_value = "s4drive-cli")]
         device_name: String,
+    },
+
+    /// Восстановить файлы из локальной копии .s4drive без GUI/S3 доступа
+    RestoreBucket {
+        /// Path to .s4drive or to a directory containing content/, meta/, trash/
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Directory where restored files will be written
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Replace existing files in the output directory
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
     },
 
     /// Работа с метадатой бакета
@@ -324,6 +347,16 @@ async fn main() {
                 &device_name,
             )
             .await;
+        }
+        Commands::RestoreBucket {
+            input,
+            output,
+            overwrite,
+        } => {
+            if let Err(error) = run_restore_bucket(&input, &output, overwrite) {
+                eprintln!("  ✗ {}", error);
+                std::process::exit(2);
+            }
         }
         Commands::Metadata { action } => match action {
             MetadataAction::Status {
@@ -813,6 +846,639 @@ async fn run_retire_device(
         Ok(_) => println!("Retired device {}", device_id),
         Err(error) => println!("Failed to retire device {}: {}", device_id, error),
     }
+}
+
+// ─── Restore Bucket ──────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct RestoreSnapshot {
+    seq_num: Option<u64>,
+    covered_head: Option<String>,
+    entries: Vec<FileEntry>,
+}
+
+#[derive(Debug, Default)]
+struct RestoreReport {
+    snapshot_seq: Option<u64>,
+    entries_seen: usize,
+    ops_applied: usize,
+    files_restored: usize,
+    folders_created: usize,
+    deleted_skipped: usize,
+    metadata_skipped: usize,
+    missing_blobs: usize,
+    path_conflicts: usize,
+}
+
+impl RestoreReport {
+    fn has_data_loss_warnings(&self) -> bool {
+        self.missing_blobs > 0 || self.metadata_skipped > 0
+    }
+}
+
+fn run_restore_bucket(input: &Path, output: &Path, overwrite: bool) -> Result<(), String> {
+    println!();
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║   S4Drive — Bucket Disaster Recovery        ║");
+    println!("╚══════════════════════════════════════════════╝");
+    println!();
+
+    let metadata_root = locate_s4drive_metadata_root(input)?;
+    let metadata_root_abs = absolutize_path(&metadata_root)
+        .map_err(|e| format!("resolve input path {}: {}", metadata_root.display(), e))?;
+    let output_abs = absolutize_path(output)
+        .map_err(|e| format!("resolve output path {}: {}", output.display(), e))?;
+
+    if output_abs == metadata_root_abs || output_abs.starts_with(&metadata_root_abs) {
+        return Err(format!(
+            "output must not be inside metadata input: {}",
+            output.display()
+        ));
+    }
+    if output.exists() && !output.is_dir() {
+        return Err(format!(
+            "output exists but is not a directory: {}",
+            output.display()
+        ));
+    }
+
+    println!("  Input:      {}", metadata_root.display());
+    println!("  Output:     {}", output.display());
+    println!("  Overwrite:  {}", if overwrite { "yes" } else { "no" });
+    println!();
+
+    let snapshot = load_restore_snapshot(&metadata_root)?;
+    let mut entries: HashMap<FileId, FileEntry> = snapshot
+        .entries
+        .iter()
+        .cloned()
+        .map(|entry| (entry.file_id, entry))
+        .collect();
+    let entries_seen = entries.len();
+    let current_head = read_current_head(&metadata_root)?;
+    let ops_applied = apply_ops_since_snapshot(
+        &metadata_root,
+        &mut entries,
+        snapshot.covered_head.as_deref(),
+        current_head.as_deref(),
+    )?;
+
+    fs::create_dir_all(output)
+        .map_err(|e| format!("create output directory {}: {}", output.display(), e))?;
+
+    let mut report = restore_entries_to_output(&metadata_root, output, &entries, overwrite)?;
+    report.snapshot_seq = snapshot.seq_num;
+    report.entries_seen = entries_seen;
+    report.ops_applied = ops_applied;
+
+    println!();
+    println!("  Restore summary:");
+    println!(
+        "    Snapshot:          {}",
+        report
+            .snapshot_seq
+            .map(|seq| format!("#{}", seq))
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!("    Entries in tree:   {}", report.entries_seen);
+    println!("    Ops applied:       {}", report.ops_applied);
+    println!("    Files restored:    {}", report.files_restored);
+    println!("    Folders created:   {}", report.folders_created);
+    println!("    Deleted skipped:   {}", report.deleted_skipped);
+    println!("    Metadata skipped:  {}", report.metadata_skipped);
+    println!("    Missing blobs:     {}", report.missing_blobs);
+    println!("    Path conflicts:    {}", report.path_conflicts);
+    println!();
+
+    if report.has_data_loss_warnings() {
+        return Err(
+            "restore completed with missing blobs or incomplete metadata; inspect the summary above"
+                .to_string(),
+        );
+    }
+
+    println!("  ✓ Restore completed");
+    println!();
+    Ok(())
+}
+
+fn locate_s4drive_metadata_root(input: &Path) -> Result<PathBuf, String> {
+    if input.join("meta").is_dir() && input.join("content").is_dir() {
+        return Ok(input.to_path_buf());
+    }
+
+    let nested = input.join(".s4drive");
+    if nested.join("meta").is_dir() && nested.join("content").is_dir() {
+        return Ok(nested);
+    }
+
+    Err(format!(
+        "input must be .s4drive or contain .s4drive/content and .s4drive/meta: {}",
+        input.display()
+    ))
+}
+
+fn load_restore_snapshot(root: &Path) -> Result<RestoreSnapshot, String> {
+    let Some(seq_num) = find_latest_snapshot_seq(root)? else {
+        return Ok(RestoreSnapshot {
+            seq_num: None,
+            covered_head: None,
+            entries: Vec::new(),
+        });
+    };
+
+    let tree_path = root
+        .join("meta")
+        .join("snapshots")
+        .join(format!("{:020}", seq_num))
+        .join("tree.json");
+    let entries: Vec<FileEntry> = read_json_file(&tree_path)?;
+    let metadata_path = root
+        .join("meta")
+        .join("snapshots")
+        .join(format!("{:020}", seq_num))
+        .join("metadata.json");
+    let covered_head = if metadata_path.exists() {
+        let metadata: SnapshotMetadata = read_json_file(&metadata_path)?;
+        metadata.covered_head
+    } else {
+        None
+    };
+
+    Ok(RestoreSnapshot {
+        seq_num: Some(seq_num),
+        covered_head,
+        entries,
+    })
+}
+
+fn find_latest_snapshot_seq(root: &Path) -> Result<Option<u64>, String> {
+    let snapshots_dir = root.join("meta").join("snapshots");
+    let latest_path = snapshots_dir.join("LATEST");
+    if latest_path.exists() {
+        let latest = read_utf8_file(&latest_path)?;
+        let seq = latest
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("parse {}: {}", latest_path.display(), e))?;
+        let tree_path = snapshots_dir.join(format!("{:020}", seq)).join("tree.json");
+        if tree_path.exists() {
+            return Ok(Some(seq));
+        }
+    }
+
+    if !snapshots_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut latest_seq = None;
+    for entry in fs::read_dir(&snapshots_dir)
+        .map_err(|e| format!("read snapshots dir {}: {}", snapshots_dir.display(), e))?
+    {
+        let entry = entry.map_err(|e| format!("read snapshots entry: {}", e))?;
+        if !entry
+            .file_type()
+            .map_err(|e| format!("read snapshots entry type: {}", e))?
+            .is_dir()
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Ok(seq) = name.parse::<u64>() else {
+            continue;
+        };
+        if entry.path().join("tree.json").exists() {
+            latest_seq = Some(latest_seq.map_or(seq, |current: u64| current.max(seq)));
+        }
+    }
+
+    Ok(latest_seq)
+}
+
+fn read_current_head(root: &Path) -> Result<Option<String>, String> {
+    let path = root.join("meta").join("heads").join("current");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let head = read_utf8_file(&path)?.trim().to_string();
+    if head.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(head))
+}
+
+fn apply_ops_since_snapshot(
+    root: &Path,
+    entries: &mut HashMap<FileId, FileEntry>,
+    covered_head: Option<&str>,
+    current_head: Option<&str>,
+) -> Result<usize, String> {
+    let Some(mut cursor) = current_head.map(ToString::to_string) else {
+        return Ok(0);
+    };
+    if covered_head == Some(cursor.as_str()) {
+        return Ok(0);
+    }
+
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        if covered_head == Some(cursor.as_str()) {
+            break;
+        }
+        if !seen.insert(cursor.clone()) {
+            return Err(format!("operation chain cycle detected at {}", cursor));
+        }
+        let op = read_local_operation(root, &cursor)?;
+        let base_head = op.base_head.clone();
+        chain.push(op);
+        if base_head.is_empty() {
+            if covered_head.is_some() {
+                return Err("operation chain does not reach snapshot covered_head".to_string());
+            }
+            break;
+        }
+        cursor = base_head;
+    }
+
+    let applied = chain.len();
+    for op in chain.iter().rev() {
+        apply_restore_operation(entries, op);
+    }
+    Ok(applied)
+}
+
+fn read_local_operation(root: &Path, op_id: &str) -> Result<Operation, String> {
+    let path = root
+        .join("meta")
+        .join("ops")
+        .join(format!("{}.json", op_id));
+    let data = read_utf8_file(&path)?;
+    Serializer::deserialize_operation(&data)
+        .map_err(|e| format!("deserialize operation {}: {}", path.display(), e))
+}
+
+fn apply_restore_operation(entries: &mut HashMap<FileId, FileEntry>, op: &Operation) {
+    let Some(file_id) = op.target_file_id else {
+        return;
+    };
+
+    match op.op_type {
+        OpType::CreateFile | OpType::UploadNewRevision | OpType::Restore => {
+            let content_ref = op.effects.new_content_ref.clone();
+            let default_name = op
+                .effects
+                .new_name
+                .clone()
+                .unwrap_or_else(|| file_id.to_string());
+            let entry = entries.entry(file_id).or_insert_with(|| {
+                new_restore_entry(
+                    file_id,
+                    EntryType::File,
+                    &default_name,
+                    op.effects.new_parent_id,
+                    &op.timestamp,
+                )
+            });
+            if let Some(name) = op.effects.new_name.as_deref() {
+                entry.name = name.to_string();
+                entry.normalized_name = Validator::normalize_name(name).to_lowercase();
+            }
+            if let Some(parent_id) = op.effects.new_parent_id {
+                entry.parent_id = Some(parent_id);
+            }
+            if let Some(content_ref) = content_ref {
+                entry.content_ref = Some(content_ref.clone());
+                entry.size = content_ref.size;
+                entry.content_hash = Some(format!("blake3:{}", content_ref.hash));
+                entry.mime = Some(content_ref.mime);
+            }
+            if let Some(revision_id) = op.effects.new_revision_id {
+                entry.current_revision_id = Some(revision_id);
+                if !entry.version_history.contains(&revision_id) {
+                    entry.version_history.push(revision_id);
+                }
+            }
+            entry.deleted_at = None;
+            entry.updated_at = op.timestamp.clone();
+        }
+        OpType::CreateFolder => {
+            let name = op
+                .effects
+                .new_name
+                .clone()
+                .unwrap_or_else(|| file_id.to_string());
+            let entry = entries.entry(file_id).or_insert_with(|| {
+                new_restore_entry(
+                    file_id,
+                    EntryType::Folder,
+                    &name,
+                    op.effects.new_parent_id,
+                    &op.timestamp,
+                )
+            });
+            entry.entry_type = EntryType::Folder;
+            entry.content_ref = None;
+            entry.deleted_at = None;
+            entry.updated_at = op.timestamp.clone();
+        }
+        OpType::Rename | OpType::Move | OpType::UpdateMetadata => {
+            if let Some(entry) = entries.get_mut(&file_id) {
+                if let Some(name) = op.effects.new_name.as_deref() {
+                    entry.name = name.to_string();
+                    entry.normalized_name = Validator::normalize_name(name).to_lowercase();
+                }
+                if let Some(parent_id) = op.effects.new_parent_id {
+                    entry.parent_id = Some(parent_id);
+                }
+                entry.updated_at = op.timestamp.clone();
+            }
+        }
+        OpType::Delete => {
+            if let Some(entry) = entries.get_mut(&file_id) {
+                entry.deleted_at = Some(op.timestamp.clone());
+                entry.updated_at = op.timestamp.clone();
+            }
+        }
+    }
+}
+
+fn new_restore_entry(
+    file_id: FileId,
+    entry_type: EntryType,
+    name: &str,
+    parent_id: Option<FileId>,
+    timestamp: &str,
+) -> FileEntry {
+    FileEntry {
+        file_id,
+        parent_id,
+        name: name.to_string(),
+        normalized_name: Validator::normalize_name(name).to_lowercase(),
+        entry_type,
+        current_revision_id: None,
+        content_ref: None,
+        size: 0,
+        content_hash: None,
+        mime: None,
+        created_at: timestamp.to_string(),
+        updated_at: timestamp.to_string(),
+        deleted_at: None,
+        version_history: Vec::new(),
+        attributes: Default::default(),
+        lock_state: Default::default(),
+    }
+}
+
+fn restore_entries_to_output(
+    root: &Path,
+    output: &Path,
+    entries: &HashMap<FileId, FileEntry>,
+    overwrite: bool,
+) -> Result<RestoreReport, String> {
+    let mut report = RestoreReport::default();
+    let mut planned_paths = HashSet::new();
+    let mut restore_items: Vec<(&FileId, &FileEntry, PathBuf)> = Vec::new();
+
+    for (file_id, entry) in entries {
+        if entry.deleted_at.is_some() {
+            report.deleted_skipped += 1;
+            continue;
+        }
+        let relative_path = match entry_relative_path(file_id, entries) {
+            Ok(path) => path,
+            Err(error) => {
+                report.metadata_skipped += 1;
+                eprintln!("  ⚠ Skipping {}: {}", file_id, error);
+                continue;
+            }
+        };
+        restore_items.push((file_id, entry, relative_path));
+    }
+
+    restore_items.sort_by(|a, b| a.2.cmp(&b.2));
+
+    for (file_id, entry, relative_path) in restore_items {
+        match entry.entry_type {
+            EntryType::Folder => {
+                let target = output.join(&relative_path);
+                fs::create_dir_all(&target)
+                    .map_err(|e| format!("create folder {}: {}", target.display(), e))?;
+                report.folders_created += 1;
+            }
+            EntryType::File | EntryType::Symlink => {
+                let Some(content_ref) = entry.content_ref.as_ref() else {
+                    report.metadata_skipped += 1;
+                    eprintln!("  ⚠ Skipping {}: file has no content_ref", file_id);
+                    continue;
+                };
+                let source = match blob_source_path(root, content_ref) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        report.metadata_skipped += 1;
+                        eprintln!("  ⚠ Skipping {}: {}", file_id, error);
+                        continue;
+                    }
+                };
+                if !source.is_file() {
+                    report.missing_blobs += 1;
+                    eprintln!(
+                        "  ⚠ Missing blob for {}: {}",
+                        relative_path.display(),
+                        source.display()
+                    );
+                    continue;
+                }
+
+                let requested_target = output.join(&relative_path);
+                let target = choose_restore_target(
+                    &requested_target,
+                    *file_id,
+                    overwrite,
+                    &mut planned_paths,
+                );
+                if target != requested_target {
+                    report.path_conflicts += 1;
+                }
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("create parent {}: {}", parent.display(), e))?;
+                }
+                let copied = fs::copy(&source, &target).map_err(|e| {
+                    format!("copy {} -> {}: {}", source.display(), target.display(), e)
+                })?;
+                if copied != content_ref.size {
+                    return Err(format!(
+                        "copied size mismatch for {}: expected {}, got {}",
+                        target.display(),
+                        content_ref.size,
+                        copied
+                    ));
+                }
+                report.files_restored += 1;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn entry_relative_path(
+    file_id: &FileId,
+    entries: &HashMap<FileId, FileEntry>,
+) -> Result<PathBuf, String> {
+    let mut visiting = HashSet::new();
+    entry_relative_path_inner(file_id, entries, &mut visiting)
+}
+
+fn entry_relative_path_inner(
+    file_id: &FileId,
+    entries: &HashMap<FileId, FileEntry>,
+    visiting: &mut HashSet<FileId>,
+) -> Result<PathBuf, String> {
+    if !visiting.insert(*file_id) {
+        return Err("parent cycle detected".to_string());
+    }
+    let entry = entries
+        .get(file_id)
+        .ok_or_else(|| format!("missing entry {}", file_id))?;
+    let own_path = safe_relative_path(&entry.name)?;
+    let result = if let Some(parent_id) = entry.parent_id {
+        if entries.contains_key(&parent_id) {
+            let mut parent_path = entry_relative_path_inner(&parent_id, entries, visiting)?;
+            parent_path.push(own_path);
+            parent_path
+        } else {
+            own_path
+        }
+    } else {
+        own_path
+    };
+    visiting.remove(file_id);
+    Ok(result)
+}
+
+fn safe_relative_path(path: &str) -> Result<PathBuf, String> {
+    if path.trim().is_empty() {
+        return Err("empty path".to_string());
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err(format!("absolute path is not allowed: {}", path));
+    }
+    let normalized = path.replace('\\', "/");
+    if looks_like_windows_absolute_path(&normalized) {
+        return Err(format!("absolute path is not allowed: {}", path));
+    }
+
+    let mut result = PathBuf::new();
+    for component in normalized.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            return Err(format!(
+                "parent directory component is not allowed: {}",
+                path
+            ));
+        }
+        if component.as_bytes().contains(&0) {
+            return Err("path contains NUL byte".to_string());
+        }
+        result.push(component);
+    }
+
+    if result.as_os_str().is_empty() {
+        return Err(format!("path has no usable components: {}", path));
+    }
+    Ok(result)
+}
+
+fn looks_like_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/'
+}
+
+fn blob_source_path(root: &Path, content_ref: &ContentRef) -> Result<PathBuf, String> {
+    let key = content_ref
+        .storage_key
+        .strip_prefix(".s4drive/")
+        .unwrap_or(&content_ref.storage_key);
+    let candidate = root.join(safe_relative_path(key)?);
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+
+    if content_ref.hash.len() >= 2 {
+        let prefix = content_ref
+            .hash
+            .get(..2)
+            .ok_or_else(|| "invalid content hash prefix".to_string())?;
+        return Ok(root
+            .join("content")
+            .join("blobs")
+            .join(prefix)
+            .join(&content_ref.hash));
+    }
+
+    Err(format!(
+        "content_ref has invalid storage key and hash: {}",
+        content_ref.storage_key
+    ))
+}
+
+fn choose_restore_target(
+    requested: &Path,
+    file_id: FileId,
+    overwrite: bool,
+    planned_paths: &mut HashSet<PathBuf>,
+) -> PathBuf {
+    if overwrite && !planned_paths.contains(requested) {
+        planned_paths.insert(requested.to_path_buf());
+        return requested.to_path_buf();
+    }
+    if !requested.exists() && !planned_paths.contains(requested) {
+        planned_paths.insert(requested.to_path_buf());
+        return requested.to_path_buf();
+    }
+
+    let mut counter = 1usize;
+    loop {
+        let candidate = restore_conflict_path(requested, file_id, counter);
+        if !candidate.exists() && !planned_paths.contains(&candidate) {
+            planned_paths.insert(candidate.clone());
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
+fn restore_conflict_path(requested: &Path, file_id: FileId, counter: usize) -> PathBuf {
+    let suffix = format!("restored {} {}", &file_id.to_string()[..8], counter);
+    let file_name = requested
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("restored-file");
+    let candidate_name = match requested.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if file_name.len() > ext.len() + 1 => {
+            let stem_len = file_name.len() - ext.len() - 1;
+            format!("{} ({suffix}).{}", &file_name[..stem_len], ext)
+        }
+        _ => format!("{file_name} ({suffix})"),
+    };
+    requested.with_file_name(candidate_name)
+}
+
+fn read_json_file<T>(path: &Path) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let text = read_utf8_file(path)?;
+    serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e))
+}
+
+fn read_utf8_file(path: &Path) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -1425,5 +2091,179 @@ mod tests {
     fn percent_encode_makes_deep_link_segments_safe() {
         assert_eq!(percent_encode("docs/report 1.txt"), "docs%2Freport%201.txt");
         assert_eq!(percent_encode("abc-_.~"), "abc-_.~");
+    }
+
+    #[test]
+    fn safe_relative_path_rejects_escape_paths() {
+        assert!(safe_relative_path("../secret.txt").is_err());
+        assert!(safe_relative_path("/tmp/secret.txt").is_err());
+        assert!(safe_relative_path("C:\\tmp\\secret.txt").is_err());
+        assert_eq!(
+            safe_relative_path("docs/report.txt").unwrap(),
+            PathBuf::from("docs").join("report.txt")
+        );
+    }
+
+    #[test]
+    fn entry_relative_path_uses_parent_chain() {
+        let folder_id = uuid::Uuid::now_v7();
+        let file_id = uuid::Uuid::now_v7();
+        let mut entries = HashMap::new();
+        entries.insert(
+            folder_id,
+            test_entry(folder_id, None, "docs", EntryType::Folder, None),
+        );
+        entries.insert(
+            file_id,
+            test_entry(
+                file_id,
+                Some(folder_id),
+                "report.txt",
+                EntryType::File,
+                Some(test_content_ref("ab")),
+            ),
+        );
+
+        assert_eq!(
+            entry_relative_path(&file_id, &entries).unwrap(),
+            PathBuf::from("docs").join("report.txt")
+        );
+    }
+
+    #[test]
+    fn restore_bucket_applies_ops_after_snapshot_and_copies_blob() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".s4drive");
+        let output = temp.path().join("restored");
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let blob = root.join("content").join("blobs").join("ab").join(hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::write(&blob, b"new content").unwrap();
+
+        let file_id = uuid::Uuid::now_v7();
+        let snapshot_dir = root
+            .join("meta")
+            .join("snapshots")
+            .join("00000000000000000001");
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(root.join("meta").join("snapshots").join("LATEST"), b"1").unwrap();
+        let snapshot_entry = test_entry(
+            file_id,
+            None,
+            "docs/report.txt",
+            EntryType::File,
+            Some(test_content_ref("oldhash")),
+        );
+        fs::write(
+            snapshot_dir.join("tree.json"),
+            serde_json::to_string_pretty(&vec![snapshot_entry]).unwrap(),
+        )
+        .unwrap();
+        let metadata = SnapshotMetadata {
+            schema_version: 1,
+            seq_num: 1,
+            created_at: "2026-06-08T00:00:00Z".to_string(),
+            entry_count: 1,
+            tree_key: ".s4drive/meta/snapshots/00000000000000000001/tree.json".to_string(),
+            covered_head: Some("op1".to_string()),
+        };
+        fs::write(
+            snapshot_dir.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let op = Operation {
+            op_id: "op2".to_string(),
+            device_id: uuid::Uuid::now_v7(),
+            actor_id: "test".to_string(),
+            logical_clock: 2,
+            base_head: "op1".to_string(),
+            target_file_id: Some(file_id),
+            op_type: OpType::UploadNewRevision,
+            preconditions: s4drive_core::metadata::types::Preconditions {
+                expected_etag: None,
+                expected_version_id: None,
+                file_exists: true,
+                parent_exists: true,
+            },
+            effects: s4drive_core::metadata::types::Effects {
+                new_revision_id: Some(uuid::Uuid::now_v7()),
+                new_content_ref: Some(ContentRef {
+                    blob_id: uuid::Uuid::now_v7(),
+                    hash: hash.to_string(),
+                    size: 11,
+                    mime: "text/plain".to_string(),
+                    storage_key: format!(".s4drive/content/blobs/ab/{hash}"),
+                }),
+                new_name: None,
+                new_parent_id: None,
+                deleted: false,
+            },
+            timestamp: "2026-06-08T00:01:00Z".to_string(),
+            signature: None,
+        };
+        let ops_dir = root.join("meta").join("ops");
+        fs::create_dir_all(&ops_dir).unwrap();
+        fs::write(
+            ops_dir.join("op2.json"),
+            Serializer::serialize_operation(&op).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("meta").join("heads")).unwrap();
+        fs::write(root.join("meta").join("heads").join("current"), b"op2").unwrap();
+
+        run_restore_bucket(&root, &output, false).unwrap();
+
+        assert_eq!(
+            fs::read(output.join("docs").join("report.txt")).unwrap(),
+            b"new content"
+        );
+    }
+
+    fn test_content_ref(hash: &str) -> ContentRef {
+        ContentRef {
+            blob_id: uuid::Uuid::now_v7(),
+            hash: hash.to_string(),
+            size: 0,
+            mime: "application/octet-stream".to_string(),
+            storage_key: format!(
+                ".s4drive/content/blobs/{}/{}",
+                &hash[..2.min(hash.len())],
+                hash
+            ),
+        }
+    }
+
+    fn test_entry(
+        file_id: FileId,
+        parent_id: Option<FileId>,
+        name: &str,
+        entry_type: EntryType,
+        content_ref: Option<ContentRef>,
+    ) -> FileEntry {
+        FileEntry {
+            file_id,
+            parent_id,
+            name: name.to_string(),
+            normalized_name: name.to_lowercase(),
+            entry_type,
+            current_revision_id: None,
+            size: content_ref
+                .as_ref()
+                .map(|content| content.size)
+                .unwrap_or(0),
+            content_hash: content_ref
+                .as_ref()
+                .map(|content| format!("blake3:{}", content.hash)),
+            mime: content_ref.as_ref().map(|content| content.mime.clone()),
+            content_ref,
+            created_at: "2026-06-08T00:00:00Z".to_string(),
+            updated_at: "2026-06-08T00:00:00Z".to_string(),
+            deleted_at: None,
+            version_history: Vec::new(),
+            attributes: Default::default(),
+            lock_state: Default::default(),
+        }
     }
 }

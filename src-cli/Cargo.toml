@@ -15,3 +15,6 @@ serde_json = "1"
 uuid = { version = "1", features = ["v7"] }
 dirs = "6"
 rusqlite = { version = "0.34", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
