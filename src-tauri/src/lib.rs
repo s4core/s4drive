@@ -3,12 +3,19 @@
 use s4drive_core::{
     config::{default_exclude_patterns, Config},
     credentials::{resolve_secret, CredentialStore},
-    db::{LocalDatabase, RevisionRecord},
-    metadata::engine::MetadataEngine,
+    db::{ConflictRecord, LocalDatabase, RevisionRecord},
+    metadata::{
+        blobs::BlobStore, engine::MetadataEngine, ops::OperationLog, tree::FileTree,
+        validator::Validator,
+    },
     s3::S3Adapter,
-    sync::{scan_folder_recursive_bounded, ActivityLog, SyncEngine, SyncState, VersionApi},
+    sync::{
+        scan_folder_recursive_bounded, ActivityLog, ConflictEngine, ConflictResolution, SyncEngine,
+        SyncState, VersionApi,
+    },
     transfer::TransferQueue,
     watcher::FileWatcher,
+    CoreError, Effects, EntryType, FileEntry, OpType, Preconditions,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -285,9 +292,24 @@ struct TransferItem {
 struct ConflictItem {
     conflict_id: String,
     file_id: String,
+    path: String,
+    local_path: String,
+    remote_path: String,
+    sibling_path: String,
     conflict_type: String,
     human_reason: String,
     created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConflictResolutionResult {
+    conflict_id: String,
+    resolution: String,
+    message: String,
+    primary_path: Option<String>,
+    preserved_path: Option<String>,
+    queued_upload: bool,
+    downloaded_remote: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1525,6 +1547,30 @@ fn version_item_from_revision(db: &LocalDatabase, revision: RevisionRecord) -> V
     }
 }
 
+fn conflict_item_from_record(record: ConflictRecord) -> ConflictItem {
+    let path = [
+        &record.local_path,
+        &record.remote_path,
+        &record.sibling_path,
+    ]
+    .into_iter()
+    .find(|value| !value.trim().is_empty())
+    .cloned()
+    .unwrap_or_else(|| record.file_id.clone());
+
+    ConflictItem {
+        conflict_id: record.conflict_id,
+        file_id: record.file_id,
+        path,
+        local_path: record.local_path,
+        remote_path: record.remote_path,
+        sibling_path: record.sibling_path,
+        conflict_type: record.conflict_type,
+        human_reason: record.human_reason,
+        created_at: record.created_at,
+    }
+}
+
 fn revision_label_for_file(db: &LocalDatabase, file_id: &str) -> String {
     let Ok(file_uuid) = uuid::Uuid::parse_str(file_id) else {
         return file_id.to_string();
@@ -1778,6 +1824,403 @@ fn restore_sidecar_path(target_path: &Path, label: &str) -> PathBuf {
         label,
         uuid::Uuid::now_v7()
     ))
+}
+
+fn find_open_conflict(db: &LocalDatabase, conflict_id: &str) -> Result<ConflictRecord, String> {
+    db.get_open_conflicts()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|record| record.conflict_id == conflict_id)
+        .ok_or_else(|| format!("open conflict not found: {}", conflict_id))
+}
+
+fn conflict_local_path(
+    settings: &DesktopSettings,
+    db: &LocalDatabase,
+    record: &ConflictRecord,
+    file_id: &uuid::Uuid,
+) -> Result<PathBuf, String> {
+    let sync_folder = ensure_sync_folder(settings)?;
+    if let Some(local_path) = non_empty_string(record.local_path.clone()).or_else(|| {
+        db.get_local_path(file_id)
+            .ok()
+            .flatten()
+            .and_then(non_empty_string)
+    }) {
+        let candidate = PathBuf::from(&local_path);
+        let path = if candidate.is_absolute() {
+            candidate
+        } else {
+            safe_join_desktop_sync_path(&sync_folder, &local_path)?
+        };
+        if path.starts_with(&sync_folder) {
+            return Ok(path);
+        }
+        return Err(format!(
+            "conflict local path escapes sync folder: {}",
+            path.display()
+        ));
+    }
+
+    let remote_path = conflict_remote_path(settings, db, record, file_id, None)?;
+    safe_join_desktop_sync_path(&sync_folder, &remote_path)
+}
+
+fn conflict_remote_path(
+    settings: &DesktopSettings,
+    db: &LocalDatabase,
+    record: &ConflictRecord,
+    file_id: &uuid::Uuid,
+    local_path: Option<&Path>,
+) -> Result<String, String> {
+    let sync_folder = ensure_sync_folder(settings)?;
+    for candidate in [
+        db.get_s3_key(file_id)
+            .ok()
+            .flatten()
+            .and_then(non_empty_string),
+        non_empty_string(record.remote_path.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if valid_relative_remote_key(&sync_folder, &candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    if let Some(local_path) = local_path {
+        let relative = local_path
+            .strip_prefix(&sync_folder)
+            .map_err(|_| "conflict path is outside sync folder".to_string())?;
+        return Ok(path_to_s3_key_desktop(relative));
+    }
+
+    Err(format!(
+        "cannot determine remote path for conflict {}",
+        record.conflict_id
+    ))
+}
+
+fn valid_relative_remote_key(sync_folder: &Path, remote_path: &str) -> bool {
+    safe_join_desktop_sync_path(sync_folder, remote_path).is_ok()
+}
+
+fn conflict_resolution_from_ui(resolution: &str) -> Result<ConflictResolution, String> {
+    match resolution {
+        "local" => Ok(ConflictResolution::KeepLocal),
+        "remote" => Ok(ConflictResolution::KeepRemote),
+        "both" => Ok(ConflictResolution::KeepBoth),
+        other => Err(format!("unsupported conflict resolution: {}", other)),
+    }
+}
+
+async fn register_pending_upload_for_path(
+    db: &LocalDatabase,
+    transfer: &TransferQueue,
+    file_id: uuid::Uuid,
+    local_path: &Path,
+    s3_key: &str,
+) -> Result<(), String> {
+    let (hash, size) = hash_file_blake3_desktop(local_path).await?;
+    let local_path_text = local_path.to_string_lossy().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let existing = db.get_file(&file_id).map_err(|e| e.to_string())?;
+    let current_revision_id = existing
+        .as_ref()
+        .and_then(|entry| entry.current_revision_id)
+        .or_else(|| Some(uuid::Uuid::now_v7()));
+    let version_history = current_revision_id.into_iter().collect();
+    let entry = FileEntry {
+        file_id,
+        parent_id: existing.as_ref().and_then(|entry| entry.parent_id),
+        name: s3_key.to_string(),
+        normalized_name: Validator::normalize_name(s3_key).to_lowercase(),
+        entry_type: EntryType::File,
+        current_revision_id,
+        content_ref: None,
+        size,
+        content_hash: Some(format!("blake3:{}", hash)),
+        mime: None,
+        created_at: existing
+            .as_ref()
+            .map(|entry| entry.created_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        updated_at: now,
+        deleted_at: None,
+        version_history,
+        attributes: Default::default(),
+        lock_state: Default::default(),
+    };
+
+    db.register_file_at_path_with_state(&entry, &local_path_text, s3_key, "pending_upload")
+        .map_err(|e| e.to_string())?;
+    transfer
+        .enqueue_upload(&file_id.to_string(), &local_path_text, s3_key)
+        .map_err(|e| e.to_string())
+}
+
+async fn commit_local_conflict_winner(
+    s3: &S3Adapter,
+    db: &LocalDatabase,
+    device_id: uuid::Uuid,
+    file_id: uuid::Uuid,
+    local_path: &Path,
+    remote_path: &str,
+    conflict_id: &str,
+) -> Result<u64, String> {
+    let blob_store = BlobStore::new(s3);
+    let (_blob_id, content_ref) = blob_store
+        .store_file(local_path, "application/octet-stream")
+        .await
+        .map_err(|e| e.to_string())?;
+    let tree = FileTree::new(s3);
+    let remote_entry = match tree.get_entry(&file_id).await {
+        Ok(entry) => Some(entry),
+        Err(CoreError::NotFound(_)) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let local_entry = db.get_file(&file_id).map_err(|e| e.to_string())?;
+    let parent_revision_id = remote_entry
+        .as_ref()
+        .and_then(|entry| entry.current_revision_id)
+        .or_else(|| {
+            local_entry
+                .as_ref()
+                .and_then(|entry| entry.current_revision_id)
+        });
+    let revision_id = uuid::Uuid::now_v7();
+    let remote_exists = remote_entry.is_some();
+    let mut clock = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let mut ops = OperationLog::new(s3, device_id, &mut clock);
+    ops.commit(
+        Some(file_id),
+        if remote_exists {
+            OpType::UploadNewRevision
+        } else {
+            OpType::CreateFile
+        },
+        Preconditions {
+            expected_etag: None,
+            expected_version_id: None,
+            file_exists: remote_exists,
+            parent_exists: true,
+        },
+        Effects {
+            new_revision_id: Some(revision_id),
+            new_content_ref: Some(content_ref.clone()),
+            new_name: Some(remote_path.to_string()),
+            new_parent_id: None,
+            deleted: false,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut version_history = local_entry
+        .as_ref()
+        .map(|entry| entry.version_history.clone())
+        .unwrap_or_default();
+    if let Some(parent_revision_id) = parent_revision_id {
+        if !version_history.contains(&parent_revision_id) {
+            version_history.push(parent_revision_id);
+        }
+    }
+    if !version_history.contains(&revision_id) {
+        version_history.push(revision_id);
+    }
+    let entry = FileEntry {
+        file_id,
+        parent_id: remote_entry
+            .as_ref()
+            .and_then(|entry| entry.parent_id)
+            .or_else(|| local_entry.as_ref().and_then(|entry| entry.parent_id)),
+        name: remote_path.to_string(),
+        normalized_name: Validator::normalize_name(remote_path).to_lowercase(),
+        entry_type: EntryType::File,
+        current_revision_id: Some(revision_id),
+        content_ref: Some(content_ref.clone()),
+        size: content_ref.size,
+        content_hash: Some(format!("blake3:{}", content_ref.hash)),
+        mime: Some(content_ref.mime.clone()),
+        created_at: remote_entry
+            .as_ref()
+            .map(|entry| entry.created_at.clone())
+            .or_else(|| local_entry.as_ref().map(|entry| entry.created_at.clone()))
+            .unwrap_or_else(|| now.clone()),
+        updated_at: now,
+        deleted_at: None,
+        version_history,
+        attributes: remote_entry
+            .as_ref()
+            .map(|entry| entry.attributes.clone())
+            .or_else(|| local_entry.as_ref().map(|entry| entry.attributes.clone()))
+            .unwrap_or_default(),
+        lock_state: Default::default(),
+    };
+
+    if let Err(error) = tree.upsert_entry(&entry).await {
+        tracing::warn!(
+            "Materialized tree update failed after local conflict resolution commit: {}",
+            error
+        );
+    }
+    let local_path_text = local_path.to_string_lossy().to_string();
+    db.register_file_at_path_with_state(&entry, &local_path_text, remote_path, "synced")
+        .map_err(|e| e.to_string())?;
+    db.update_local_mtime_by_path(&local_path_text)
+        .map_err(|e| e.to_string())?;
+    let versions = VersionApi::new(Some(db.clone()), &device_id.to_string(), "This device");
+    let parent_revision = parent_revision_id.map(|id| id.to_string());
+    let content_hash = format!("blake3:{}", content_ref.hash);
+    versions
+        .record_revision(
+            &revision_id.to_string(),
+            &file_id,
+            parent_revision.as_deref(),
+            Some(&content_hash),
+            content_ref.size,
+            Some(&content_ref.mime),
+            &device_id.to_string(),
+            "This device",
+            "resolved_local",
+            Some(conflict_id),
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(content_ref.size)
+}
+
+async fn hash_file_blake3_desktop(path: &Path) -> Result<(String, u64), String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open file for hashing: {}", e))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut size = 0u64;
+
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read file for hashing: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+
+    Ok((hasher.finalize().to_hex().to_string(), size))
+}
+
+fn conflict_copy_path(record: &ConflictRecord) -> Option<PathBuf> {
+    non_empty_string(record.sibling_path.clone()).map(PathBuf::from)
+}
+
+fn ensure_local_conflict_copy(
+    settings: &DesktopSettings,
+    record: &ConflictRecord,
+    local_path: &Path,
+    remote_path: &str,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(existing) = conflict_copy_path(record).filter(|path| path.exists()) {
+        return Ok(Some(existing));
+    }
+    if !local_path.exists() {
+        return Ok(None);
+    }
+
+    let sync_folder = ensure_sync_folder(settings)?;
+    let copy_path = ConflictEngine::create_conflict_copy(
+        &local_path.to_string_lossy(),
+        &sync_folder.to_string_lossy(),
+        remote_path,
+        "This device",
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Some(PathBuf::from(copy_path)))
+}
+
+async fn download_remote_entry_to_local(
+    s3: &S3Adapter,
+    db: &LocalDatabase,
+    record: &ConflictRecord,
+    file_id: &uuid::Uuid,
+    local_path: &Path,
+    remote_path: &str,
+) -> Result<u64, String> {
+    let tree = FileTree::new(s3);
+    let mut remote_entry = tree.get_entry(file_id).await.map_err(|e| match e {
+        CoreError::NotFound(_) => "remote version is deleted or no longer available".to_string(),
+        other => other.to_string(),
+    })?;
+    let content_ref = remote_entry
+        .content_ref
+        .clone()
+        .ok_or_else(|| format!("remote conflict has no content: {}", record.conflict_id))?;
+
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create remote resolution parent: {}", e))?;
+    }
+    let tmp_path = restore_sidecar_path(local_path, "remote-resolution");
+    let size = s3
+        .download_object_to_file(&content_ref.storage_key, &tmp_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = finish_restore_replace(&tmp_path, local_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(error);
+    }
+
+    remote_entry.name = remote_path.to_string();
+    remote_entry.normalized_name = Validator::normalize_name(remote_path).to_lowercase();
+    remote_entry.size = content_ref.size;
+    remote_entry.content_hash = Some(format!("blake3:{}", content_ref.hash));
+    remote_entry.updated_at = chrono::Utc::now().to_rfc3339();
+    db.register_file_at_path_with_state(
+        &remote_entry,
+        &local_path.to_string_lossy(),
+        remote_path,
+        "synced",
+    )
+    .map_err(|e| e.to_string())?;
+    db.update_local_mtime_by_path(&local_path.to_string_lossy())
+        .map_err(|e| e.to_string())?;
+
+    Ok(size)
+}
+
+async fn accept_remote_delete(
+    settings: &DesktopSettings,
+    db: &LocalDatabase,
+    record: &ConflictRecord,
+    file_id: &uuid::Uuid,
+    local_path: &Path,
+    remote_path: &str,
+) -> Result<Option<PathBuf>, String> {
+    let preserved = ensure_local_conflict_copy(settings, record, local_path, remote_path)?;
+    if local_path.exists() {
+        tokio::fs::remove_file(local_path)
+            .await
+            .map_err(|e| format!("remove local file after accepting remote delete: {}", e))?;
+    }
+    db.mark_file_deleted(file_id).map_err(|e| e.to_string())?;
+    Ok(preserved)
+}
+
+fn conflict_copy_s3_key(settings: &DesktopSettings, copy_path: &Path) -> Result<String, String> {
+    let sync_folder = ensure_sync_folder(settings)?;
+    let relative = copy_path
+        .strip_prefix(&sync_folder)
+        .map_err(|_| "conflict copy is outside sync folder".to_string())?;
+    Ok(path_to_s3_key_desktop(relative))
 }
 
 // Sync State
@@ -2787,8 +3230,22 @@ fn get_transfers(
 }
 
 #[tauri::command]
-fn get_conflicts() -> Result<Vec<ConflictItem>, String> {
-    Ok(Vec::new())
+fn get_conflicts(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ConflictItem>, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let config = app_local_config(&app, &settings);
+    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let conflicts = db.get_open_conflicts().map_err(|e| e.to_string())?;
+    state
+        .conflict_count
+        .store(conflicts.len() as u32, Ordering::Relaxed);
+
+    Ok(conflicts
+        .into_iter()
+        .map(conflict_item_from_record)
+        .collect())
 }
 
 #[tauri::command]
@@ -2894,9 +3351,232 @@ fn get_devices(state: tauri::State<'_, AppState>) -> Result<Vec<DeviceItem>, Str
 }
 
 #[tauri::command]
-fn resolve_conflict(conflict_id: String, resolution: String) -> Result<(), String> {
-    tracing::info!("conflict resolved: {} -> {}", conflict_id, resolution);
-    Ok(())
+async fn resolve_conflict(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    conflict_id: String,
+    resolution: String,
+) -> Result<ConflictResolutionResult, String> {
+    let conflict_id = conflict_id.trim().to_string();
+    if conflict_id.is_empty() {
+        return Err("conflict id is required".to_string());
+    }
+    let resolution = resolution.trim().to_string();
+    let core_resolution = conflict_resolution_from_ui(&resolution)?;
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    if !settings.account_is_complete() {
+        return Err("connect storage before resolving conflicts".to_string());
+    }
+
+    let secret = resolve_desktop_secret(&app, &settings, None)?;
+    let config = app_core_config(&app, &settings, secret);
+    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let device_id = stable_device_id_from_db(&db, state.inner())?;
+    let record = find_open_conflict(&db, &conflict_id)?;
+    let file_id = uuid::Uuid::parse_str(&record.file_id)
+        .map_err(|e| format!("invalid conflict file id: {}", e))?;
+    let local_path = conflict_local_path(&settings, &db, &record, &file_id)?;
+    let remote_path = conflict_remote_path(&settings, &db, &record, &file_id, Some(&local_path))?;
+    let transfer = TransferQueue::new(&db);
+    let s3 = S3Adapter::new(&config).await.map_err(|e| e.to_string())?;
+
+    let mut result = ConflictResolutionResult {
+        conflict_id: conflict_id.clone(),
+        resolution: resolution.clone(),
+        message: String::new(),
+        primary_path: Some(local_path.to_string_lossy().to_string()),
+        preserved_path: None,
+        queued_upload: false,
+        downloaded_remote: false,
+    };
+
+    match resolution.as_str() {
+        "local" => {
+            if !local_path.exists() {
+                if let Some(copy_path) = conflict_copy_path(&record).filter(|path| path.exists()) {
+                    if let Some(parent) = local_path.parent() {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(|e| format!("create local conflict target: {}", e))?;
+                    }
+                    tokio::fs::copy(&copy_path, &local_path)
+                        .await
+                        .map_err(|e| format!("restore local conflict copy: {}", e))?;
+                } else {
+                    return Err(format!(
+                        "local version is missing for conflict {}",
+                        record.conflict_id
+                    ));
+                }
+            }
+            commit_local_conflict_winner(
+                &s3,
+                &db,
+                device_id,
+                file_id,
+                &local_path,
+                &remote_path,
+                &conflict_id,
+            )
+            .await?;
+            db.complete_conflict_transfers_for_file(
+                &file_id,
+                "resolved by conflict resolution: local kept",
+            )
+            .map_err(|e| e.to_string())?;
+            result.message =
+                "Local version selected and uploaded as the winning version.".to_string();
+        }
+        "remote" => {
+            let preserved =
+                ensure_local_conflict_copy(&settings, &record, &local_path, &remote_path)?;
+            match download_remote_entry_to_local(
+                &s3,
+                &db,
+                &record,
+                &file_id,
+                &local_path,
+                &remote_path,
+            )
+            .await
+            {
+                Ok(_) => {
+                    result.downloaded_remote = true;
+                    result.preserved_path = preserved
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string());
+                    result.message = if let Some(path) = result.preserved_path.as_deref() {
+                        format!(
+                            "Cloud version restored locally. Local edits were preserved as {}.",
+                            path
+                        )
+                    } else {
+                        "Cloud version restored locally.".to_string()
+                    };
+                }
+                Err(error)
+                    if record.conflict_type == "delete_edit"
+                        && error.contains("remote version is deleted") =>
+                {
+                    let preserved = accept_remote_delete(
+                        &settings,
+                        &db,
+                        &record,
+                        &file_id,
+                        &local_path,
+                        &remote_path,
+                    )
+                    .await?;
+                    result.preserved_path = preserved
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string());
+                    result.message = if let Some(path) = result.preserved_path.as_deref() {
+                        format!(
+                            "Remote deletion accepted. Local edits were preserved as {}.",
+                            path
+                        )
+                    } else {
+                        "Remote deletion accepted.".to_string()
+                    };
+                }
+                Err(error) => return Err(error),
+            }
+            db.complete_conflict_transfers_for_file(
+                &file_id,
+                "resolved by conflict resolution: remote kept",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        "both" => {
+            let preserved =
+                ensure_local_conflict_copy(&settings, &record, &local_path, &remote_path)?;
+            let mut remote_deleted = false;
+            match download_remote_entry_to_local(
+                &s3,
+                &db,
+                &record,
+                &file_id,
+                &local_path,
+                &remote_path,
+            )
+            .await
+            {
+                Ok(_) => {
+                    result.downloaded_remote = true;
+                }
+                Err(error)
+                    if record.conflict_type == "delete_edit"
+                        && error.contains("remote version is deleted") =>
+                {
+                    accept_remote_delete(
+                        &settings,
+                        &db,
+                        &record,
+                        &file_id,
+                        &local_path,
+                        &remote_path,
+                    )
+                    .await?;
+                    remote_deleted = true;
+                }
+                Err(error) => return Err(error),
+            }
+
+            if let Some(copy_path) = preserved.as_ref() {
+                let copy_s3_key = conflict_copy_s3_key(&settings, copy_path)?;
+                register_pending_upload_for_path(
+                    &db,
+                    &transfer,
+                    uuid::Uuid::now_v7(),
+                    copy_path,
+                    &copy_s3_key,
+                )
+                .await?;
+                result.queued_upload = true;
+                result.preserved_path = Some(copy_path.to_string_lossy().to_string());
+            }
+            result.message = match (remote_deleted, result.preserved_path.as_deref()) {
+                (true, Some(path)) => format!(
+                    "Remote deletion kept for the original file. Local version is queued as {}.",
+                    path
+                ),
+                (true, None) => "Remote deletion kept for the original file.".to_string(),
+                (false, Some(path)) => format!(
+                    "Cloud version kept as the main file. Local version is queued as {}.",
+                    path
+                ),
+                (false, None) => "Cloud version kept as the main file.".to_string(),
+            };
+            db.complete_conflict_transfers_for_file(
+                &file_id,
+                "resolved by conflict resolution: both kept",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        _ => return Err(format!("unsupported conflict resolution: {}", resolution)),
+    }
+
+    let conflict_engine =
+        ConflictEngine::new(Some(db.clone()), &device_id.to_string(), "This device");
+    conflict_engine
+        .resolve(&conflict_id, core_resolution, "resolved from desktop UI")
+        .map_err(|e| e.to_string())?;
+    let remaining = db.count_open_conflicts().map_err(|e| e.to_string())?;
+    state.conflict_count.store(remaining, Ordering::Relaxed);
+    if let Ok(activity) = ActivityLog::new(&db) {
+        let _ = activity.log(
+            "conflict_resolved",
+            &record.file_id,
+            &remote_path,
+            &result.message,
+        );
+    }
+    let _ = app.emit("files-changed", ());
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.emit("sync-status-changed", current_sync_status(state.inner())?);
+    }
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -3123,6 +3803,12 @@ fn check_for_updates() -> Result<UpdateInfo, String> {
 mod tests {
     use super::*;
 
+    fn test_db() -> LocalDatabase {
+        let mut config = Config::default();
+        config.core.db_path = ":memory:".to_string();
+        LocalDatabase::new(&config).unwrap()
+    }
+
     #[test]
     fn default_settings_map_to_core_config() {
         let settings = DesktopSettings::default();
@@ -3161,6 +3847,71 @@ mod tests {
 
         let network = humanize_connection_error("request timeout");
         assert!(network.contains("storage server"));
+    }
+
+    #[test]
+    fn conflict_item_uses_human_path_before_file_id() {
+        let record = ConflictRecord {
+            id: 1,
+            conflict_id: "conflict-1".to_string(),
+            file_id: "file-1".to_string(),
+            local_revision_id: None,
+            remote_revision_id: None,
+            local_path: "docs/report.txt".to_string(),
+            remote_path: "cloud/report.txt".to_string(),
+            sibling_path: "docs/report (conflict).txt".to_string(),
+            conflict_type: "edit_edit".to_string(),
+            human_reason: "both sides changed the file".to_string(),
+            file_size: 42,
+            mime: Some("text/plain".to_string()),
+            status: "open".to_string(),
+            created_at: "2026-06-07T20:00:00Z".to_string(),
+            resolved_at: None,
+        };
+
+        let item = conflict_item_from_record(record);
+
+        assert_eq!(item.conflict_id, "conflict-1");
+        assert_eq!(item.path, "docs/report.txt");
+        assert_eq!(item.local_path, "docs/report.txt");
+        assert_eq!(item.remote_path, "cloud/report.txt");
+        assert_eq!(item.sibling_path, "docs/report (conflict).txt");
+        assert_eq!(item.conflict_type, "edit_edit");
+    }
+
+    #[test]
+    fn conflict_remote_path_ignores_absolute_record_path() {
+        let root = std::env::temp_dir().join(format!("s4drive-conflict-{}", uuid::Uuid::now_v7()));
+        let local_path = root.join("nested").join("file.txt");
+        let settings = DesktopSettings {
+            sync_folder: root.to_string_lossy().to_string(),
+            ..DesktopSettings::default()
+        };
+        let db = test_db();
+        let file_id = uuid::Uuid::now_v7();
+        let absolute = local_path.to_string_lossy().to_string();
+        let record = ConflictRecord {
+            id: 1,
+            conflict_id: "conflict-absolute-remote-path".to_string(),
+            file_id: file_id.to_string(),
+            local_revision_id: None,
+            remote_revision_id: None,
+            local_path: absolute.clone(),
+            remote_path: absolute,
+            sibling_path: String::new(),
+            conflict_type: "delete_edit".to_string(),
+            human_reason: "remote deleted while local changed".to_string(),
+            file_size: 0,
+            mime: None,
+            status: "open".to_string(),
+            created_at: "2026-06-08T00:00:00Z".to_string(),
+            resolved_at: None,
+        };
+
+        let remote_path =
+            conflict_remote_path(&settings, &db, &record, &file_id, Some(&local_path)).unwrap();
+
+        assert_eq!(remote_path, "nested/file.txt");
     }
 
     #[test]
@@ -3258,6 +4009,24 @@ mod tests {
         write_restored_version(&target, b"new").await.unwrap();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_file_blake3_desktop_streams_expected_hash_and_size() {
+        let root = std::env::temp_dir().join(format!("s4drive-hash-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("file.txt");
+        std::fs::write(&target, b"conflict resolution").unwrap();
+
+        let (hash, size) = hash_file_blake3_desktop(&target).await.unwrap();
+
+        assert_eq!(
+            hash,
+            blake3::hash(b"conflict resolution").to_hex().to_string()
+        );
+        assert_eq!(size, 19);
 
         std::fs::remove_dir_all(root).unwrap();
     }

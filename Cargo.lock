@@ -4310,6 +4310,7 @@ name = "s4drive-tauri"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "chrono",
  "s4drive-core",
  "serde",

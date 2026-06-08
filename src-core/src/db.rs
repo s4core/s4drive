@@ -194,15 +194,34 @@ impl LocalDatabase {
             .conn
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
-        conn.execute(
-            "UPDATE transfer_queue
+        let interrupted = conn
+            .execute(
+                "UPDATE transfer_queue
              SET status = 'queued',
                  updated_at = datetime('now'),
                  error_message = COALESCE(error_message, 'recovered after restart')
              WHERE status = 'in_progress'",
-            [],
-        )
-        .map_err(|e| CoreError::Database(e.to_string()))
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let false_blob_preconditions = conn
+            .execute(
+                "UPDATE transfer_queue
+                 SET status = 'queued',
+                     retry_count = 0,
+                     error_message = 'recovered after content blob deduplication conflict',
+                     updated_at = datetime('now')
+                 WHERE status = 'failed'
+                   AND error_message LIKE '%.s4drive/content/blobs/%'
+                   AND (
+                       error_message LIKE '%PreconditionFailed%'
+                       OR error_message LIKE '%Precondition Failed%'
+                       OR error_message LIKE '%412%'
+                   )",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(interrupted + false_blob_preconditions)
     }
 
     // ─── File Operations ───────────────────────────────────────────
@@ -743,6 +762,34 @@ impl LocalDatabase {
                      updated_at = datetime('now')
                  WHERE file_id = ?1
                    AND status IN ('queued', 'in_progress', 'paused')",
+                rusqlite::params![file_id.to_string(), reason],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(updated as u64)
+    }
+
+    pub fn complete_conflict_transfers_for_file(
+        &self,
+        file_id: &uuid::Uuid,
+        reason: &str,
+    ) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let updated = conn
+            .execute(
+                "UPDATE transfer_queue
+                 SET status = 'completed',
+                     error_message = ?2,
+                     transferred_bytes = CASE
+                       WHEN total_bytes > 0 THEN total_bytes
+                       ELSE transferred_bytes
+                     END,
+                     updated_at = datetime('now')
+                 WHERE file_id = ?1
+                   AND status IN ('queued', 'in_progress', 'paused', 'failed')
+                   AND error_message LIKE '%conflict%'",
                 rusqlite::params![file_id.to_string(), reason],
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
@@ -2354,6 +2401,75 @@ mod tests {
         assert!(db.get_file(&entry.file_id).unwrap().is_none());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recover_interrupted_transfers_requeues_false_blob_precondition_failures() {
+        let db = test_db();
+        db.enqueue_transfer("upload", "file-1", "/tmp/file-1.txt", "file-1.txt", 10)
+            .unwrap();
+        db.enqueue_transfer("upload", "file-2", "/tmp/file-2.txt", "file-2.txt", 20)
+            .unwrap();
+        db.enqueue_transfer("upload", "file-3", "/tmp/file-3.txt", "file-3.txt", 30)
+            .unwrap();
+        db.fail_transfer(
+            1,
+            "max retries: Conflict: 412 PreconditionFailed: .s4drive/content/blobs/aa/aabb",
+        )
+        .unwrap();
+        db.fail_transfer(2, "conflict: remote revision diverged")
+            .unwrap();
+        db.fail_transfer(
+            3,
+            "max retries: service error: Precondition Failed: .s4drive/content/blobs/bb/bbcc",
+        )
+        .unwrap();
+
+        assert_eq!(db.recover_interrupted_transfers().unwrap(), 2);
+        let recent = db.get_recent_transfers(10, 0).unwrap();
+
+        assert!(recent.iter().any(|job| {
+            job.id == 1
+                && job.status == crate::transfer::TransferStatus::Queued
+                && job.retry_count == 0
+        }));
+        assert!(recent
+            .iter()
+            .any(|job| job.id == 2 && job.status == crate::transfer::TransferStatus::Failed));
+        assert!(recent.iter().any(|job| {
+            job.id == 3
+                && job.status == crate::transfer::TransferStatus::Queued
+                && job.retry_count == 0
+        }));
+    }
+
+    #[test]
+    fn complete_conflict_transfers_for_file_moves_failed_conflicts_to_completed() {
+        let db = test_db();
+        let file_id = uuid::Uuid::now_v7();
+        db.enqueue_transfer(
+            "upload",
+            &file_id.to_string(),
+            "/tmp/conflict.txt",
+            "conflict.txt",
+            10,
+        )
+        .unwrap();
+        let job_id = db.get_recent_transfers(10, 0).unwrap()[0].id;
+        db.fail_transfer(job_id, "conflict: remote revision diverged")
+            .unwrap();
+
+        assert_eq!(
+            db.complete_conflict_transfers_for_file(&file_id, "resolved by conflict UI")
+                .unwrap(),
+            1
+        );
+        let jobs = db.get_recent_transfers(10, 10).unwrap();
+        assert!(jobs.iter().any(|job| {
+            job.id == job_id
+                && job.status == crate::transfer::TransferStatus::Completed
+                && job.error_message.as_deref() == Some("resolved by conflict UI")
+        }));
     }
 
     #[test]

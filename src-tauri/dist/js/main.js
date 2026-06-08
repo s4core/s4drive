@@ -446,17 +446,32 @@
     list.innerHTML = state.conflicts.map(c => `
       <div class="conflict-item">
         <div class="conflict-header">
-          <span class="conflict-name">${escapeHtml(c.file_id || 'Unknown')}</span>
+          <span class="conflict-name">${escapeHtml(c.path || c.file_id || 'Unknown')}</span>
           <span class="conflict-type">${escapeHtml(c.conflict_type || '')}</span>
         </div>
+        <div class="conflict-meta">${escapeHtml(c.created_at || '')}</div>
         <div class="conflict-reason">${escapeHtml(c.human_reason || '')}</div>
+        <div class="conflict-paths">
+          ${renderConflictPath('Local version', c.local_path)}
+          ${renderConflictPath('Cloud path', c.remote_path)}
+          ${renderConflictPath('Saved copy', c.sibling_path)}
+        </div>
         <div class="conflict-actions">
-          <button class="btn btn-primary btn-sm" data-conflict-action data-conflict-id="${escapeAttr(c.conflict_id)}" data-resolution="local">Keep Local</button>
-          <button class="btn btn-outline btn-sm" data-conflict-action data-conflict-id="${escapeAttr(c.conflict_id)}" data-resolution="remote">Keep Remote</button>
+          <button class="btn btn-primary btn-sm" data-conflict-action data-conflict-id="${escapeAttr(c.conflict_id)}" data-resolution="local">Upload Local</button>
+          <button class="btn btn-outline btn-sm" data-conflict-action data-conflict-id="${escapeAttr(c.conflict_id)}" data-resolution="remote">Restore Cloud</button>
           <button class="btn btn-outline btn-sm" data-conflict-action data-conflict-id="${escapeAttr(c.conflict_id)}" data-resolution="both">Keep Both</button>
         </div>
       </div>
     `).join('');
+  }
+
+  function renderConflictPath(label, value) {
+    if (!value) return '';
+    return `
+      <div class="conflict-path-row">
+        <span>${escapeHtml(label)}</span>
+        <code>${escapeHtml(value)}</code>
+      </div>`;
   }
 
   // ─── Versions / Devices ──────────────────────────────────────
@@ -738,6 +753,7 @@
   }
 
   async function runDiagnostics() {
+    renderDiagnosticsLoading();
     try {
       const items = await invoke('run_diagnostics');
       renderDiagnostics(items || []);
@@ -806,10 +822,21 @@
     }
   }
 
+  function renderDiagnosticsLoading() {
+    const list = document.getElementById('diagnosticsList');
+    if (!list) return;
+    list.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">🩺</div>
+        <div class="empty-title">Diagnostics are loading</div>
+        <div class="empty-desc">Please wait a few seconds.</div>
+      </div>`;
+  }
+
   function renderDiagnostics(items) {
     const list = document.getElementById('diagnosticsList');
     if (!items.length) {
-      list.innerHTML = `<div class="empty-state"><div class="empty-icon">🩺</div><div class="empty-title">No Diagnostics Yet</div></div>`;
+      renderDiagnosticsLoading();
       return;
     }
     list.innerHTML = items.map(item => `
@@ -1138,10 +1165,12 @@
   // Conflict actions are delegated from the conflict list.
   window.__resolveConflict = async (conflictId, resolution) => {
     try {
-      await invoke('resolve_conflict', { conflictId, resolution });
-      showToast(`Conflict resolved: ${resolution}`, 'success');
+      const result = await invoke('resolve_conflict', { conflictId, resolution });
+      showToast(result?.message || `Conflict resolved: ${resolution}`, 'success', 8000);
       refreshConflicts();
       refreshDashboard();
+      refreshTransfers();
+      refreshActivity();
     } catch(e) {
       showToast(`Failed to resolve: ${e}`, 'error');
     }

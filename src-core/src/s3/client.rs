@@ -213,7 +213,7 @@ impl S3Adapter {
                     Err(err) => {
                         let service_err = err.into_service_error();
                         let code = service_err.meta().code().map(ToString::to_string);
-                        if code.as_deref() == Some("PreconditionFailed") {
+                        if is_precondition_failed_error(code.as_deref(), &service_err) {
                             Ok(false)
                         } else {
                             Err(classify_s3_service_error(code.as_deref(), service_err, key))
@@ -252,7 +252,7 @@ impl S3Adapter {
                     Err(err) => {
                         let service_err = err.into_service_error();
                         let code = service_err.meta().code().map(ToString::to_string);
-                        if code.as_deref() == Some("PreconditionFailed") {
+                        if is_precondition_failed_error(code.as_deref(), &service_err) {
                             Ok(false)
                         } else {
                             Err(classify_s3_service_error(code.as_deref(), service_err, key))
@@ -292,7 +292,7 @@ impl S3Adapter {
                     Err(err) => {
                         let service_err = err.into_service_error();
                         let code = service_err.meta().code().map(ToString::to_string);
-                        if code.as_deref() == Some("PreconditionFailed") {
+                        if is_precondition_failed_error(code.as_deref(), &service_err) {
                             Ok(false)
                         } else {
                             Err(classify_s3_service_error(code.as_deref(), service_err, key))
@@ -904,7 +904,7 @@ impl S3Adapter {
                     Err(err) => {
                         let service_err = err.into_service_error();
                         let code = service_err.meta().code().map(ToString::to_string);
-                        if code.as_deref() == Some("PreconditionFailed") {
+                        if is_precondition_failed_error(code.as_deref(), &service_err) {
                             Ok(false)
                         } else {
                             Err(classify_s3_service_error(code.as_deref(), service_err, key))
@@ -1037,6 +1037,18 @@ fn content_md5_base64(body: &[u8]) -> String {
     general_purpose::STANDARD.encode(digest)
 }
 
+fn is_precondition_failed_error(code: Option<&str>, e: impl std::fmt::Display) -> bool {
+    if code
+        .map(|code| code.eq_ignore_ascii_case("PreconditionFailed"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let raw = e.to_string().to_ascii_lowercase();
+    raw.contains("preconditionfailed") || raw.contains("precondition failed") || raw.contains("412")
+}
+
 /// Classify S3 errors into CoreError variants.
 pub(crate) fn classify_s3_error(e: impl std::fmt::Display, context: &str) -> CoreError {
     let raw = e.to_string();
@@ -1092,6 +1104,26 @@ mod tests {
     #[test]
     fn content_md5_is_standard_base64() {
         assert_eq!(content_md5_base64(b"hello"), "XUFAKrxLKna5cZ2REBfFkg==");
+    }
+
+    #[test]
+    fn precondition_failed_detection_handles_code_and_text() {
+        assert!(is_precondition_failed_error(
+            Some("PreconditionFailed"),
+            "service error"
+        ));
+        assert!(is_precondition_failed_error(
+            None,
+            "service error: 412 Precondition Failed"
+        ));
+        assert!(is_precondition_failed_error(
+            None,
+            "service error: PreconditionFailed"
+        ));
+        assert!(!is_precondition_failed_error(
+            Some("NoSuchKey"),
+            "service error: 404"
+        ));
     }
 
     #[test]
