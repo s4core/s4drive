@@ -1,6 +1,7 @@
 //! Bounded lifecycle maintenance for local index and S4 metadata.
 
-use super::{handle_local_delete, ActivityLog};
+use super::local_changes::LocalChanges;
+use super::ActivityLog;
 use crate::config::MaintenanceConfig;
 use crate::db::{LocalDatabase, LocalMaintenanceStats, RemoteBlobGcCandidate};
 use crate::error::{CoreError, CoreResult};
@@ -64,11 +65,16 @@ impl MaintenanceReport {
 
 pub struct SyncMaintenance {
     config: MaintenanceConfig,
+    /// Name kept up to date in this device's registration in the bucket.
+    device_name: String,
 }
 
 impl SyncMaintenance {
-    pub fn new(config: MaintenanceConfig) -> Self {
-        Self { config }
+    pub fn new(config: MaintenanceConfig, device_name: &str) -> Self {
+        Self {
+            config,
+            device_name: device_name.to_string(),
+        }
     }
 
     pub async fn run_once(
@@ -137,7 +143,7 @@ impl SyncMaintenance {
         let compactor = OpLogCompactor::new(s3);
         let snapshot_manager = SnapshotManager::new(s3);
         metadata
-            .upsert_device_registration(&current_device_name())
+            .upsert_device_registration(&self.device_name)
             .await?;
         let current_head = remote_head_for_maintenance(s3).await?;
         let applied_head = db
@@ -270,10 +276,18 @@ impl SyncMaintenance {
         let mut last_row_id = cursor;
         let mut deleted = 0u64;
         let mut canceled = 0u64;
+        let local = LocalChanges::new(s3, metadata, db, activity, sync_folder);
 
         for candidate in candidates {
             last_row_id = candidate.row_id;
             if Path::new(&candidate.local_path).exists() {
+                continue;
+            }
+            // Already deleted with its folder earlier in this batch.
+            if matches!(
+                db.get_object_state(&candidate.file_id)?.as_deref(),
+                Some("deleted_locally" | "deleted_remotely")
+            ) {
                 continue;
             }
 
@@ -282,16 +296,7 @@ impl SyncMaintenance {
                 "local file missing during maintenance reconciliation",
             )?;
 
-            match handle_local_delete(
-                s3,
-                metadata,
-                db,
-                activity,
-                sync_folder,
-                &candidate.local_path,
-            )
-            .await
-            {
+            match local.missing(&candidate.local_path).await {
                 Ok(()) => deleted += 1,
                 Err(error) => {
                     tracing::warn!(
@@ -815,12 +820,6 @@ async fn collect_remote_tree_entries_for_snapshot(
     }
 
     Ok(Some(entries))
-}
-
-fn current_device_name() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "device".to_string())
 }
 
 fn parse_blob_key(key: &str) -> Option<BlobIdentity> {

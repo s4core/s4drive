@@ -8,6 +8,8 @@
 pub mod client;
 pub mod compatibility;
 pub mod error;
+#[cfg(test)]
+pub mod memory;
 pub mod retry;
 
 pub use client::*;

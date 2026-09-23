@@ -12,17 +12,20 @@ use rusqlite::OpenFlags;
 use s4drive_core::config::Config;
 use s4drive_core::metadata::compaction::DeviceWatermarks;
 use s4drive_core::metadata::engine::MetadataEngine;
+use s4drive_core::metadata::placement::Placement;
 use s4drive_core::metadata::serializer::Serializer;
 use s4drive_core::metadata::types::{
     ContentRef, EntryType, FileEntry, FileId, OpType, Operation, SnapshotMetadata,
 };
-use s4drive_core::metadata::validator::Validator;
 use s4drive_core::s3::S3Adapter;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+
+/// Deepest folder chain printed; a longer one can only be a cycle.
+const MAX_PRINTED_FOLDER_DEPTH: usize = 256;
 
 #[derive(Parser)]
 #[command(name = "s4drive", about = "S4Drive CLI")]
@@ -247,6 +250,9 @@ enum SyncAction {
         local_path: String,
         #[arg(short, long, default_value = "s4drive-cli")]
         device_name: String,
+        /// Seconds between remote polls while syncing; grows up to 10x when idle
+        #[arg(long, default_value_t = 10)]
+        poll_interval: u64,
     },
     Status {
         #[arg(short, long)]
@@ -418,6 +424,7 @@ async fn main() {
                 region,
                 local_path,
                 device_name,
+                poll_interval,
             } => {
                 run_sync_start(
                     &endpoint,
@@ -427,6 +434,7 @@ async fn main() {
                     &region,
                     &local_path,
                     &device_name,
+                    poll_interval,
                 )
                 .await;
             }
@@ -728,6 +736,7 @@ async fn run_metadata_tree(
         Ok(ids) => {
             let total = ids.len();
             let shown = ids.into_iter().take(limit);
+            let mut folders = HashMap::new();
 
             for file_id in shown {
                 match tree.get_entry(&file_id).await {
@@ -739,7 +748,7 @@ async fn run_metadata_tree(
                         println!(
                             "  {} {}  ({} bytes, {})",
                             kind,
-                            entry.name,
+                            tree_entry_path(&tree, &entry, &mut folders).await,
                             entry.size,
                             &entry.file_id.to_string()[..8]
                         );
@@ -758,6 +767,34 @@ async fn run_metadata_tree(
         Err(e) => println!("  ✗ Failed to list tree: {}", e),
     }
     println!();
+}
+
+/// Path of a tree entry, read up through its parent folders. `…` stands
+/// for a folder that is gone.
+async fn tree_entry_path(
+    tree: &s4drive_core::metadata::tree::FileTree<'_>,
+    entry: &FileEntry,
+    folders: &mut HashMap<FileId, Option<FileEntry>>,
+) -> String {
+    let mut names = vec![entry.name.clone()];
+    let mut cursor = entry.parent_id;
+    while let Some(parent_id) = cursor {
+        if let std::collections::hash_map::Entry::Vacant(slot) = folders.entry(parent_id) {
+            slot.insert(tree.get_entry(&parent_id).await.ok());
+        }
+        match folders.get(&parent_id).and_then(Option::as_ref) {
+            Some(parent) if names.len() <= MAX_PRINTED_FOLDER_DEPTH => {
+                names.push(parent.name.clone());
+                cursor = parent.parent_id;
+            }
+            _ => {
+                names.push("…".to_string());
+                break;
+            }
+        }
+    }
+    names.reverse();
+    names.join("/")
 }
 
 // ─── Metadata Ops ────────────────────────────────────────────────────
@@ -1123,36 +1160,21 @@ fn apply_restore_operation(entries: &mut HashMap<FileId, FileEntry>, op: &Operat
     let Some(file_id) = op.target_file_id else {
         return;
     };
+    let placement = Placement::of_op(op);
 
     match op.op_type {
         OpType::CreateFile | OpType::UploadNewRevision | OpType::Restore => {
-            let content_ref = op.effects.new_content_ref.clone();
-            let default_name = op
-                .effects
-                .new_name
-                .clone()
-                .unwrap_or_else(|| file_id.to_string());
-            let entry = entries.entry(file_id).or_insert_with(|| {
-                new_restore_entry(
-                    file_id,
-                    EntryType::File,
-                    &default_name,
-                    op.effects.new_parent_id,
-                    &op.timestamp,
-                )
-            });
-            if let Some(name) = op.effects.new_name.as_deref() {
-                entry.name = name.to_string();
-                entry.normalized_name = Validator::normalize_name(name).to_lowercase();
+            let entry = entries
+                .entry(file_id)
+                .or_insert_with(|| new_restore_entry(file_id, EntryType::File, &op.timestamp));
+            if let Some(placement) = &placement {
+                placement.apply_to(entry);
             }
-            if let Some(parent_id) = op.effects.new_parent_id {
-                entry.parent_id = Some(parent_id);
-            }
-            if let Some(content_ref) = content_ref {
-                entry.content_ref = Some(content_ref.clone());
+            if let Some(content_ref) = op.effects.new_content_ref.clone() {
                 entry.size = content_ref.size;
                 entry.content_hash = Some(format!("blake3:{}", content_ref.hash));
-                entry.mime = Some(content_ref.mime);
+                entry.mime = Some(content_ref.mime.clone());
+                entry.content_ref = Some(content_ref);
             }
             if let Some(revision_id) = op.effects.new_revision_id {
                 entry.current_revision_id = Some(revision_id);
@@ -1164,58 +1186,86 @@ fn apply_restore_operation(entries: &mut HashMap<FileId, FileEntry>, op: &Operat
             entry.updated_at = op.timestamp.clone();
         }
         OpType::CreateFolder => {
-            let name = op
-                .effects
-                .new_name
-                .clone()
-                .unwrap_or_else(|| file_id.to_string());
-            let entry = entries.entry(file_id).or_insert_with(|| {
-                new_restore_entry(
-                    file_id,
-                    EntryType::Folder,
-                    &name,
-                    op.effects.new_parent_id,
-                    &op.timestamp,
-                )
-            });
+            let entry = entries
+                .entry(file_id)
+                .or_insert_with(|| new_restore_entry(file_id, EntryType::Folder, &op.timestamp));
+            if let Some(placement) = &placement {
+                placement.apply_to(entry);
+            }
             entry.entry_type = EntryType::Folder;
             entry.content_ref = None;
             entry.deleted_at = None;
             entry.updated_at = op.timestamp.clone();
         }
         OpType::Rename | OpType::Move | OpType::UpdateMetadata => {
+            let Some(placement) = placement else {
+                return;
+            };
+            // Devices skip a move that would put a folder inside itself.
+            if placement
+                .parent_id
+                .is_some_and(|parent| parent == file_id || has_ancestor(entries, parent, file_id))
+            {
+                return;
+            }
             if let Some(entry) = entries.get_mut(&file_id) {
-                if let Some(name) = op.effects.new_name.as_deref() {
-                    entry.name = name.to_string();
-                    entry.normalized_name = Validator::normalize_name(name).to_lowercase();
-                }
-                if let Some(parent_id) = op.effects.new_parent_id {
-                    entry.parent_id = Some(parent_id);
-                }
+                placement.apply_to(entry);
                 entry.updated_at = op.timestamp.clone();
             }
         }
         OpType::Delete => {
-            if let Some(entry) = entries.get_mut(&file_id) {
-                entry.deleted_at = Some(op.timestamp.clone());
-                entry.updated_at = op.timestamp.clone();
+            // A deleted folder takes everything inside with it.
+            let deleted: Vec<FileId> = entries
+                .keys()
+                .filter(|id| **id == file_id || has_ancestor(entries, **id, file_id))
+                .copied()
+                .collect();
+            for id in deleted {
+                if let Some(entry) = entries.get_mut(&id) {
+                    entry.deleted_at.get_or_insert_with(|| op.timestamp.clone());
+                    entry.updated_at = op.timestamp.clone();
+                }
             }
         }
     }
 }
 
-fn new_restore_entry(
-    file_id: FileId,
-    entry_type: EntryType,
-    name: &str,
-    parent_id: Option<FileId>,
-    timestamp: &str,
-) -> FileEntry {
+/// Whether `ancestor` is on the parent chain of `file_id`.
+fn has_ancestor(entries: &HashMap<FileId, FileEntry>, file_id: FileId, ancestor: FileId) -> bool {
+    let mut cursor = entries.get(&file_id).and_then(|entry| entry.parent_id);
+    for _ in 0..=entries.len() {
+        match cursor {
+            Some(id) if id == ancestor => return true,
+            Some(id) => cursor = entries.get(&id).and_then(|entry| entry.parent_id),
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Deleted, or inside a folder that is deleted or missing.
+fn is_gone(entries: &HashMap<FileId, FileEntry>, file_id: FileId) -> bool {
+    let mut cursor = Some(file_id);
+    for _ in 0..=entries.len() {
+        let Some(id) = cursor else {
+            return false;
+        };
+        match entries.get(&id) {
+            Some(entry) if entry.deleted_at.is_none() => cursor = entry.parent_id,
+            _ => return true,
+        }
+    }
+    // A parent cycle; the path lookup reports it.
+    false
+}
+
+fn new_restore_entry(file_id: FileId, entry_type: EntryType, timestamp: &str) -> FileEntry {
+    let name = file_id.to_string();
     FileEntry {
         file_id,
-        parent_id,
-        name: name.to_string(),
-        normalized_name: Validator::normalize_name(name).to_lowercase(),
+        parent_id: None,
+        normalized_name: name.clone(),
+        name,
         entry_type,
         current_revision_id: None,
         content_ref: None,
@@ -1242,7 +1292,7 @@ fn restore_entries_to_output(
     let mut restore_items: Vec<(&FileId, &FileEntry, PathBuf)> = Vec::new();
 
     for (file_id, entry) in entries {
-        if entry.deleted_at.is_some() {
+        if is_gone(entries, *file_id) {
             report.deleted_skipped += 1;
             continue;
         }
@@ -1344,16 +1394,14 @@ fn entry_relative_path_inner(
         .get(file_id)
         .ok_or_else(|| format!("missing entry {}", file_id))?;
     let own_path = safe_relative_path(&entry.name)?;
-    let result = if let Some(parent_id) = entry.parent_id {
-        if entries.contains_key(&parent_id) {
+    // Without a parent, `name` is the whole path: written before folder nodes.
+    let result = match entry.parent_id {
+        Some(parent_id) => {
             let mut parent_path = entry_relative_path_inner(&parent_id, entries, visiting)?;
             parent_path.push(own_path);
             parent_path
-        } else {
-            own_path
         }
-    } else {
-        own_path
+        None => own_path,
     };
     visiting.remove(file_id);
     Ok(result)
@@ -1515,6 +1563,7 @@ fn level_badge(level: u32) -> &'static str {
 
 // ─── Sync Commands ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_sync_start(
     endpoint: &str,
     bucket: &str,
@@ -1523,6 +1572,7 @@ async fn run_sync_start(
     region: &str,
     local_path: &str,
     device_name: &str,
+    poll_interval: u64,
 ) {
     println!();
     println!("╔══════════════════════════════════════════════╗");
@@ -1537,7 +1587,8 @@ async fn run_sync_start(
 
     let mut config = build_config(endpoint, bucket, access_key, secret_key, region);
     config.sync_folder.local_path = local_path.to_string();
-    config.sync_folder.polling_interval_sec = 10;
+    config.sync_folder.polling_interval_sec = poll_interval;
+    config.core.device_name = Some(device_name.to_string());
 
     let mut core = s4drive_core::core::S4DriveCore::new(config);
 
@@ -2219,6 +2270,136 @@ mod tests {
             fs::read(output.join("docs").join("report.txt")).unwrap(),
             b"new content"
         );
+    }
+
+    fn test_op(
+        target: FileId,
+        op_type: OpType,
+        name: Option<&str>,
+        parent_id: Option<FileId>,
+        content_ref: Option<ContentRef>,
+    ) -> Operation {
+        let deleted = matches!(op_type, OpType::Delete);
+        Operation {
+            op_id: uuid::Uuid::now_v7().to_string(),
+            device_id: uuid::Uuid::now_v7(),
+            actor_id: "test".to_string(),
+            logical_clock: 1,
+            base_head: String::new(),
+            target_file_id: Some(target),
+            op_type,
+            preconditions: s4drive_core::metadata::types::Preconditions {
+                expected_etag: None,
+                expected_version_id: None,
+                file_exists: false,
+                parent_exists: true,
+            },
+            effects: s4drive_core::metadata::types::Effects {
+                new_revision_id: None,
+                new_content_ref: content_ref,
+                new_name: name.map(ToString::to_string),
+                new_parent_id: parent_id,
+                deleted,
+            },
+            timestamp: "2026-09-23T00:00:00Z".to_string(),
+            signature: None,
+        }
+    }
+
+    fn replay(ops: &[Operation]) -> HashMap<FileId, FileEntry> {
+        let mut entries = HashMap::new();
+        for op in ops {
+            apply_restore_operation(&mut entries, op);
+        }
+        entries
+    }
+
+    #[test]
+    fn replayed_folder_rename_moves_the_files_inside() {
+        let (folder, file) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let entries = replay(&[
+            test_op(folder, OpType::CreateFolder, Some("photos"), None, None),
+            test_op(
+                file,
+                OpType::CreateFile,
+                Some("one.jpg"),
+                Some(folder),
+                Some(test_content_ref("ab")),
+            ),
+            test_op(folder, OpType::Rename, Some("pictures"), None, None),
+        ]);
+
+        assert_eq!(
+            entry_relative_path(&file, &entries).unwrap(),
+            PathBuf::from("pictures").join("one.jpg")
+        );
+    }
+
+    #[test]
+    fn replayed_folder_delete_takes_the_files_inside() {
+        let (folder, file, outside) = (
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+        );
+        let entries = replay(&[
+            test_op(folder, OpType::CreateFolder, Some("photos"), None, None),
+            test_op(
+                file,
+                OpType::CreateFile,
+                Some("one.jpg"),
+                Some(folder),
+                Some(test_content_ref("ab")),
+            ),
+            test_op(
+                outside,
+                OpType::CreateFile,
+                Some("two.jpg"),
+                None,
+                Some(test_content_ref("cd")),
+            ),
+            test_op(folder, OpType::Delete, Some("photos"), None, None),
+            // Recreating the folder must not bring its old files back.
+            test_op(folder, OpType::CreateFolder, Some("photos"), None, None),
+        ]);
+
+        assert!(is_gone(&entries, file));
+        assert!(!is_gone(&entries, outside));
+        assert!(!is_gone(&entries, folder));
+    }
+
+    #[test]
+    fn replay_skips_a_move_that_puts_a_folder_inside_itself() {
+        let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let entries = replay(&[
+            test_op(a, OpType::CreateFolder, Some("a"), None, None),
+            test_op(b, OpType::CreateFolder, Some("b"), None, None),
+            test_op(a, OpType::Move, Some("a"), Some(b), None),
+            test_op(b, OpType::Move, Some("b"), Some(a), None),
+        ]);
+
+        assert_eq!(
+            entry_relative_path(&a, &entries).unwrap(),
+            PathBuf::from("b").join("a")
+        );
+        assert_eq!(
+            entry_relative_path(&b, &entries).unwrap(),
+            PathBuf::from("b")
+        );
+    }
+
+    #[test]
+    fn an_entry_inside_a_missing_folder_is_not_restored() {
+        let file = uuid::Uuid::now_v7();
+        let entries = replay(&[test_op(
+            file,
+            OpType::CreateFile,
+            Some("one.jpg"),
+            Some(uuid::Uuid::now_v7()),
+            Some(test_content_ref("ab")),
+        )]);
+
+        assert!(is_gone(&entries, file));
     }
 
     fn test_content_ref(hash: &str) -> ContentRef {

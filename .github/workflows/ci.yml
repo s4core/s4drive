@@ -1,12 +1,20 @@
+# Workflow of the public mirror https://github.com/s4core/s4drive.
+# The "Push to GitHub" job of the private Gitea CI (.github/workflows/ci.yml)
+# installs it there as .github/workflows/ci.yml; it never runs in Gitea.
+#
+# It only builds and publishes. fmt, clippy, the tests and the end-to-end
+# scripts run in the Gitea CI before the mirror pushes main and the v* tag
+# here; this workflow then builds the Linux, Windows, macOS and CLI artifacts
+# and publishes the GitHub Release with the notes from
+# .github/release-notes/<tag>.md.
+# To rebuild an existing tag, run "Build & Release" with workflow_dispatch.
+
 name: Build & Release
 
 on:
   push:
-    branches: [main, develop]
     tags:
       - 'v*'
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -36,57 +44,10 @@ defaults:
     shell: bash
 
 jobs:
-  # ─── Lint & Test ─────────────────────────────────────────────
-  lint-test:
-    name: Lint & Test (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
-          fetch-depth: 0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install Tauri system deps (Linux)
-        run: |
-          sudo apt-get update -qq
-          sudo env DEBIAN_FRONTEND="${DEBIAN_FRONTEND}" TZ="${TZ}" \
-            APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND}" \
-            NEEDRESTART_MODE="${NEEDRESTART_MODE}" \
-            apt-get -y -qq --no-install-recommends \
-            -o Dpkg::Options::=--force-confdef \
-            -o Dpkg::Options::=--force-confold \
-            install \
-            wget file libxdo-dev \
-            libwebkit2gtk-4.1-dev librsvg2-dev \
-            patchelf libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
-            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy --all -- -D warnings
-
-      - name: Run tests
-        run: cargo test -p s4drive-core --lib
-
   # ─── Linux build ─────────────────────────────────────────────
   build-linux:
     name: Linux (deb + rpm + AppImage)
     runs-on: ubuntu-latest
-    needs: [lint-test]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -120,7 +81,6 @@ jobs:
   build-windows:
     name: Windows (exe + msi)
     runs-on: windows-latest
-    needs: [lint-test]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,7 +127,6 @@ jobs:
   build-macos:
     name: macOS (universal dmg)
     runs-on: macos-latest
-    needs: [lint-test]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -304,7 +263,6 @@ jobs:
             os: macos-latest
             suffix: ""
     runs-on: ${{ matrix.os }}
-    needs: [lint-test]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -354,7 +312,6 @@ jobs:
     if: ${{ vars.ENABLE_MOBILE_CI == 'true' }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    needs: [lint-test]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -415,7 +372,6 @@ jobs:
     if: ${{ vars.ENABLE_MOBILE_CI == 'true' }}
     runs-on: macos-latest
     continue-on-error: true
-    needs: [lint-test]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -456,7 +412,7 @@ jobs:
   # ─── GitHub Release ──────────────────────────────────────────
   release:
     name: Create Release
-    if: (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && startsWith(inputs.release_tag, 'v'))) && github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && startsWith(inputs.release_tag, 'v'))
     runs-on: ubuntu-latest
     needs:
       - build-linux
@@ -494,18 +450,25 @@ jobs:
             echo "tag=$TAG"
             echo "version=$VERSION"
           } >> "$GITHUB_OUTPUT"
-          PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
-          if [ -n "$PREV" ]; then
-            LOG=$(git log "$PREV..$TAG" --oneline --no-decorate 2>/dev/null)
+          NOTES_FILE=".github/release-notes/${TAG}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            # Hand-written notes: the private CI does not release a tag without them.
+            cp "$NOTES_FILE" release-notes.md
           else
-            LOG=$(git log "$TAG" --oneline --max-count=30 --no-decorate 2>/dev/null)
+            # Tags from before the notes files: list the commits instead.
+            PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
+            if [ -n "$PREV" ]; then
+              LOG=$(git log "$PREV..$TAG" --oneline --no-decorate 2>/dev/null)
+            else
+              LOG=$(git log "$TAG" --oneline --max-count=30 --no-decorate 2>/dev/null)
+            fi
+            {
+              echo "# S4Drive v${VERSION}"
+              echo
+              echo "## What's Changed"
+            } > release-notes.md
+            echo "$LOG" | sed 's/^/ - /' >> release-notes.md
           fi
-          {
-            echo "# S4Drive v${VERSION}"
-            echo
-            echo "## What's Changed"
-          } > release-notes.md
-          echo "$LOG" | sed 's/^/ - /' >> release-notes.md
 
       - name: Organize release assets
         run: |
@@ -546,6 +509,8 @@ jobs:
           tag_name: ${{ steps.notes.outputs.tag }}
           name: S4Drive v${{ steps.notes.outputs.version }}
           body_path: release-notes.md
+          # Appends GitHub's "Full Changelog" link after the notes.
+          generate_release_notes: true
           draft: false
           prerelease: ${{ contains(steps.notes.outputs.tag, 'rc') || contains(steps.notes.outputs.tag, 'beta') || contains(steps.notes.outputs.tag, 'alpha') }}
           files: release-assets/*

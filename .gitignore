@@ -1,10 +1,35 @@
+# Rust / Cargo (включая src-tauri/target, куда пишет сборка Tauri)
 target/
-target
-/target/
-.codegraph/
+**/*.rs.bk
+
+# Схемы, которые tauri-build генерирует при каждой сборке
 src-tauri/gen/
+
+# Linux-пакеты из scripts/build-linux-docker.sh.
+# Только в корне: src-tauri/dist — это исходники фронтенда.
+/dist/
+
+# Frontend (Phase 6+): зависимости и отчёты тестов
+node_modules/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# Python (scripts/)
+__pycache__/
+*.pyc
+
+# Переменные окружения и секреты
+.env
+.env.*
+
+# Кэши и индексы инструментов
+.codegraph/
+
+# Временные файлы, ОС, редакторы
+tmp/
 *.swp
-*.swo
+*~
 .DS_Store
 Thumbs.db
-node_modules/

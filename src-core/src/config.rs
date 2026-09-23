@@ -43,6 +43,10 @@ pub struct CoreConfig {
     pub db_path: String,
     pub log_level: String,
     pub max_retries: u32,
+    /// Name of this device in conflict copies and version history;
+    /// `None` uses the host name (see `default_device_name`).
+    #[serde(default)]
+    pub device_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,10 +135,29 @@ impl Default for Config {
                 db_path: "~/.s4drive/db.sqlite".into(),
                 log_level: "info".into(),
                 max_retries: 3,
+                device_name: None,
             },
             maintenance: MaintenanceConfig::default(),
         }
     }
+}
+
+/// The host name, or "device" when there is none to find.
+pub fn default_device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .or_else(|| {
+            // Shells set HOSTNAME without exporting it, so ask the OS.
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+        })
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "device".to_string())
 }
 
 pub fn default_exclude_patterns() -> Vec<String> {
@@ -224,5 +247,11 @@ max_retries = 3
         assert_eq!(config.maintenance.remote_op_retention_days, 90);
         assert_eq!(config.maintenance.remote_op_snapshot_interval_ops, 1_000);
         assert_eq!(config.maintenance.remote_op_snapshot_max_entries, 50_000);
+        assert_eq!(config.core.device_name, None);
+    }
+
+    #[test]
+    fn default_device_name_is_never_empty() {
+        assert!(!default_device_name().trim().is_empty());
     }
 }

@@ -37,7 +37,9 @@ s4drive-cli restore-bucket --input ./.s4drive --output ./restored-files
 
 - Restores the latest live file tree from the newest snapshot plus operation log
   tail when available.
-- Copies blobs back to their original paths under `--output`.
+- Copies blobs back to their original paths under `--output`. A path is built
+  from the chain of parent folders, so renamed and moved folders come back
+  under their latest names; files inside a deleted folder are not restored.
 - Refuses to write outside `--output`.
 - Does not overwrite existing output files unless `--overwrite` is passed.
 - If an output path already exists, writes a conflict-suffixed copy instead.

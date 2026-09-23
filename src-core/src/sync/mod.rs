@@ -11,7 +11,10 @@ pub mod activity;
 pub mod conflict;
 pub mod conflict_engine;
 pub mod download;
+pub mod folders;
+mod local_changes;
 pub mod maintenance;
+mod remote_changes;
 pub mod versions;
 
 pub use activity::ActivityLog;
@@ -21,13 +24,14 @@ pub use download::DownloadEngine;
 pub use versions::{VersionApi, VersionHistory, VersionInfo};
 
 use crate::config::MaintenanceConfig;
-use crate::db::LocalDatabase;
+use crate::db::{LocalDatabase, LocalFileSnapshot};
 use crate::error::{CoreError, CoreResult};
 use crate::metadata::blobs::{hash_file_blake3, BlobStore};
 use crate::metadata::engine::MetadataEngine;
 use crate::metadata::ops::OperationLog;
+use crate::metadata::placement::Placement;
 use crate::metadata::serializer::Serializer;
-use crate::metadata::tree::{FileTree, TombstoneManager};
+use crate::metadata::tree::FileTree;
 use crate::metadata::types::{
     ContentRef, Effects, EntryType, FileEntry, OpType, Operation, Preconditions,
 };
@@ -36,7 +40,10 @@ use crate::optimization::{clamp_concurrency, AdaptiveConcurrency, IdleBackoff};
 use crate::s3::S3Adapter;
 use crate::transfer::TransferQueue;
 use crate::watcher::{FsEvent, FsEventStream};
+use folders::FolderNodes;
+use local_changes::LocalChanges;
 use maintenance::SyncMaintenance;
+use remote_changes::RemoteChanges;
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,6 +171,7 @@ impl SyncEngine {
         max_concurrent_downloads: u32,
         exclude_patterns: &[String],
         maintenance_config: MaintenanceConfig,
+        device_name: &str,
     ) {
         let device_id = metadata.device_id().to_string();
         self.event_stream = Some(Arc::new(Mutex::new(event_stream)));
@@ -175,10 +183,6 @@ impl SyncEngine {
             tracing::warn!("ActivityLog init failed: {}", e);
             ActivityLog::new_in_memory()
         });
-
-        let device_name = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "device".to_string());
 
         self.db = Some(db.clone());
         let sync_folder = shellexpand::tilde(sync_folder).to_string();
@@ -192,9 +196,9 @@ impl SyncEngine {
         self.conflict_engine = Some(ConflictEngine::new(
             Some(db.clone()),
             &device_id,
-            &device_name,
+            device_name,
         ));
-        self.versions = Some(VersionApi::new(Some(db), &device_id, &device_name));
+        self.versions = Some(VersionApi::new(Some(db), &device_id, device_name));
         self.activity = Some(activity);
         self.download = Some(DownloadEngine::new(s3, sync_folder));
         self.configured = true;
@@ -233,6 +237,7 @@ impl SyncEngine {
         if self.is_running() {
             return Ok(());
         }
+        self.upgrade_bucket_schema().await?;
 
         self.running.store(true, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
@@ -283,12 +288,15 @@ impl SyncEngine {
         let max_concurrent_downloads = self.max_concurrent_downloads;
         let exclude_patterns = self.exclude_patterns.clone();
         let maintenance_config = self.maintenance_config.clone();
+        // The interval set before start() is the base of the idle backoff;
+        // the loop then overwrites `interval` with the current backoff step.
+        let base_interval = *interval.lock().unwrap_or_else(|e| e.into_inner());
         let handle = tokio::spawn(async move {
-            let mut idle_backoff = IdleBackoff::new();
+            let mut idle_backoff = IdleBackoff::with_base(base_interval);
             let blob_lease_ttl_minutes = maintenance_config
                 .blob_lease_ttl_minutes
                 .max(MIN_BLOB_LEASE_TTL_MINUTES);
-            let maintenance = SyncMaintenance::new(maintenance_config);
+            let maintenance = SyncMaintenance::new(maintenance_config, versions.device_name());
             tracing::info!("Sync loop started");
             set_state(&state, SyncState::Idle);
 
@@ -430,6 +438,13 @@ impl SyncEngine {
         Ok(())
     }
 
+    async fn upgrade_bucket_schema(&self) -> CoreResult<()> {
+        match &self.metadata {
+            Some(metadata) => metadata.upgrade_schema().await,
+            None => Err(CoreError::Internal("metadata engine missing".into())),
+        }
+    }
+
     /// Gracefully stop the sync loop.
     pub async fn stop(&mut self) -> CoreResult<()> {
         self.running.store(false, Ordering::Relaxed);
@@ -510,6 +525,7 @@ impl SyncEngine {
             .clone()
             .ok_or_else(|| CoreError::Internal("activity log missing".into()))?;
 
+        metadata.upgrade_schema().await?;
         self.running.store(true, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
         let mut result = run_initial_sync(
@@ -534,7 +550,8 @@ impl SyncEngine {
         )
         .await;
         if let Ok(result) = result.as_mut() {
-            let maintenance = SyncMaintenance::new(self.maintenance_config.clone());
+            let maintenance =
+                SyncMaintenance::new(self.maintenance_config.clone(), versions.device_name());
             apply_maintenance_report(
                 result,
                 maintenance
@@ -749,6 +766,13 @@ async fn run_initial_sync(
         local_scan.visited,
         local_scan.queued
     );
+    let folders = FolderNodes::new(download.s3(), db, metadata.device_id(), sync_folder);
+    for path in &local_scan.new_folders {
+        if let Err(e) = folders.ensure_folder(path).await {
+            tracing::warn!("New folders will be added in a later pass: {}", e);
+            break;
+        }
+    }
 
     // ── Phase B: Process upload queue ──
     let (pending_uploads, _) = transfer.pending_count()?;
@@ -786,9 +810,15 @@ async fn run_initial_sync(
     // ── Phase C: Pull remote changes ──
     set_state(state, SyncState::ScanningRemote);
     if remote_tree_bootstrap_in_progress(db)? || !had_local_index {
-        let remote_scan =
-            queue_missing_remote_tree_entries(download.s3(), db, transfer, versions, sync_folder)
-                .await?;
+        let remote_scan = queue_missing_remote_tree_entries(
+            download.s3(),
+            metadata,
+            db,
+            transfer,
+            versions,
+            sync_folder,
+        )
+        .await?;
         if remote_scan.queued > 0 {
             tracing::info!(
                 "Remote tree scan queued {} download(s); complete={}",
@@ -799,6 +829,7 @@ async fn run_initial_sync(
     } else {
         let (download_jobs, remote_conflicts) = poll_remote_changes(
             download.s3(),
+            metadata,
             db,
             transfer,
             activity,
@@ -840,6 +871,8 @@ struct LocalUploadScan {
     queued: u32,
     bytes: u64,
     truncated: bool,
+    /// Folders without a node yet, parents first.
+    new_folders: Vec<String>,
 }
 
 async fn queue_local_uploads_from_scan(
@@ -878,6 +911,11 @@ async fn queue_local_uploads_from_scan(
                 CoreError::FileSystem(format!("metadata {}: {}", entry_path.display(), e))
             })?;
             if metadata.is_dir() {
+                let folder_path =
+                    path_to_s3_key(entry_path.strip_prefix(sync_path).unwrap_or(&entry_path));
+                if db.folder_at(&folder_path)?.is_none() {
+                    result.new_folders.push(folder_path);
+                }
                 dirs.push(entry_path);
                 continue;
             }
@@ -1002,6 +1040,7 @@ async fn remote_head_for_checkpoint(s3: &S3Adapter) -> CoreResult<String> {
 
 async fn queue_missing_remote_tree_entries(
     s3: &S3Adapter,
+    metadata: &MetadataEngine,
     db: &LocalDatabase,
     transfer: &TransferQueue,
     versions: &VersionApi,
@@ -1009,6 +1048,7 @@ async fn queue_missing_remote_tree_entries(
 ) -> CoreResult<RemoteTreeScan> {
     queue_missing_remote_tree_entries_from(
         s3,
+        metadata,
         db,
         transfer,
         versions,
@@ -1019,8 +1059,10 @@ async fn queue_missing_remote_tree_entries(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn queue_missing_remote_tree_entries_from(
     s3: &S3Adapter,
+    metadata: &MetadataEngine,
     db: &LocalDatabase,
     transfer: &TransferQueue,
     versions: &VersionApi,
@@ -1082,6 +1124,7 @@ async fn queue_missing_remote_tree_entries_from(
         continuation_token.as_deref().unwrap_or("<start>")
     );
     let tree = FileTree::new(s3);
+    let folders = FolderNodes::new(s3, db, metadata.device_id(), sync_folder);
 
     let mut queued = 0usize;
     let mut complete = false;
@@ -1093,6 +1136,7 @@ async fn queue_missing_remote_tree_entries_from(
         for file_id in &page.ids {
             if let Ok(entry) = tree.get_entry(file_id).await {
                 let result = queue_remote_tree_entry(
+                    &folders,
                     db,
                     transfer,
                     versions,
@@ -1165,6 +1209,7 @@ fn remote_tree_scan_continuation(
 }
 
 async fn queue_remote_tree_entry(
+    folders: &FolderNodes<'_>,
     db: &LocalDatabase,
     transfer: &TransferQueue,
     versions: &VersionApi,
@@ -1172,15 +1217,28 @@ async fn queue_remote_tree_entry(
     entry: &FileEntry,
     reconcile_existing: bool,
 ) -> CoreResult<RemoteTreeEntryResult> {
+    let placement = Placement::of(entry);
+    if entry.entry_type == EntryType::Folder {
+        if let Some(parent_path) = folders.parent_path(placement.parent_id).await? {
+            folders
+                .place_folder(entry.file_id, &placement, &parent_path)
+                .await?;
+        }
+        return Ok(RemoteTreeEntryResult::checkpoint_safe());
+    }
     if entry.entry_type != EntryType::File {
         return Ok(RemoteTreeEntryResult::checkpoint_safe());
     }
     let Some(content_ref) = entry.content_ref.as_ref() else {
         return Ok(RemoteTreeEntryResult::blocked());
     };
+    // Left behind by a deleted folder: gone with it.
+    let Some(remote_path) = folders.resolve(&placement).await? else {
+        return Ok(RemoteTreeEntryResult::checkpoint_safe());
+    };
 
     let file_id = entry.file_id;
-    let local_path = safe_join_sync_path(sync_folder, &entry.name)?;
+    let local_path = safe_join_sync_path(sync_folder, &remote_path)?;
     let local_path_text = local_path.to_string_lossy().to_string();
 
     if let Some(local_entry) = db.get_file(&file_id)? {
@@ -1225,14 +1283,14 @@ async fn queue_remote_tree_entry(
         }
 
         if same_content {
-            db.register_file_at_path_with_state(entry, &local_path_text, &entry.name, "synced")?;
+            db.register_file_at_path_with_state(entry, &local_path_text, &remote_path, "synced")?;
             return Ok(RemoteTreeEntryResult::checkpoint_safe());
         }
     }
 
     let blob_key = content_ref.storage_key.clone();
     transfer.enqueue_download(&file_id.to_string(), &local_path_text, &blob_key)?;
-    db.register_file_at_path_with_state(entry, &local_path_text, &entry.name, "pending_download")?;
+    db.register_file_at_path_with_state(entry, &local_path_text, &remote_path, "pending_download")?;
     record_entry_revision(
         versions,
         &file_id,
@@ -1306,6 +1364,9 @@ async fn run_sync_cycle(
             .map_err(|e| CoreError::Internal(format!("event stream lock: {}", e)))?;
         stream.drain()
     };
+    let events = expand_folder_events(events, _sync_folder, exclude_patterns);
+    let events = drop_deletes_inside_deleted_folders(events);
+    let local = LocalChanges::new(download.s3(), metadata, db, activity, _sync_folder);
 
     for event in &events {
         let path = event.path();
@@ -1314,6 +1375,12 @@ async fn run_sync_cycle(
         }
 
         match event {
+            FsEvent::Created(p) if Path::new(p).is_dir() => {
+                // Not fatal: the first upload inside adds the folder too.
+                if let Err(e) = local.created_folder(p).await {
+                    tracing::warn!("Could not add folder {}: {}", p, e);
+                }
+            }
             FsEvent::Created(p) | FsEvent::Modified(p) => {
                 let full_path = Path::new(p);
                 if !full_path.exists() || !full_path.is_file() {
@@ -1326,6 +1393,17 @@ async fn run_sync_cycle(
                         continue;
                     }
                 };
+                // Files of a moved folder come as created events; the index
+                // already has them at the new path, and hashing is not needed.
+                if matches!(event, FsEvent::Created(_))
+                    && db
+                        .get_file_snapshot_by_local_path(p)?
+                        .is_some_and(|snapshot| {
+                            snapshot.state == "synced" && fingerprint_matches(&snapshot, full_path)
+                        })
+                {
+                    continue;
+                }
                 let (hash_hex, file_size) = match blake3_file_hash(full_path).await {
                     Ok(value) => value,
                     Err(e) => {
@@ -1381,21 +1459,8 @@ async fn run_sync_cycle(
                     activity.log("new_file", &file_id.to_string(), &s3_key, "queued")?;
                 }
             }
-            FsEvent::Deleted(p) => {
-                handle_local_delete(download.s3(), metadata, db, activity, _sync_folder, p).await?;
-            }
-            FsEvent::Renamed { from, to } => {
-                handle_local_rename(
-                    download.s3(),
-                    metadata,
-                    db,
-                    activity,
-                    _sync_folder,
-                    from,
-                    to,
-                )
-                .await?;
-            }
+            FsEvent::Deleted(p) => local.deleted(p).await?,
+            FsEvent::Renamed { from, to } => local.renamed(from, to).await?,
         }
     }
 
@@ -1440,6 +1505,7 @@ async fn run_sync_cycle(
         if remote_tree_bootstrap_in_progress(db)? {
             let remote_scan = queue_missing_remote_tree_entries(
                 download.s3(),
+                metadata,
                 db,
                 transfer,
                 versions,
@@ -1457,6 +1523,7 @@ async fn run_sync_cycle(
         } else {
             let (queued, remote_conflicts) = poll_remote_changes(
                 download.s3(),
+                metadata,
                 db,
                 transfer,
                 activity,
@@ -1519,6 +1586,7 @@ async fn process_upload_queue(
     let mut conflicts = 0u32;
     let mut concurrency = AdaptiveConcurrency::new(max_concurrent_uploads);
     let mut processed_jobs = 0u32;
+    let folders = FolderNodes::new(s3, db, metadata.device_id(), sync_folder);
 
     while processed_jobs < MAX_UPLOAD_JOBS_PER_PASS {
         let remaining = MAX_UPLOAD_JOBS_PER_PASS - processed_jobs;
@@ -1561,12 +1629,7 @@ async fn process_upload_queue(
                 Err(e) => {
                     tracing::warn!("Blob upload failed: {}", e);
                     concurrency.record_failure();
-                    let retry = transfer.increment_retry(job.id)?;
-                    if retry >= max_retries {
-                        transfer.mark_failed(job.id, &format!("max retries: {}", e))?;
-                    } else {
-                        requeue_with_backoff(transfer, job.id, retry).await?;
-                    }
+                    retry_later(transfer, job.id, max_retries, &e).await?;
                     continue;
                 }
             };
@@ -1583,12 +1646,7 @@ async fn process_upload_queue(
                 Err(e) => {
                     tracing::warn!("Blob lease creation failed: {}", e);
                     concurrency.record_failure();
-                    let retry = transfer.increment_retry(job.id)?;
-                    if retry >= max_retries {
-                        transfer.mark_failed(job.id, &format!("max retries: {}", e))?;
-                    } else {
-                        requeue_with_backoff(transfer, job.id, retry).await?;
-                    }
+                    retry_later(transfer, job.id, max_retries, &e).await?;
                     continue;
                 }
             };
@@ -1599,6 +1657,16 @@ async fn process_upload_queue(
                     let _ = release_blob_lease(s3, &lease_key).await;
                     transfer.mark_failed(job.id, &format!("invalid file_id: {}", e))?;
                     concurrency.record_failure();
+                    continue;
+                }
+            };
+            let placement = match folders.placement_for(&s3_key).await {
+                Ok(placement) => placement,
+                Err(e) => {
+                    tracing::warn!("Could not add the folders of {}: {}", s3_key, e);
+                    let _ = release_blob_lease(s3, &lease_key).await;
+                    concurrency.record_failure();
+                    retry_later(transfer, job.id, max_retries, &e).await?;
                     continue;
                 }
             };
@@ -1615,9 +1683,9 @@ async fn process_upload_queue(
                 .collect();
             let entry = FileEntry {
                 file_id: parsed_file_id,
-                parent_id: None,
-                name: s3_key.clone(),
-                normalized_name: Validator::normalize_name(&s3_key).to_lowercase(),
+                parent_id: placement.parent_id,
+                name: placement.name.clone(),
+                normalized_name: Validator::normalize_name(&placement.name).to_lowercase(),
                 entry_type: EntryType::File,
                 current_revision_id: Some(revision_id),
                 content_ref: Some(content_ref.clone()),
@@ -1706,8 +1774,8 @@ async fn process_upload_queue(
                 op_type,
                 Some(content_ref.clone()),
                 Some(revision_id),
-                Some(s3_key.clone()),
-                None,
+                Some(placement.name.clone()),
+                placement.parent_id,
                 false,
                 remote_exists,
                 true,
@@ -1748,12 +1816,7 @@ async fn process_upload_queue(
                     } else {
                         tracing::warn!("Metadata commit failed: {}", e);
                         concurrency.record_failure();
-                        let retry = transfer.increment_retry(job.id)?;
-                        if retry >= max_retries {
-                            transfer.mark_failed(job.id, &format!("max retries: {}", e))?;
-                        } else {
-                            requeue_with_backoff(transfer, job.id, retry).await?;
-                        }
+                        retry_later(transfer, job.id, max_retries, &e).await?;
                     }
                 }
             }
@@ -1845,12 +1908,7 @@ async fn process_download_queue(
                 Err(e) => {
                     tracing::warn!("Download failed: {}", e);
                     concurrency.record_failure();
-                    let retry = transfer.increment_retry(job.id)?;
-                    if retry >= max_retries {
-                        transfer.mark_failed(job.id, &format!("max retries: {}", e))?;
-                    } else {
-                        requeue_with_backoff(transfer, job.id, retry).await?;
-                    }
+                    retry_later(transfer, job.id, max_retries, &e).await?;
                 }
             }
         }
@@ -1864,6 +1922,7 @@ async fn process_download_queue(
 #[allow(clippy::too_many_arguments)]
 async fn poll_remote_changes(
     s3: &S3Adapter,
+    metadata: &MetadataEngine,
     db: &LocalDatabase,
     transfer: &TransferQueue,
     activity: &ActivityLog,
@@ -1928,6 +1987,7 @@ async fn poll_remote_changes(
         };
         let remote_scan = queue_missing_remote_tree_entries_from(
             s3,
+            metadata,
             db,
             transfer,
             versions,
@@ -1944,6 +2004,15 @@ async fn poll_remote_changes(
     let mut conflicts = 0u32;
     let mut processed_all = true;
     let tree = FileTree::new(s3);
+    let remote = RemoteChanges {
+        db,
+        activity,
+        conflict,
+        conflict_engine,
+        versions,
+        sync_folder: _sync_folder,
+        folders: FolderNodes::new(s3, db, metadata.device_id(), _sync_folder),
+    };
 
     for op in &ops {
         let file_id = match op.target_file_id {
@@ -1953,7 +2022,7 @@ async fn poll_remote_changes(
 
         match op.op_type {
             OpType::UploadNewRevision | OpType::CreateFile => {
-                let (entry, content_ref, remote_path) =
+                let (entry, content_ref, placement) =
                     match remote_file_state(&tree, op, &file_id).await {
                         Ok(Some(value)) => value,
                         Ok(None) => continue,
@@ -1963,6 +2032,16 @@ async fn poll_remote_changes(
                             break;
                         }
                     };
+                let remote_path = match remote.folders.resolve(&placement).await {
+                    Ok(Some(path)) => path,
+                    // Its folder was deleted since: nothing to download.
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("Remote op {} is not usable yet: {}", op.op_id, e);
+                        processed_all = false;
+                        break;
+                    }
+                };
 
                 let local_path = safe_join_sync_path(_sync_folder, &remote_path)?;
                 let local_path_text = local_path.to_string_lossy().to_string();
@@ -1970,6 +2049,7 @@ async fn poll_remote_changes(
                 if let Some(local_entry) = db.get_file(&file_id)? {
                     if content_hash_matches(local_entry.content_hash.as_deref(), &content_ref.hash)
                     {
+                        db.set_parent(&file_id, placement.parent_id)?;
                         continue;
                     }
 
@@ -2080,6 +2160,12 @@ async fn poll_remote_changes(
                         conflicts += 1;
                         continue;
                     }
+                } else if local_path.is_dir() {
+                    tracing::warn!(
+                        "{} is a folder here; the file is not downloaded",
+                        remote_path
+                    );
+                    continue;
                 } else if local_path.exists() {
                     if has_open_conflict(db, &file_id, ConflictType::CreateCreate.as_str())? {
                         continue;
@@ -2130,6 +2216,14 @@ async fn poll_remote_changes(
                     .or_else(|| parent_revision_from_history(&entry));
                 let parent_revision = parent_revision_uuid.map(|id| id.to_string());
                 let remote_revision = remote_revision_uuid.map(|id| id.to_string());
+                // Register the file first: a revision row references it, and
+                // this may be the first time the device sees the file.
+                db.register_file_at_path_with_state(
+                    &entry,
+                    &local_path_text,
+                    &remote_path,
+                    "pending_download",
+                )?;
                 if let Some(revision_id) = remote_revision.as_deref() {
                     versions.record_revision(
                         revision_id,
@@ -2149,137 +2243,12 @@ async fn poll_remote_changes(
                     &local_path_text,
                     &content_ref.storage_key,
                 )?;
-                db.register_file_at_path_with_state(
-                    &entry,
-                    &local_path_text,
-                    &remote_path,
-                    "pending_download",
-                )?;
                 new_downloads += 1;
                 activity.log("remote_change", &file_id.to_string(), &op.op_id, "queued")?;
             }
-            OpType::Rename | OpType::Move => {
-                if let Some(new_name) = op.effects.new_name.as_deref() {
-                    if let Some(old_path) = db.get_local_path(&file_id)? {
-                        let new_path = safe_join_sync_path(_sync_folder, new_name)?;
-                        let old_path_obj = Path::new(&old_path);
-                        if new_path.exists() && !same_path(old_path_obj, &new_path) {
-                            if has_open_conflict(db, &file_id, ConflictType::RenameRename.as_str())?
-                            {
-                                continue;
-                            }
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let conflict_path = ConflictEngine::create_conflict_copy(
-                                &new_path.to_string_lossy(),
-                                _sync_folder,
-                                new_name,
-                                versions.device_name(),
-                                &now,
-                            )?;
-                            let reason = ConflictEngine::explain_conflict(
-                                &ConflictType::RenameRename,
-                                &old_path,
-                                new_name,
-                                versions.device_name(),
-                                "remote",
-                                &now,
-                                &op.timestamp,
-                            );
-                            conflict.register(&file_id.to_string(), &old_path, &reason);
-                            conflict_engine.record_conflict(
-                                &file_id.to_string(),
-                                &ConflictType::RenameRename,
-                                &old_path,
-                                new_name,
-                                &conflict_path,
-                                None,
-                                None,
-                                &reason,
-                            )?;
-                            conflicts += 1;
-                            continue;
-                        }
-                        if old_path_obj.exists() {
-                            if let Some(parent) = new_path.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    CoreError::FileSystem(format!("create rename parent: {}", e))
-                                })?;
-                            }
-                            std::fs::rename(&old_path, &new_path).map_err(|e| {
-                                CoreError::FileSystem(format!("remote rename apply: {}", e))
-                            })?;
-                        }
-                        db.update_local_path(&file_id, &new_path.to_string_lossy(), new_name)?;
-                        activity.log(
-                            "remote_rename",
-                            &file_id.to_string(),
-                            &op.op_id,
-                            "applied",
-                        )?;
-                    }
-                }
-            }
-            OpType::Delete => {
-                if let Ok(Some(_entry)) = db.get_file(&file_id) {
-                    if let Some(local_path) = db.get_local_path(&file_id)? {
-                        let local_path_obj = PathBuf::from(&local_path);
-                        let local_hash =
-                            db.get_file(&file_id)?.and_then(|entry| entry.content_hash);
-                        if local_file_changed_since_sync(&local_path_obj, local_hash.as_deref())
-                            .await?
-                        {
-                            if has_open_conflict(db, &file_id, ConflictType::DeleteEdit.as_str())? {
-                                continue;
-                            }
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let conflict_name =
-                                relative_s3_key(_sync_folder, Path::new(&local_path))
-                                    .unwrap_or_else(|_| {
-                                        Path::new(&local_path)
-                                            .file_name()
-                                            .map(|name| name.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| "deleted".to_string())
-                                    });
-                            let conflict_path = ConflictEngine::create_conflict_copy(
-                                &local_path,
-                                _sync_folder,
-                                &conflict_name,
-                                versions.device_name(),
-                                &now,
-                            )?;
-                            let local_rev = db
-                                .get_file(&file_id)?
-                                .and_then(|entry| entry.current_revision_id)
-                                .map(|id| id.to_string());
-                            let reason = ConflictEngine::explain_conflict(
-                                &ConflictType::DeleteEdit,
-                                &local_path,
-                                &local_path,
-                                versions.device_name(),
-                                "remote",
-                                &now,
-                                &op.timestamp,
-                            );
-                            conflict.register(&file_id.to_string(), &local_path, &reason);
-                            conflict_engine.record_conflict(
-                                &file_id.to_string(),
-                                &ConflictType::DeleteEdit,
-                                &local_path,
-                                &local_path,
-                                &conflict_path,
-                                local_rev.as_deref(),
-                                None,
-                                &reason,
-                            )?;
-                            conflicts += 1;
-                            continue;
-                        }
-                        move_local_file_to_trash(_sync_folder, &local_path, &file_id)?;
-                    }
-                    db.mark_file_deleted(&file_id)?;
-                    activity.log("remote_delete", &file_id.to_string(), &op.op_id, "applied")?;
-                }
-            }
+            OpType::CreateFolder => conflicts += remote.created_folder(file_id, op).await?,
+            OpType::Rename | OpType::Move => conflicts += remote.renamed(file_id, op).await?,
+            OpType::Delete => conflicts += remote.deleted(file_id, op).await?,
             _ => {}
         }
     }
@@ -2291,138 +2260,89 @@ async fn poll_remote_changes(
     Ok((new_downloads, conflicts))
 }
 
-async fn handle_local_delete(
-    s3: &S3Adapter,
-    metadata: &MetadataEngine,
-    db: &LocalDatabase,
-    activity: &ActivityLog,
+/// A folder event says nothing about what is inside it: a folder moved in,
+/// or files written before the watcher saw a new folder. Each file and
+/// folder inside gets a Created event after the folder's own event; files the
+/// index already has at that path are skipped by size and mtime.
+///
+/// The scan sees the folder as it is now, so it can already hold a folder
+/// that a later event of the batch moves in. That part is left to the move.
+fn expand_folder_events(
+    events: Vec<FsEvent>,
     sync_folder: &str,
-    local_path: &str,
-) -> CoreResult<()> {
-    let Some(entry) = db.get_file_by_local_path(local_path)? else {
-        return Ok(());
-    };
-
-    let tree = FileTree::new(s3);
-    let remote_entry = tree.get_entry(&entry.file_id).await.ok();
-    let content_refs = remote_entry
-        .as_ref()
-        .and_then(|entry| {
-            entry
-                .content_ref
-                .as_ref()
-                .map(|content| vec![content.blob_id])
+    exclude_patterns: &[String],
+) -> Vec<FsEvent> {
+    let moved_in: Vec<PathBuf> = events
+        .iter()
+        .filter_map(|event| match event {
+            FsEvent::Renamed { to, .. } => Some(PathBuf::from(to)),
+            _ => None,
         })
-        .unwrap_or_default();
-    let remote_path = db
-        .get_s3_key(&entry.file_id)?
-        .filter(|key| !key.is_empty())
-        .or_else(|| relative_s3_key(sync_folder, Path::new(local_path)).ok())
-        .unwrap_or_else(|| entry.name.clone());
-    let deleted_name = Path::new(&remote_path)
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| remote_path.clone());
-
-    let tombstones = TombstoneManager::new(s3);
-    tombstones
-        .create_tombstone(
-            &entry.file_id,
-            &remote_path,
-            &deleted_name,
-            &metadata.device_id().to_string(),
-            content_refs,
-            90,
-        )
-        .await?;
-
-    commit_sync_operation(
-        s3,
-        metadata,
-        Some(entry.file_id),
-        OpType::Delete,
-        None,
-        None,
-        Some(remote_path.clone()),
-        None,
-        true,
-        true,
-        true,
-    )
-    .await?;
-
-    if let Err(e) = tree.delete_entry(&entry.file_id).await {
-        tracing::debug!("delete tree entry after tombstone failed: {}", e);
+        .collect();
+    let mut expanded = Vec::with_capacity(events.len());
+    for event in events {
+        let folder = match &event {
+            FsEvent::Created(path) | FsEvent::Renamed { to: path, .. } => Some(PathBuf::from(path))
+                .filter(|path| {
+                    path.is_dir()
+                        && !should_ignore_sync_path(path, Path::new(sync_folder), exclude_patterns)
+                }),
+            _ => None,
+        };
+        expanded.push(event);
+        let Some(folder) = folder else {
+            continue;
+        };
+        match scan_folder_recursive_bounded(&folder, exclude_patterns, MAX_SYNC_SCAN_FILES) {
+            // Scan paths are relative to the scanned folder.
+            Ok(scan) => {
+                let left_to_moves: Vec<&PathBuf> = moved_in
+                    .iter()
+                    .filter(|target| **target != folder && target.starts_with(&folder))
+                    .collect();
+                let inside = scan
+                    .folders
+                    .into_iter()
+                    .chain(scan.files.into_iter().map(|(path, _)| path))
+                    .map(|path| folder.join(path))
+                    .filter(|path| !left_to_moves.iter().any(|target| path.starts_with(target)));
+                expanded.extend(
+                    inside.map(|path| FsEvent::Created(path.to_string_lossy().to_string())),
+                );
+            }
+            Err(e) => tracing::warn!("Could not scan folder {}: {}", folder.display(), e),
+        }
     }
-    db.mark_file_deleted(&entry.file_id)?;
-    activity.log(
-        "delete",
-        &entry.file_id.to_string(),
-        &remote_path,
-        "tombstoned",
-    )?;
-    Ok(())
+    expanded
 }
 
-async fn handle_local_rename(
-    s3: &S3Adapter,
-    metadata: &MetadataEngine,
-    db: &LocalDatabase,
-    activity: &ActivityLog,
-    sync_folder: &str,
-    from: &str,
-    to: &str,
-) -> CoreResult<()> {
-    let Some(entry) = db.get_file_by_local_path(from)? else {
-        return Ok(());
-    };
-    let new_s3_key = relative_s3_key(sync_folder, Path::new(to))?;
-    let tree = FileTree::new(s3);
-
-    commit_sync_operation(
-        s3,
-        metadata,
-        Some(entry.file_id),
-        OpType::Rename,
-        None,
-        None,
-        Some(new_s3_key.clone()),
-        None,
-        false,
-        true,
-        true,
-    )
-    .await?;
-
-    let mut remote_entry = tree
-        .get_entry(&entry.file_id)
-        .await
-        .unwrap_or(entry.clone());
-    remote_entry.name = new_s3_key.clone();
-    remote_entry.normalized_name = Validator::normalize_name(&new_s3_key).to_lowercase();
-    remote_entry.updated_at = chrono::Utc::now().to_rfc3339();
-    if let Ok(metadata) = std::fs::metadata(to) {
-        remote_entry.size = metadata.len();
-    }
-    if let Err(e) = tree.upsert_entry(&remote_entry).await {
-        tracing::warn!("Materialized tree rename failed after op commit: {}", e);
-    }
-
-    db.update_local_path(&entry.file_id, to, &new_s3_key)?;
-    activity.log(
-        "rename",
-        &entry.file_id.to_string(),
-        &format!("{} -> {}", from, to),
-        "applied",
-    )?;
-    Ok(())
+/// Removing a folder tree reports every file and folder inside it. The
+/// folder's own delete covers all of them in one op, so theirs are dropped.
+fn drop_deletes_inside_deleted_folders(events: Vec<FsEvent>) -> Vec<FsEvent> {
+    let deleted: std::collections::HashSet<PathBuf> = events
+        .iter()
+        .filter_map(|event| match event {
+            FsEvent::Deleted(path) => Some(PathBuf::from(path)),
+            _ => None,
+        })
+        .collect();
+    events
+        .into_iter()
+        .filter(|event| match event {
+            FsEvent::Deleted(path) => !Path::new(path)
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| deleted.contains(ancestor)),
+            _ => true,
+        })
+        .collect()
 }
 
 async fn remote_file_state(
     tree: &FileTree<'_>,
     op: &Operation,
     file_id: &uuid::Uuid,
-) -> CoreResult<Option<(FileEntry, ContentRef, String)>> {
+) -> CoreResult<Option<(FileEntry, ContentRef, Placement)>> {
     let tree_entry = match tree.get_entry(file_id).await {
         Ok(entry) => Some(entry),
         Err(CoreError::NotFound(_)) => None,
@@ -2436,20 +2356,17 @@ async fn remote_file_state(
     let Some(content_ref) = content_ref else {
         return Ok(None);
     };
-    let remote_path = op
-        .effects
-        .new_name
-        .clone()
-        .or_else(|| tree_entry.as_ref().map(|entry| entry.name.clone()))
-        .unwrap_or_else(|| file_id.to_string());
+    let placement = Placement::of_op(op)
+        .or_else(|| tree_entry.as_ref().map(Placement::of))
+        .unwrap_or_else(|| Placement::new(None, &file_id.to_string()));
 
     let mut entry = tree_entry.unwrap_or_else(|| {
         let now = chrono::Utc::now().to_rfc3339();
         FileEntry {
             file_id: *file_id,
             parent_id: None,
-            name: remote_path.clone(),
-            normalized_name: Validator::normalize_name(&remote_path).to_lowercase(),
+            name: String::new(),
+            normalized_name: String::new(),
             entry_type: EntryType::File,
             current_revision_id: op.effects.new_revision_id,
             content_ref: Some(content_ref.clone()),
@@ -2464,8 +2381,7 @@ async fn remote_file_state(
             lock_state: Default::default(),
         }
     });
-    entry.name = remote_path.clone();
-    entry.normalized_name = Validator::normalize_name(&remote_path).to_lowercase();
+    placement.apply_to(&mut entry);
     entry.content_ref = Some(content_ref.clone());
     entry.size = content_ref.size;
     entry.content_hash = Some(blake3_local_hash(&content_ref.hash));
@@ -2481,7 +2397,7 @@ async fn remote_file_state(
         return Ok(None);
     }
 
-    Ok(Some((entry, content_ref, remote_path)))
+    Ok(Some((entry, content_ref, placement)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2713,6 +2629,21 @@ async fn commit_sync_operation(
     Ok(())
 }
 
+/// Try a transfer again after a pause, or give up after `max_retries`.
+async fn retry_later(
+    transfer: &TransferQueue,
+    job_id: i64,
+    max_retries: u32,
+    error: &CoreError,
+) -> CoreResult<()> {
+    let retry = transfer.increment_retry(job_id)?;
+    if retry >= max_retries {
+        transfer.mark_failed(job_id, &format!("max retries: {}", error))
+    } else {
+        requeue_with_backoff(transfer, job_id, retry).await
+    }
+}
+
 async fn requeue_with_backoff(
     transfer: &TransferQueue,
     job_id: i64,
@@ -2726,6 +2657,27 @@ async fn requeue_with_backoff(
 fn retry_backoff(retry_count: u32) -> Duration {
     let shift = retry_count.saturating_sub(1).min(5);
     Duration::from_secs(1u64 << shift)
+}
+
+/// Whether a file still has the size and mtime the index saw when it synced.
+fn fingerprint_matches(snapshot: &LocalFileSnapshot, path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| {
+        metadata.len() == snapshot.size
+            && snapshot.local_mtime.is_some()
+            && metadata_mtime_millis(&metadata) == snapshot.local_mtime
+    })
+}
+
+/// Whether a file differs from what was last synced: checked by size and
+/// mtime first, and by content only when those changed.
+async fn local_file_edited(db: &LocalDatabase, path: &Path) -> CoreResult<bool> {
+    let Some(snapshot) = db.get_file_snapshot_by_local_path(&path.to_string_lossy())? else {
+        return Ok(path.exists());
+    };
+    if fingerprint_matches(&snapshot, path) {
+        return Ok(false);
+    }
+    local_file_changed_since_sync(path, snapshot.local_hash.as_deref()).await
 }
 
 async fn local_file_changed_since_sync(
@@ -2856,6 +2808,8 @@ fn safe_join_sync_path(sync_folder: &str, remote_path: &str) -> CoreResult<PathB
 #[derive(Debug, Clone)]
 pub struct FolderScan {
     pub files: Vec<(PathBuf, u64)>,
+    /// Folders inside, parents first.
+    pub folders: Vec<PathBuf>,
     pub truncated: bool,
 }
 
@@ -2868,23 +2822,15 @@ pub fn scan_folder_recursive_bounded(
     exclude_patterns: &[String],
     max_files: usize,
 ) -> CoreResult<FolderScan> {
-    let mut files = Vec::new();
-    if !path.is_dir() {
-        return Ok(FolderScan {
-            files,
-            truncated: false,
-        });
+    let mut scan = FolderScan {
+        files: Vec::new(),
+        folders: Vec::new(),
+        truncated: false,
+    };
+    if path.is_dir() {
+        scan_folder_recursive_inner(path, path, exclude_patterns, max_files, &mut scan)?;
     }
-    let mut truncated = false;
-    scan_folder_recursive_inner(
-        path,
-        path,
-        exclude_patterns,
-        max_files,
-        &mut files,
-        &mut truncated,
-    )?;
-    Ok(FolderScan { files, truncated })
+    Ok(scan)
 }
 
 fn scan_folder_recursive_inner(
@@ -2892,10 +2838,9 @@ fn scan_folder_recursive_inner(
     path: &Path,
     exclude_patterns: &[String],
     max_files: usize,
-    files: &mut Vec<(PathBuf, u64)>,
-    truncated: &mut bool,
+    scan: &mut FolderScan,
 ) -> CoreResult<()> {
-    if *truncated {
+    if scan.truncated {
         return Ok(());
     }
 
@@ -2903,8 +2848,8 @@ fn scan_folder_recursive_inner(
         .map_err(|e| CoreError::FileSystem(format!("scan {}: {}", path.display(), e)))?;
 
     for entry in entries {
-        if files.len() >= max_files {
-            *truncated = true;
+        if scan.files.len() >= max_files {
+            scan.truncated = true;
             break;
         }
 
@@ -2913,27 +2858,21 @@ fn scan_folder_recursive_inner(
         if should_ignore_sync_path(&entry_path, root, exclude_patterns) {
             continue;
         }
+        let rel = entry_path
+            .strip_prefix(root)
+            .unwrap_or(&entry_path)
+            .to_path_buf();
         if entry_path.is_dir() {
-            scan_folder_recursive_inner(
-                root,
-                &entry_path,
-                exclude_patterns,
-                max_files,
-                files,
-                truncated,
-            )?;
+            scan.folders.push(rel);
+            scan_folder_recursive_inner(root, &entry_path, exclude_patterns, max_files, scan)?;
         } else if entry_path.is_file() {
-            let rel = entry_path
-                .strip_prefix(root)
-                .unwrap_or(&entry_path)
-                .to_path_buf();
             let size = entry
                 .metadata()
                 .map_err(|e| {
                     CoreError::FileSystem(format!("metadata {}: {}", entry_path.display(), e))
                 })?
                 .len();
-            files.push((rel, size));
+            scan.files.push((rel, size));
         }
     }
     Ok(())
@@ -3228,6 +3167,115 @@ mod tests {
         assert!(names.contains(&"b.txt".to_string()));
         assert!(names.contains(&"nested/c.txt".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_events_get_one_created_event_per_entry_inside() {
+        let root =
+            std::env::temp_dir().join(format!("s4drive-test-expand-{}", uuid::Uuid::now_v7()));
+        let album = root.join("album");
+        std::fs::create_dir_all(album.join("2024")).unwrap();
+        std::fs::create_dir_all(root.join(".s4drive").join("trash")).unwrap();
+        std::fs::write(album.join("cover.jpg"), b"cover").unwrap();
+        std::fs::write(album.join("2024").join("one.jpg"), b"one").unwrap();
+        let text = |path: PathBuf| path.to_string_lossy().to_string();
+        let loose_file = text(root.join("loose.txt"));
+        let sync_folder = text(root.clone());
+
+        let events = vec![
+            FsEvent::Renamed {
+                from: text(root.join("photos")),
+                to: text(album.clone()),
+            },
+            FsEvent::Created(text(root.join(".s4drive").join("trash"))),
+            FsEvent::Modified(loose_file.clone()),
+        ];
+        let expanded: Vec<(&str, String)> = expand_folder_events(events, &sync_folder, &[])
+            .iter()
+            .map(|event| (event.event_type(), event.path().to_string()))
+            .collect();
+
+        assert_eq!(expanded[0], ("renamed", text(album.clone())));
+        assert_eq!(expanded[1], ("created", text(album.join("2024"))));
+        let mut files: Vec<String> = expanded[2..4].iter().map(|(_, p)| p.clone()).collect();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                text(album.join("2024").join("one.jpg")),
+                text(album.join("cover.jpg"))
+            ]
+        );
+        assert!(expanded[2..4].iter().all(|(kind, _)| *kind == "created"));
+        assert_eq!(
+            expanded[4].0, "created",
+            "an ignored folder is kept but not scanned"
+        );
+        assert_eq!(expanded[5], ("modified", loose_file));
+        assert_eq!(expanded.len(), 6);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_moved_in_later_in_the_batch_is_left_to_its_move() {
+        // Regression: the scan of "album" saw "pictures" moved in by a later
+        // event, and its files came as new files before the move.
+        let root =
+            std::env::temp_dir().join(format!("s4drive-test-moved-in-{}", uuid::Uuid::now_v7()));
+        let pictures = root.join("album").join("pictures");
+        std::fs::create_dir_all(&pictures).unwrap();
+        std::fs::write(root.join("album").join("cover.jpg"), b"cover").unwrap();
+        std::fs::write(pictures.join("one.jpg"), b"one").unwrap();
+        let text = |path: PathBuf| path.to_string_lossy().to_string();
+
+        let events = vec![
+            FsEvent::Created(text(root.join("album"))),
+            FsEvent::Renamed {
+                from: text(root.join("pictures")),
+                to: text(pictures.clone()),
+            },
+        ];
+        let expanded: Vec<(&str, String)> = expand_folder_events(events, &text(root.clone()), &[])
+            .iter()
+            .map(|event| (event.event_type(), event.path().to_string()))
+            .collect();
+
+        assert_eq!(
+            expanded,
+            [
+                ("created", text(root.join("album"))),
+                ("created", text(root.join("album").join("cover.jpg"))),
+                ("renamed", text(pictures.clone())),
+                ("created", text(pictures.join("one.jpg"))),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deletes_inside_a_deleted_folder_are_dropped() {
+        let deleted = |path: &str| FsEvent::Deleted(path.to_string());
+        let events = vec![
+            deleted("/s/photos/2024/one.jpg"),
+            deleted("/s/photos/2024"),
+            deleted("/s/photos2/other.jpg"),
+            FsEvent::Created("/s/photos/new.jpg".to_string()),
+            deleted("/s/photos"),
+        ];
+
+        let kept: Vec<String> = drop_deletes_inside_deleted_folders(events)
+            .iter()
+            .map(|event| format!("{} {}", event.event_type(), event.path()))
+            .collect();
+
+        assert_eq!(
+            kept,
+            [
+                "deleted /s/photos2/other.jpg",
+                "created /s/photos/new.jpg",
+                "deleted /s/photos"
+            ]
+        );
     }
 
     #[test]

@@ -1,17 +1,17 @@
 //! S4Drive Tauri desktop shell: tray-first window lifecycle and IPC bridge.
 
 use s4drive_core::{
-    config::{default_exclude_patterns, Config},
+    config::{default_device_name, default_exclude_patterns, Config},
     credentials::{resolve_secret, CredentialStore},
     db::{ConflictRecord, LocalDatabase, RevisionRecord},
     metadata::{
-        blobs::BlobStore, engine::MetadataEngine, ops::OperationLog, tree::FileTree,
-        validator::Validator,
+        blobs::BlobStore, engine::MetadataEngine, ops::OperationLog, placement::Placement,
+        tree::FileTree, validator::Validator,
     },
     s3::S3Adapter,
     sync::{
-        scan_folder_recursive_bounded, ActivityLog, ConflictEngine, ConflictResolution, SyncEngine,
-        SyncState, VersionApi,
+        folders::FolderNodes, scan_folder_recursive_bounded, ActivityLog, ConflictEngine,
+        ConflictResolution, SyncEngine, SyncState, VersionApi,
     },
     transfer::TransferQueue,
     watcher::FileWatcher,
@@ -1960,6 +1960,7 @@ async fn register_pending_upload_for_path(
         .map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_local_conflict_winner(
     s3: &S3Adapter,
     db: &LocalDatabase,
@@ -1967,6 +1968,7 @@ async fn commit_local_conflict_winner(
     file_id: uuid::Uuid,
     local_path: &Path,
     remote_path: &str,
+    placement: &Placement,
     conflict_id: &str,
 ) -> Result<u64, String> {
     let blob_store = BlobStore::new(s3);
@@ -2009,8 +2011,8 @@ async fn commit_local_conflict_winner(
         Effects {
             new_revision_id: Some(revision_id),
             new_content_ref: Some(content_ref.clone()),
-            new_name: Some(remote_path.to_string()),
-            new_parent_id: None,
+            new_name: Some(placement.name.clone()),
+            new_parent_id: placement.parent_id,
             deleted: false,
         },
     )
@@ -2032,12 +2034,9 @@ async fn commit_local_conflict_winner(
     }
     let entry = FileEntry {
         file_id,
-        parent_id: remote_entry
-            .as_ref()
-            .and_then(|entry| entry.parent_id)
-            .or_else(|| local_entry.as_ref().and_then(|entry| entry.parent_id)),
-        name: remote_path.to_string(),
-        normalized_name: Validator::normalize_name(remote_path).to_lowercase(),
+        parent_id: placement.parent_id,
+        name: placement.name.clone(),
+        normalized_name: Validator::normalize_name(&placement.name).to_lowercase(),
         entry_type: EntryType::File,
         current_revision_id: Some(revision_id),
         content_ref: Some(content_ref.clone()),
@@ -2972,14 +2971,16 @@ async fn run_sync_now_with_options(
     set_sync_detail(&app, state, "Preparing metadata");
     let metadata = MetadataEngine::new(s3.clone(), device_id);
     let mut bucket_initialized = false;
+    let device_name = config
+        .core
+        .device_name
+        .clone()
+        .unwrap_or_else(default_device_name);
     if !metadata
         .check_initialized()
         .await
         .map_err(|e| e.to_string())?
     {
-        let device_name = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "desktop".to_string());
         metadata
             .init_bucket(&device_name)
             .await
@@ -3004,6 +3005,7 @@ async fn run_sync_now_with_options(
         config.sync_folder.max_concurrent_downloads,
         &config.sync_folder.exclude_patterns,
         config.maintenance.clone(),
+        &device_name,
     );
 
     if !mark_sync_requested(&app, state, notify_user) {
@@ -3409,6 +3411,11 @@ async fn resolve_conflict(
                     ));
                 }
             }
+            let sync_folder = ensure_sync_folder(&settings)?.to_string_lossy().to_string();
+            let placement = FolderNodes::new(&s3, &db, device_id, &sync_folder)
+                .placement_for(&remote_path)
+                .await
+                .map_err(|e| e.to_string())?;
             commit_local_conflict_winner(
                 &s3,
                 &db,
@@ -3416,6 +3423,7 @@ async fn resolve_conflict(
                 file_id,
                 &local_path,
                 &remote_path,
+                &placement,
                 &conflict_id,
             )
             .await?;

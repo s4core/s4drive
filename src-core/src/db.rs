@@ -8,6 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 const LOCAL_DEVICE_ID_CHECKPOINT: &str = "local_device_id";
+/// SQL condition for rows that still exist on this device.
+const LIVE_ROW: &str = "state NOT IN ('deleted_locally', 'deleted_remotely', 'ignored')";
+/// SQL condition for rows at `?1` or inside it; `?2` is `?1` plus a separator.
+/// substr instead of LIKE: paths may contain % and _.
+const AT_OR_UNDER: &str = "(local_path = ?1 OR substr(local_path, 1, length(?2)) = ?2)";
 
 /// Local SQLite database for metadata index and transfer queue.
 #[derive(Clone)]
@@ -23,6 +28,16 @@ pub struct LocalFileSnapshot {
     pub local_hash: Option<String>,
     pub local_mtime: Option<String>,
     pub state: String,
+}
+
+/// A live folder in the local index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedFolder {
+    pub file_id: uuid::Uuid,
+    pub parent_id: Option<uuid::Uuid>,
+    pub local_path: String,
+    /// Path relative to the sync folder, `/`-separated.
+    pub remote_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +296,9 @@ impl LocalDatabase {
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         let result = conn.query_row(
             "SELECT file_id, size, local_hash, local_mtime, state
-             FROM objects WHERE local_path = ?1",
+             FROM objects WHERE local_path = ?1 AND is_folder = 0
+             ORDER BY state IN ('deleted_locally', 'deleted_remotely'), id DESC
+             LIMIT 1",
             rusqlite::params![local_path],
             |row| {
                 Ok(LocalFileSnapshot {
@@ -649,7 +666,8 @@ impl LocalDatabase {
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM objects
-                 WHERE state NOT IN ('deleted_locally', 'deleted_remotely', 'ignored')",
+                 WHERE is_folder = 0
+                   AND state NOT IN ('deleted_locally', 'deleted_remotely', 'ignored')",
                 [],
                 |row| row.get(0),
             )
@@ -1213,6 +1231,9 @@ impl LocalDatabase {
     // ─── Extended File Operations (Phase 4) ────────────────────────
 
     /// Find a file by its full local path.
+    ///
+    /// A deleted file can share its old path with a newer one: the live file
+    /// wins, and a deleted one is returned only when nothing else is there.
     pub fn get_file_by_local_path(&self, local_path: &str) -> CoreResult<Option<FileEntry>> {
         let conn = self
             .conn
@@ -1222,7 +1243,9 @@ impl LocalDatabase {
             .prepare(
                 "SELECT file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
                         current_revision_id, local_hash, created_at, updated_at
-                 FROM objects WHERE local_path = ?1",
+                 FROM objects WHERE local_path = ?1 AND is_folder = 0
+                 ORDER BY state IN ('deleted_locally', 'deleted_remotely'), id DESC
+                 LIMIT 1",
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
 
@@ -1233,6 +1256,248 @@ impl LocalDatabase {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(CoreError::Database(e.to_string())),
         }
+    }
+
+    /// Live files inside a folder (at any depth), with their local paths.
+    pub fn live_files_under(&self, folder: &str) -> CoreResult<Vec<(FileEntry, String)>> {
+        let prefix = subtree_prefix(folder);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        // substr instead of LIKE: paths may contain % and _.
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
+                        current_revision_id, local_hash, created_at, updated_at
+                 FROM objects
+                 WHERE substr(local_path, 1, length(?1)) = ?1
+                   AND is_folder = 0
+                   AND state NOT IN ('deleted_locally', 'deleted_remotely', 'ignored')
+                 ORDER BY local_path",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix], |row| {
+                Ok((file_entry_from_index_row(row)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row.map_err(|e| CoreError::Database(e.to_string()))?);
+        }
+        Ok(files)
+    }
+
+    /// The live folder with this id.
+    pub fn folder_by_id(&self, file_id: &uuid::Uuid) -> CoreResult<Option<IndexedFolder>> {
+        self.query_folders(
+            &format!("file_id = ?1 AND is_folder = 1 AND {}", LIVE_ROW),
+            rusqlite::params![file_id.to_string()],
+        )
+        .map(|folders| folders.into_iter().next())
+    }
+
+    /// The live folder at a path relative to the sync folder.
+    pub fn folder_at(&self, remote_path: &str) -> CoreResult<Option<IndexedFolder>> {
+        self.query_folders(
+            &format!("s3_key = ?1 AND is_folder = 1 AND {}", LIVE_ROW),
+            rusqlite::params![remote_path],
+        )
+        .map(|folders| folders.into_iter().next())
+    }
+
+    /// Live folders inside a folder (at any depth), without the folder itself.
+    pub fn live_folders_under(&self, folder: &str) -> CoreResult<Vec<IndexedFolder>> {
+        self.query_folders(
+            &format!(
+                "substr(local_path, 1, length(?1)) = ?1 AND is_folder = 1 AND {}",
+                LIVE_ROW
+            ),
+            rusqlite::params![subtree_prefix(folder)],
+        )
+    }
+
+    fn query_folders(
+        &self,
+        condition: &str,
+        params: impl rusqlite::Params,
+    ) -> CoreResult<Vec<IndexedFolder>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT file_id, parent_file_id, local_path, s3_key FROM objects
+                 WHERE {} ORDER BY local_path",
+                condition
+            ))
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params, |row| {
+                Ok(IndexedFolder {
+                    file_id: parse_uuid_column(row.get::<_, String>(0)?, 0)?,
+                    parent_id: parse_optional_uuid_column(row.get::<_, Option<String>>(1)?, 1)?,
+                    local_path: row.get::<_, String>(2)?,
+                    remote_path: row.get::<_, String>(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    /// The live file or folder at a path relative to the sync folder.
+    pub fn live_entry_at(&self, remote_path: &str) -> CoreResult<Option<uuid::Uuid>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let result = conn.query_row(
+            &format!(
+                "SELECT file_id FROM objects WHERE s3_key = ?1 AND {} LIMIT 1",
+                LIVE_ROW
+            ),
+            rusqlite::params![remote_path],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(id) => parse_uuid_column(id, 0)
+                .map(Some)
+                .map_err(|e| CoreError::Database(e.to_string())),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CoreError::Database(e.to_string())),
+        }
+    }
+
+    /// Index a folder that exists in the bucket.
+    pub fn register_folder(&self, folder: &IndexedFolder) -> CoreResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let placement = crate::metadata::placement::Placement::new(
+            folder.parent_id,
+            crate::metadata::placement::split_path(&folder.remote_path).1,
+        );
+        let entry = crate::metadata::placement::folder_entry(folder.file_id, &placement, &now);
+        self.upsert_file_index(&entry, &folder.local_path, &folder.remote_path, "synced")
+    }
+
+    pub fn set_parent(
+        &self,
+        file_id: &uuid::Uuid,
+        parent_id: Option<uuid::Uuid>,
+    ) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE objects SET parent_file_id = ?2 WHERE file_id = ?1",
+            rusqlite::params![file_id.to_string(), parent_id.map(|id| id.to_string())],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Point everything at or inside `from` to the same place under `to`, in
+    /// the index and in pending transfers, after the folder was moved on disk.
+    pub fn move_subtree(
+        &self,
+        from_local: &str,
+        to_local: &str,
+        from_remote: &str,
+        to_remote: &str,
+    ) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let params = rusqlite::params![
+            from_local,
+            subtree_prefix(from_local),
+            to_local,
+            from_remote,
+            format!("{}/", from_remote),
+            to_remote
+        ];
+        let remote_key = "CASE WHEN s3_key = ?4 OR substr(s3_key, 1, length(?5)) = ?5
+                               THEN ?6 || substr(s3_key, length(?4) + 1)
+                               ELSE s3_key END";
+        tx.execute(
+            &format!(
+                "UPDATE objects
+                 SET local_path = ?3 || substr(local_path, length(?1) + 1),
+                     s3_key = {},
+                     updated_at = datetime('now')
+                 WHERE {} AND state NOT IN ('deleted_locally', 'deleted_remotely')",
+                remote_key, AT_OR_UNDER
+            ),
+            params,
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        // A download job keeps the blob key in s3_key; only uploads carry a path.
+        tx.execute(
+            &format!(
+                "UPDATE transfer_queue
+                 SET local_path = ?3 || substr(local_path, length(?1) + 1),
+                     s3_key = CASE WHEN direction = 'upload' THEN {} ELSE s3_key END,
+                     updated_at = datetime('now')
+                 WHERE {} AND status IN ('queued', 'in_progress', 'paused', 'failed')",
+                remote_key, AT_OR_UNDER
+            ),
+            params,
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.commit().map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    /// Mark everything at or inside a folder as deleted and cancel its
+    /// transfers. Returns how many rows were marked.
+    pub fn mark_subtree_deleted(&self, folder: &str, state: &str) -> CoreResult<u64> {
+        self.mark_deleted_where(folder, state, "")
+    }
+
+    /// Mark a folder and the folders inside it as deleted, leaving files.
+    pub fn mark_folders_deleted(&self, folder: &str, state: &str) -> CoreResult<u64> {
+        self.mark_deleted_where(folder, state, "AND is_folder = 1")
+    }
+
+    fn mark_deleted_where(&self, folder: &str, state: &str, extra: &str) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = format!("{} AND {} {}", AT_OR_UNDER, LIVE_ROW, extra);
+        tx.execute(
+            &format!(
+                "UPDATE transfer_queue
+                 SET status = 'failed', error_message = 'folder deleted', updated_at = datetime('now')
+                 WHERE status IN ('queued', 'in_progress', 'paused')
+                   AND file_id IN (SELECT file_id FROM objects WHERE {})",
+                rows
+            ),
+            rusqlite::params![folder, subtree_prefix(folder)],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        let marked = tx
+            .execute(
+                &format!(
+                    "UPDATE objects SET state = ?3, updated_at = datetime('now') WHERE {}",
+                    rows
+                ),
+                rusqlite::params![folder, subtree_prefix(folder), state],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(marked as u64)
     }
 
     pub fn get_local_path(&self, file_id: &uuid::Uuid) -> CoreResult<Option<String>> {
@@ -1511,7 +1776,7 @@ impl LocalDatabase {
             ],
         ) {
             Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(err, _))
+            Err(rusqlite::Error::SqliteFailure(err, message))
                 if err.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
                 let existing = conn.query_row(
@@ -1536,15 +1801,20 @@ impl LocalDatabase {
                         })
                     },
                 );
-                if let Ok(existing) = existing {
-                    if existing.same_revision_content(rev) {
-                        return Ok(());
-                    }
-                }
-                return Err(CoreError::Conflict(format!(
-                    "revision id already exists with different content: {}",
-                    rev.revision_id
-                )));
+                return match existing {
+                    Ok(existing) if existing.same_revision_content(rev) => Ok(()),
+                    Ok(_) => Err(CoreError::Conflict(format!(
+                        "revision id already exists with different content: {}",
+                        rev.revision_id
+                    ))),
+                    // No row with this id: another constraint failed, such as
+                    // a revision of a file that is not in `objects` yet.
+                    Err(_) => Err(CoreError::Database(format!(
+                        "insert revision {}: {}",
+                        rev.revision_id,
+                        message.unwrap_or_else(|| err.to_string())
+                    ))),
+                };
             }
             Err(e) => return Err(CoreError::Database(e.to_string())),
         }
@@ -1984,6 +2254,15 @@ fn parse_optional_uuid_column(
     value
         .map(|value| parse_uuid_column(value, column))
         .transpose()
+}
+
+/// `folder` with one trailing separator: the common start of paths inside it.
+fn subtree_prefix(folder: &str) -> String {
+    format!(
+        "{}{}",
+        folder.trim_end_matches(std::path::MAIN_SEPARATOR),
+        std::path::MAIN_SEPARATOR
+    )
 }
 
 fn entry_name_from_paths(local_path: &str, s3_key: &str) -> String {
@@ -2616,6 +2895,222 @@ mod tests {
             db.insert_revision(&conflicting),
             Err(CoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn get_file_by_local_path_prefers_the_live_file() {
+        // Regression: a deleted row at the same path used to win, and a delete
+        // of the live file then tombstoned the deleted one on every pass.
+        let db = test_db();
+        let deleted = file_entry("report.md", 1);
+        let live = file_entry("report.md", 2);
+        db.register_local_file_at_path(&deleted, "/sync/report.md", "report.md")
+            .unwrap();
+        db.mark_file_deleted(&deleted.file_id).unwrap();
+        db.register_local_file_at_path(&live, "/sync/report.md", "report.md")
+            .unwrap();
+
+        let found = db
+            .get_file_by_local_path("/sync/report.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.file_id, live.file_id);
+
+        db.mark_file_deleted(&live.file_id).unwrap();
+        let found = db.get_file_by_local_path("/sync/report.md").unwrap();
+        assert!(found.is_some(), "a deleted file is still found by its path");
+    }
+
+    #[test]
+    fn live_files_under_lists_only_live_files_inside_the_folder() {
+        let db = test_db();
+        let sep = std::path::MAIN_SEPARATOR;
+        let path = |parts: &[&str]| parts.join(&sep.to_string());
+        let nested = file_entry("photos/2024/one.jpg", 1);
+        let direct = file_entry("photos/100%_two.jpg", 1);
+        let deleted = file_entry("photos/old.jpg", 1);
+        let sibling = file_entry("photos2/other.jpg", 1);
+        for (entry, local) in [
+            (&nested, path(&["", "s", "photos", "2024", "one.jpg"])),
+            (&direct, path(&["", "s", "photos", "100%_two.jpg"])),
+            (&deleted, path(&["", "s", "photos", "old.jpg"])),
+            (&sibling, path(&["", "s", "photos2", "other.jpg"])),
+        ] {
+            db.register_local_file_at_path(entry, &local, &entry.name)
+                .unwrap();
+        }
+        db.mark_file_deleted(&deleted.file_id).unwrap();
+
+        let found: Vec<_> = db
+            .live_files_under(&path(&["", "s", "photos"]))
+            .unwrap()
+            .into_iter()
+            .map(|(entry, _)| entry.file_id)
+            .collect();
+        assert_eq!(found, [direct.file_id, nested.file_id]);
+    }
+
+    fn local(parts: &[&str]) -> String {
+        parts.join(std::path::MAIN_SEPARATOR_STR)
+    }
+
+    fn folder(db: &LocalDatabase, remote_path: &str) -> IndexedFolder {
+        let mut parts = vec!["", "s"];
+        parts.extend(remote_path.split('/'));
+        let folder = IndexedFolder {
+            file_id: uuid::Uuid::now_v7(),
+            parent_id: None,
+            local_path: local(&parts),
+            remote_path: remote_path.to_string(),
+        };
+        db.register_folder(&folder).unwrap();
+        folder
+    }
+
+    #[test]
+    fn folders_are_found_by_path_but_not_as_files() {
+        let db = test_db();
+        let photos = folder(&db, "photos");
+        db.register_local_file_at_path(
+            &file_entry("a.txt", 1),
+            &local(&["", "s", "a.txt"]),
+            "a.txt",
+        )
+        .unwrap();
+
+        assert_eq!(db.folder_at("photos").unwrap(), Some(photos.clone()));
+        assert_eq!(
+            db.folder_by_id(&photos.file_id).unwrap(),
+            Some(photos.clone())
+        );
+        assert_eq!(db.live_entry_at("photos").unwrap(), Some(photos.file_id));
+        assert!(db
+            .get_file_by_local_path(&photos.local_path)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.count_live_objects().unwrap(),
+            1,
+            "folders are not counted as files"
+        );
+
+        db.mark_subtree_deleted(&photos.local_path, "deleted_locally")
+            .unwrap();
+        assert!(db.folder_at("photos").unwrap().is_none());
+    }
+
+    #[test]
+    fn move_subtree_moves_rows_and_pending_transfers_inside_the_folder_only() {
+        let db = test_db();
+        let photos = folder(&db, "photos");
+        let year = folder(&db, "photos/2024");
+        let inside = file_entry("one.jpg", 1);
+        let inside_path = local(&["", "s", "photos", "2024", "one.jpg"]);
+        let sibling = file_entry("other.jpg", 1);
+        let sibling_path = local(&["", "s", "photos2", "other.jpg"]);
+        db.register_local_file_at_path(&inside, &inside_path, "photos/2024/one.jpg")
+            .unwrap();
+        db.register_local_file_at_path(&sibling, &sibling_path, "photos2/other.jpg")
+            .unwrap();
+        let id = |entry: &FileEntry| entry.file_id.to_string();
+        db.enqueue_transfer(
+            "upload",
+            &id(&inside),
+            &inside_path,
+            "photos/2024/one.jpg",
+            1,
+        )
+        .unwrap();
+        db.enqueue_transfer("download", &id(&sibling), &sibling_path, "blobs/ab/abc", 1)
+            .unwrap();
+
+        db.move_subtree(
+            &photos.local_path,
+            &local(&["", "s", "pictures"]),
+            "photos",
+            "pictures",
+        )
+        .unwrap();
+
+        let moved_path = local(&["", "s", "pictures", "2024", "one.jpg"]);
+        assert_eq!(
+            db.get_local_path(&inside.file_id).unwrap(),
+            Some(moved_path.clone())
+        );
+        assert_eq!(
+            db.get_s3_key(&inside.file_id).unwrap().as_deref(),
+            Some("pictures/2024/one.jpg")
+        );
+        assert_eq!(
+            db.folder_at("pictures/2024").unwrap().unwrap().file_id,
+            year.file_id
+        );
+        assert!(db.folder_at("photos").unwrap().is_none());
+        assert_eq!(
+            db.get_local_path(&sibling.file_id).unwrap(),
+            Some(sibling_path.clone())
+        );
+
+        let upload = &db.get_pending_transfers("upload", 10).unwrap()[0];
+        assert_eq!(
+            (upload.local_path.as_str(), upload.s3_key.as_str()),
+            (moved_path.as_str(), "pictures/2024/one.jpg")
+        );
+        let download = &db.get_pending_transfers("download", 10).unwrap()[0];
+        assert_eq!(download.local_path, sibling_path);
+    }
+
+    #[test]
+    fn mark_subtree_deleted_cancels_transfers_inside_the_folder() {
+        let db = test_db();
+        let photos = folder(&db, "photos");
+        let inside = file_entry("one.jpg", 1);
+        let inside_path = local(&["", "s", "photos", "one.jpg"]);
+        let outside = file_entry("two.jpg", 1);
+        let outside_path = local(&["", "s", "two.jpg"]);
+        for (entry, path) in [(&inside, &inside_path), (&outside, &outside_path)] {
+            db.register_local_file_at_path(entry, path, &entry.name)
+                .unwrap();
+            db.enqueue_transfer("upload", &entry.file_id.to_string(), path, &entry.name, 1)
+                .unwrap();
+        }
+
+        let marked = db
+            .mark_subtree_deleted(&photos.local_path, "deleted_remotely")
+            .unwrap();
+
+        assert_eq!(marked, 2, "the folder and the file inside");
+        assert_eq!(
+            db.get_object_state(&inside.file_id).unwrap().as_deref(),
+            Some("deleted_remotely")
+        );
+        let pending = db.get_pending_transfers("upload", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].file_id, outside.file_id.to_string());
+    }
+
+    #[test]
+    fn insert_revision_of_unknown_file_reports_the_real_constraint() {
+        // Regression: this used to read "revision id already exists" and the
+        // sync loop, treating it as a conflict, stopped at it on every pass.
+        let db = test_db();
+        let revision = RevisionRecord {
+            revision_id: uuid::Uuid::now_v7().to_string(),
+            file_id: uuid::Uuid::now_v7().to_string(),
+            parent_revision_id: None,
+            content_hash: Some("blake3:abc".to_string()),
+            size: 10,
+            mime: None,
+            author_device_id: "device-1".to_string(),
+            author_name: "Device".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            merge_state: "clean".to_string(),
+            conflict_revision_id: None,
+        };
+
+        let err = db.insert_revision(&revision).unwrap_err();
+        assert!(matches!(err, CoreError::Database(_)), "{err}");
+        assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
     }
 
     #[test]

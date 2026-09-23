@@ -2,14 +2,14 @@ use crate::error::{CoreError, CoreResult};
 use crate::metadata::serializer::Serializer;
 use crate::metadata::types::*;
 use crate::metadata::validator::Validator;
-use crate::s3::S3Adapter;
+use crate::s3::{S3Adapter, S3ObjectStore};
 
 /// File Tree — CRUD для файлов/папок в `.s4drive/meta/tree/`.
 ///
 /// Каждый файл/папка хранится как отдельный JSON-объект
 /// в `.s4drive/meta/tree/{file_id}.json`.
-pub struct FileTree<'a> {
-    s3: &'a S3Adapter,
+pub struct FileTree<'a, S: S3ObjectStore + ?Sized = S3Adapter> {
+    s3: &'a S,
 }
 
 #[derive(Debug, Clone)]
@@ -26,31 +26,29 @@ pub struct TombstonePage {
     pub is_truncated: bool,
 }
 
-impl<'a> FileTree<'a> {
-    pub fn new(s3: &'a S3Adapter) -> Self {
+fn tree_entry_key(file_id: &FileId) -> String {
+    format!(".s4drive/meta/tree/{}.json", file_id)
+}
+
+const TREE_PREFIX: &str = ".s4drive/meta/tree/";
+
+impl<'a, S: S3ObjectStore + ?Sized> FileTree<'a, S> {
+    pub fn new(s3: &'a S) -> Self {
         Self { s3 }
-    }
-
-    fn entry_key(file_id: &FileId) -> String {
-        format!(".s4drive/meta/tree/{}.json", file_id)
-    }
-
-    fn tree_prefix() -> String {
-        ".s4drive/meta/tree/".to_string()
     }
 
     /// Создать или обновить запись файла/папки.
     pub async fn upsert_entry(&self, entry: &FileEntry) -> CoreResult<()> {
         Validator::validate_file_entry(entry)?;
         let json = Serializer::serialize_file_entry(entry)?;
-        let key = Self::entry_key(&entry.file_id);
-        self.s3.put_metadata(&key, &json).await?;
+        let key = tree_entry_key(&entry.file_id);
+        self.s3.put_object(&key, json.into_bytes()).await?;
         Ok(())
     }
 
     /// Прочитать запись файла/папки.
     pub async fn get_entry(&self, file_id: &FileId) -> CoreResult<FileEntry> {
-        let key = Self::entry_key(file_id);
+        let key = tree_entry_key(file_id);
         let data = self.s3.get_object(&key).await?;
         let text =
             String::from_utf8(data).map_err(|e| CoreError::Protocol(format!("UTF-8: {}", e)))?;
@@ -61,17 +59,24 @@ impl<'a> FileTree<'a> {
     /// Удалить запись из materialized tree.
     /// Tombstone creation is handled by `TombstoneManager`.
     pub async fn delete_entry(&self, file_id: &FileId) -> CoreResult<()> {
-        let key = Self::entry_key(file_id);
+        let key = tree_entry_key(file_id);
         self.s3.delete_object(&key).await
     }
 
     /// Список всех file_id в дереве.
     pub async fn list_entries(&self) -> CoreResult<Vec<FileId>> {
-        let keys = self.s3.list_objects(&Self::tree_prefix()).await?;
+        let keys = self.s3.list_objects(TREE_PREFIX).await?;
         let ids: Vec<FileId> = keys.iter().filter_map(|k| tree_key_to_file_id(k)).collect();
         Ok(ids)
     }
 
+    /// Количество записей в дереве.
+    pub async fn entry_count(&self) -> CoreResult<usize> {
+        self.list_entries().await.map(|v| v.len())
+    }
+}
+
+impl<'a> FileTree<'a, S3Adapter> {
     /// One page of file_id values from the materialized tree.
     pub async fn list_entries_page(
         &self,
@@ -80,7 +85,7 @@ impl<'a> FileTree<'a> {
     ) -> CoreResult<FileTreePage> {
         let page = self
             .s3
-            .list_objects_page(&Self::tree_prefix(), None, max_keys, continuation_token)
+            .list_objects_page(TREE_PREFIX, None, max_keys, continuation_token)
             .await?;
         let ids = page
             .keys
@@ -92,11 +97,6 @@ impl<'a> FileTree<'a> {
             next_continuation_token: page.next_continuation_token,
             is_truncated: page.is_truncated,
         })
-    }
-
-    /// Количество записей в дереве.
-    pub async fn entry_count(&self) -> CoreResult<usize> {
-        self.list_entries().await.map(|v| v.len())
     }
 }
 
@@ -111,21 +111,17 @@ fn tree_key_to_file_id(key: &str) -> Option<FileId> {
 /// Tombstone Manager — запись, чтение и GC tombstones.
 ///
 /// Tombstones хранятся в `.s4drive/trash/tombstones/{file_id}.json`.
-pub struct TombstoneManager<'a> {
-    s3: &'a S3Adapter,
+pub struct TombstoneManager<'a, S: S3ObjectStore + ?Sized = S3Adapter> {
+    s3: &'a S,
 }
 
-impl<'a> TombstoneManager<'a> {
-    pub fn new(s3: &'a S3Adapter) -> Self {
+fn tombstone_key(file_id: &FileId) -> String {
+    Serializer::tombstone_key(&file_id.to_string())
+}
+
+impl<'a, S: S3ObjectStore + ?Sized> TombstoneManager<'a, S> {
+    pub fn new(s3: &'a S) -> Self {
         Self { s3 }
-    }
-
-    fn tombstone_key(file_id: &FileId) -> String {
-        Serializer::tombstone_key(&file_id.to_string())
-    }
-
-    fn tombstone_prefix() -> String {
-        Serializer::tombstone_prefix()
     }
 
     /// Создать tombstone для удалённого файла.
@@ -152,8 +148,8 @@ impl<'a> TombstoneManager<'a> {
         };
 
         let json = Serializer::serialize_tombstone(&tombstone)?;
-        let key = Self::tombstone_key(file_id);
-        self.s3.put_metadata(&key, &json).await?;
+        let key = tombstone_key(file_id);
+        self.s3.put_object(&key, json.into_bytes()).await?;
 
         tracing::info!(
             "Tombstone created: file_id={}, retention={}d",
@@ -166,7 +162,7 @@ impl<'a> TombstoneManager<'a> {
 
     /// Прочитать tombstone.
     pub async fn get_tombstone(&self, file_id: &FileId) -> CoreResult<Tombstone> {
-        let key = Self::tombstone_key(file_id);
+        let key = tombstone_key(file_id);
         let data = self.s3.get_object(&key).await?;
         let text =
             String::from_utf8(data).map_err(|e| CoreError::Protocol(format!("UTF-8: {}", e)))?;
@@ -176,39 +172,15 @@ impl<'a> TombstoneManager<'a> {
 
     /// Список всех tombstones.
     pub async fn list_tombstones(&self) -> CoreResult<Vec<FileId>> {
-        let keys = self.s3.list_objects(&Self::tombstone_prefix()).await?;
+        let keys = self
+            .s3
+            .list_objects(&Serializer::tombstone_prefix())
+            .await?;
         let ids: Vec<FileId> = keys
             .iter()
             .filter_map(|k| tombstone_key_to_file_id(k))
             .collect();
         Ok(ids)
-    }
-
-    /// One page of tombstone file_id values.
-    pub async fn list_tombstones_page(
-        &self,
-        continuation_token: Option<&str>,
-        max_keys: i32,
-    ) -> CoreResult<TombstonePage> {
-        let page = self
-            .s3
-            .list_objects_page(
-                &Self::tombstone_prefix(),
-                None,
-                max_keys,
-                continuation_token,
-            )
-            .await?;
-        let ids = page
-            .keys
-            .iter()
-            .filter_map(|key| tombstone_key_to_file_id(key))
-            .collect();
-        Ok(TombstonePage {
-            ids,
-            next_continuation_token: page.next_continuation_token,
-            is_truncated: page.is_truncated,
-        })
     }
 
     /// GC: удалить tombstones у которых истёк retention.
@@ -221,10 +193,10 @@ impl<'a> TombstoneManager<'a> {
             if let Ok(t) = self.get_tombstone(&file_id).await {
                 if let Ok(until) = chrono::DateTime::parse_from_rfc3339(&t.retention_until) {
                     if now > until {
-                        let key = Self::tombstone_key(&file_id);
+                        let key = tombstone_key(&file_id);
                         self.s3.delete_object(&key).await?;
                         // Also clean up tree entry if still present
-                        let tree_key = FileTree::entry_key(&file_id);
+                        let tree_key = tree_entry_key(&file_id);
                         let _ = self.s3.delete_object(&tree_key).await;
                         collected += 1;
                         tracing::debug!("GC collected tombstone: {}", file_id);
@@ -242,6 +214,35 @@ impl<'a> TombstoneManager<'a> {
     }
 }
 
+impl<'a> TombstoneManager<'a, S3Adapter> {
+    /// One page of tombstone file_id values.
+    pub async fn list_tombstones_page(
+        &self,
+        continuation_token: Option<&str>,
+        max_keys: i32,
+    ) -> CoreResult<TombstonePage> {
+        let page = self
+            .s3
+            .list_objects_page(
+                &Serializer::tombstone_prefix(),
+                None,
+                max_keys,
+                continuation_token,
+            )
+            .await?;
+        let ids = page
+            .keys
+            .iter()
+            .filter_map(|key| tombstone_key_to_file_id(key))
+            .collect();
+        Ok(TombstonePage {
+            ids,
+            next_continuation_token: page.next_continuation_token,
+            is_truncated: page.is_truncated,
+        })
+    }
+}
+
 fn tombstone_key_to_file_id(key: &str) -> Option<FileId> {
     key.strip_prefix(".s4drive/trash/tombstones/")
         .and_then(|s| s.strip_suffix(".json"))
@@ -255,7 +256,7 @@ mod tests {
     #[test]
     fn test_entry_key_format() {
         let file_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let key = FileTree::entry_key(&file_id);
+        let key = tree_entry_key(&file_id);
         assert_eq!(
             key,
             ".s4drive/meta/tree/550e8400-e29b-41d4-a716-446655440000.json"
@@ -265,7 +266,7 @@ mod tests {
     #[test]
     fn test_tombstone_key_format() {
         let file_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let key = TombstoneManager::tombstone_key(&file_id);
+        let key = tombstone_key(&file_id);
         assert_eq!(
             key,
             ".s4drive/trash/tombstones/550e8400-e29b-41d4-a716-446655440000.json"

@@ -11,13 +11,17 @@
 /// - RevisionGraph: DAG of file revisions
 /// - Serializer: JSON serialization for all metadata types
 /// - Validator: invariant validation
-pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+///
+/// Schema 2 adds folder nodes (see `placement`). Clients that only know
+/// schema 1 read a v2 bucket wrongly, so the descriptor keeps them out.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 pub mod blobs;
 pub mod compaction;
 pub mod engine;
 pub mod graph;
 pub mod ops;
+pub mod placement;
 pub mod serializer;
 pub mod snapshots;
 pub mod tree;

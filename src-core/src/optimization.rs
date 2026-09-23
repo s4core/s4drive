@@ -124,6 +124,7 @@ pub fn clamp_concurrency(val: u32) -> u32 {
 ///
 /// Phase 8 requires the exact sequence 30s -> 60s -> 120s -> 300s while the
 /// sync loop is idle, and a reset as soon as any local or remote work happens.
+/// Another polling interval scales the same 1 : 2 : 4 : 10 sequence.
 #[derive(Debug, Clone)]
 pub struct IdleBackoff {
     steps: [Duration; 4],
@@ -138,13 +139,14 @@ impl Default for IdleBackoff {
 
 impl IdleBackoff {
     pub fn new() -> Self {
+        Self::with_base(Duration::from_secs(30))
+    }
+
+    /// Backoff whose first (active) delay is `base`, at least one second.
+    pub fn with_base(base: Duration) -> Self {
+        let base = base.max(Duration::from_secs(1));
         Self {
-            steps: [
-                Duration::from_secs(30),
-                Duration::from_secs(60),
-                Duration::from_secs(120),
-                Duration::from_secs(300),
-            ],
+            steps: [base, base * 2, base * 4, base * 10],
             idle_cycles: 0,
         }
     }
@@ -295,6 +297,19 @@ mod tests {
 
         backoff.reset();
         assert_eq!(backoff.next_idle_delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn idle_backoff_scales_the_sequence_to_its_base() {
+        let mut backoff = IdleBackoff::with_base(Duration::from_secs(2));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(2));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(4));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(8));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(20));
+        assert_eq!(backoff.next_idle_delay(), Duration::from_secs(20));
+
+        let zero = IdleBackoff::with_base(Duration::ZERO);
+        assert_eq!(zero.current_delay(), Duration::from_secs(1));
     }
 
     #[test]

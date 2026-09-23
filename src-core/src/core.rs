@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{default_device_name, Config};
 use crate::credentials::{resolve_secret, CredentialStore};
 use crate::db::LocalDatabase;
 use crate::diagnostics::Diagnostics;
@@ -211,7 +211,14 @@ impl S4DriveCore {
                 self.config.sync_folder.max_concurrent_downloads,
                 &self.config.sync_folder.exclude_patterns,
                 self.config.maintenance.clone(),
+                &self
+                    .config
+                    .core
+                    .device_name
+                    .clone()
+                    .unwrap_or_else(default_device_name),
             );
+            sync.set_polling_interval(self.config.sync_folder.polling_interval_sec);
             sync.start().await?;
             self.diagnostics.log("Sync engine started");
         }

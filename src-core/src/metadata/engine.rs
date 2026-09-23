@@ -4,6 +4,9 @@ use crate::metadata::types::*;
 use crate::metadata::validator::Validator;
 use crate::s3::S3Adapter;
 
+/// Descriptor capability of buckets with folder nodes (schema 2).
+pub const FOLDER_NODES_CAPABILITY: &str = "folder_nodes";
+
 /// Metadata Engine — высокоуровневый API для работы с `.s4drive/` в S3.
 ///
 /// Оркестрирует:
@@ -57,6 +60,7 @@ impl MetadataEngine {
                 "conditional_writes".into(),
                 "multipart_upload".into(),
                 "metadata_v1".into(),
+                FOLDER_NODES_CAPABILITY.into(),
             ],
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
         };
@@ -78,20 +82,7 @@ impl MetadataEngine {
             Err(e) => return Err(e),
         }
 
-        // Schema migration marker for protocol v1.
-        let migration = serde_json::json!({
-            "schema_version": crate::metadata::SUPPORTED_SCHEMA_VERSION,
-            "name": "metadata_protocol_v1",
-            "applied_at": chrono::Utc::now().to_rfc3339(),
-            "client_version": env!("CARGO_PKG_VERSION"),
-        });
-        self.s3
-            .put_if_not_exists(
-                &Serializer::schema_migration_key(crate::metadata::SUPPORTED_SCHEMA_VERSION),
-                serde_json::to_vec_pretty(&migration)
-                    .map_err(|e| CoreError::Protocol(e.to_string()))?,
-            )
-            .await?;
+        self.write_migration_marker().await?;
 
         // Device registration.
         let device = self.upsert_device_registration(device_name).await?;
@@ -167,6 +158,69 @@ impl MetadataEngine {
             )
             .await?;
         Ok(device)
+    }
+
+    /// Raise a bucket made by an older client to the current schema, so that
+    /// clients which cannot read it stop at the descriptor. Does nothing for
+    /// an uninitialized or already current bucket.
+    pub async fn upgrade_schema(&self) -> CoreResult<()> {
+        let key = Serializer::descriptor_key();
+        let etag = match self.s3.head_object(&key).await {
+            Ok(meta) => meta.etag,
+            Err(CoreError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut desc = self.read_descriptor().await?;
+        let previous = desc.schema_version;
+        if previous >= crate::metadata::SUPPORTED_SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        desc.schema_version = crate::metadata::SUPPORTED_SCHEMA_VERSION;
+        desc.min_client_version = env!("CARGO_PKG_VERSION").to_string();
+        if !desc
+            .capabilities
+            .iter()
+            .any(|c| c == FOLDER_NODES_CAPABILITY)
+        {
+            desc.capabilities.push(FOLDER_NODES_CAPABILITY.into());
+        }
+        let json = Serializer::serialize_descriptor(&desc)?;
+        if !self.s3.put_if_match(&key, json.into_bytes(), &etag).await? {
+            // Changed since we read it, most likely upgraded by another device.
+            let current = self.read_descriptor().await?;
+            if current.schema_version >= crate::metadata::SUPPORTED_SCHEMA_VERSION {
+                return Ok(());
+            }
+            return Err(CoreError::Conflict(
+                "bucket descriptor changed during the schema upgrade; retry".into(),
+            ));
+        }
+        self.write_migration_marker().await?;
+        tracing::info!(
+            "Bucket metadata upgraded from schema {} to {}",
+            previous,
+            crate::metadata::SUPPORTED_SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    async fn write_migration_marker(&self) -> CoreResult<()> {
+        let version = crate::metadata::SUPPORTED_SCHEMA_VERSION;
+        let migration = serde_json::json!({
+            "schema_version": version,
+            "name": format!("metadata_protocol_v{}", version),
+            "applied_at": chrono::Utc::now().to_rfc3339(),
+            "client_version": env!("CARGO_PKG_VERSION"),
+        });
+        self.s3
+            .put_if_not_exists(
+                &Serializer::schema_migration_key(version),
+                serde_json::to_vec_pretty(&migration)
+                    .map_err(|e| CoreError::Protocol(e.to_string()))?,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Проверить, инициализирован ли бакет.

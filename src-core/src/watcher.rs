@@ -4,6 +4,7 @@ use notify::{
     event::{ModifyKind, RenameMode},
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
+use std::collections::HashSet;
 use std::path::{Component, Path};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -48,40 +49,77 @@ impl FsEvent {
     }
 }
 
+/// What the notify callback sends to the stream.
+///
+/// A rename inside the sync folder arrives as three notify events: the old
+/// path, the new path and the pair. The halves stay distinct here so that the
+/// stream can drop them when the pair follows.
+#[derive(Debug, Clone)]
+enum RawEvent {
+    Ready(FsEvent),
+    RenameFrom(String),
+    RenameTo(String),
+}
+
 /// Thread-safe event stream for polling from the sync engine.
 pub struct FsEventStream {
-    rx: Arc<Mutex<mpsc::Receiver<FsEvent>>>,
-    pending: Vec<FsEvent>,
+    rx: Arc<Mutex<mpsc::Receiver<RawEvent>>>,
+    pending: Vec<RawEvent>,
+    /// Rename halves without their pair in the last drain.
+    held: Vec<RawEvent>,
 }
 
 impl FsEventStream {
     /// Drain all available events without blocking.
+    ///
+    /// A rename half whose pair is in the same drain is dropped. A half
+    /// without a pair waits for one more drain, in case the pair was not
+    /// delivered yet, and then becomes a delete (moved out of the folder) or
+    /// a create (moved in).
     pub fn drain(&mut self) -> Vec<FsEvent> {
-        let mut events = Vec::new();
-        events.append(&mut self.pending);
+        self.receive();
+        let held = std::mem::take(&mut self.held);
+        let fresh = std::mem::take(&mut self.pending);
 
-        if let Ok(rx) = self.rx.lock() {
-            while let Ok(event) = rx.try_recv() {
-                events.push(event);
+        let mut renamed_from = HashSet::new();
+        let mut renamed_to = HashSet::new();
+        for raw in held.iter().chain(&fresh) {
+            if let RawEvent::Ready(FsEvent::Renamed { from, to }) = raw {
+                renamed_from.insert(from.clone());
+                renamed_to.insert(to.clone());
             }
         }
 
+        let mut events = Vec::new();
+        for (raw, waited) in held
+            .into_iter()
+            .map(|raw| (raw, true))
+            .chain(fresh.into_iter().map(|raw| (raw, false)))
+        {
+            match raw {
+                RawEvent::Ready(event) => events.push(event),
+                RawEvent::RenameFrom(path) if renamed_from.contains(&path) => {}
+                RawEvent::RenameTo(path) if renamed_to.contains(&path) => {}
+                RawEvent::RenameFrom(path) if waited => events.push(FsEvent::Deleted(path)),
+                RawEvent::RenameTo(path) if waited => events.push(FsEvent::Created(path)),
+                half => self.held.push(half),
+            }
+        }
         events
     }
 
     /// Return true if at least one event is ready without discarding it.
     pub fn has_pending(&mut self) -> bool {
-        if !self.pending.is_empty() {
-            return true;
-        }
+        self.receive();
+        !self.pending.is_empty() || !self.held.is_empty()
+    }
 
+    fn receive(&mut self) {
         if let Ok(rx) = self.rx.lock() {
             while let Ok(event) = rx.try_recv() {
                 self.pending.push(event);
             }
         }
-
-        !self.pending.is_empty()
     }
 }
 
@@ -113,7 +151,7 @@ impl FileWatcher {
                 .map_err(|e| CoreError::FileSystem(e.to_string()))?;
         }
 
-        let (tx, rx) = mpsc::channel::<FsEvent>();
+        let (tx, rx) = mpsc::channel::<RawEvent>();
 
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
@@ -144,6 +182,7 @@ impl FileWatcher {
             FsEventStream {
                 rx,
                 pending: Vec::new(),
+                held: Vec::new(),
             },
         ))
     }
@@ -166,8 +205,7 @@ impl FileWatcher {
 
         let mut watcher = notify::recommended_watcher(|res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
-                let fs_event = convert_notify_event(&event);
-                if let Some(e) = fs_event {
+                if let Some(RawEvent::Ready(e)) = convert_notify_event(&event) {
                     tracing::debug!("FS event: {} -> {}", e.event_type(), e.path());
                 }
             }
@@ -218,19 +256,19 @@ impl Drop for FileWatcher {
     }
 }
 
-/// Convert a notify event to S4Drive FsEvent.
-fn convert_notify_event(event: &Event) -> Option<FsEvent> {
+/// Convert a notify event to what the stream receives.
+fn convert_notify_event(event: &Event) -> Option<RawEvent> {
     match event.kind {
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
-            return convert_rename_event(event);
+            return convert_rename_event(event).map(RawEvent::Ready);
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
             let path = event.paths.first()?;
-            return visible_event(path, FsEvent::Deleted);
+            return visible_event(path, RawEvent::RenameFrom);
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
             let path = event.paths.first()?;
-            return visible_event(path, FsEvent::Created);
+            return visible_event(path, RawEvent::RenameTo);
         }
         _ => {}
     }
@@ -242,15 +280,16 @@ fn convert_notify_event(event: &Event) -> Option<FsEvent> {
     }
 
     let path_str = path.to_string_lossy().to_string();
-    match event.kind {
-        EventKind::Create(_) => Some(FsEvent::Created(path_str)),
-        EventKind::Modify(_) => Some(FsEvent::Modified(path_str)),
-        EventKind::Remove(_) => Some(FsEvent::Deleted(path_str)),
+    let fs_event = match event.kind {
+        EventKind::Create(_) => FsEvent::Created(path_str),
+        EventKind::Modify(_) => FsEvent::Modified(path_str),
+        EventKind::Remove(_) => FsEvent::Deleted(path_str),
         _ => {
             tracing::debug!("Unhandled fs event kind: {:?}", event.kind);
-            None
+            return None;
         }
-    }
+    };
+    Some(RawEvent::Ready(fs_event))
 }
 
 fn convert_rename_event(event: &Event) -> Option<FsEvent> {
@@ -270,7 +309,7 @@ fn convert_rename_event(event: &Event) -> Option<FsEvent> {
     }
 }
 
-fn visible_event(path: &Path, build: impl FnOnce(String) -> FsEvent) -> Option<FsEvent> {
+fn visible_event(path: &Path, build: impl FnOnce(String) -> RawEvent) -> Option<RawEvent> {
     if should_ignore_path(path) {
         return None;
     }
@@ -356,7 +395,7 @@ mod tests {
             .add_path("/tmp/b.txt".into());
 
         match convert_notify_event(&event).unwrap() {
-            FsEvent::Renamed { from, to } => {
+            RawEvent::Ready(FsEvent::Renamed { from, to }) => {
                 assert_eq!(from, "/tmp/a.txt");
                 assert_eq!(to, "/tmp/b.txt");
             }
@@ -373,19 +412,77 @@ mod tests {
         assert!(convert_notify_event(&event).is_none());
     }
 
-    #[test]
-    fn test_has_pending_does_not_discard_events() {
+    fn stream() -> (mpsc::Sender<RawEvent>, FsEventStream) {
         let (tx, rx) = mpsc::channel();
-        tx.send(FsEvent::Created("/tmp/file.txt".into())).unwrap();
-        let mut stream = FsEventStream {
+        let stream = FsEventStream {
             rx: Arc::new(Mutex::new(rx)),
             pending: Vec::new(),
+            held: Vec::new(),
         };
+        (tx, stream)
+    }
+
+    fn rename(from: &str, to: &str) -> RawEvent {
+        RawEvent::Ready(FsEvent::Renamed {
+            from: from.into(),
+            to: to.into(),
+        })
+    }
+
+    fn kinds(events: &[FsEvent]) -> Vec<(&'static str, &str)> {
+        events.iter().map(|e| (e.event_type(), e.path())).collect()
+    }
+
+    #[test]
+    fn test_has_pending_does_not_discard_events() {
+        let (tx, mut stream) = stream();
+        tx.send(RawEvent::Ready(FsEvent::Created("/tmp/file.txt".into())))
+            .unwrap();
 
         assert!(stream.has_pending());
         let events = stream.drain();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].path(), "/tmp/file.txt");
         assert!(!stream.has_pending());
+    }
+
+    #[test]
+    fn rename_inside_the_folder_is_one_event() {
+        // Regression: the halves used to become a delete and a create, and the
+        // delete removed the renamed file on every device.
+        let (tx, mut stream) = stream();
+        tx.send(RawEvent::RenameFrom("/s/a.txt".into())).unwrap();
+        tx.send(RawEvent::RenameTo("/s/b.txt".into())).unwrap();
+        tx.send(rename("/s/a.txt", "/s/b.txt")).unwrap();
+
+        assert_eq!(kinds(&stream.drain()), [("renamed", "/s/b.txt")]);
+        assert!(!stream.has_pending());
+    }
+
+    #[test]
+    fn rename_split_across_drains_is_still_one_event() {
+        let (tx, mut stream) = stream();
+        tx.send(RawEvent::RenameFrom("/s/a.txt".into())).unwrap();
+        assert!(stream.drain().is_empty());
+
+        tx.send(RawEvent::RenameTo("/s/b.txt".into())).unwrap();
+        tx.send(rename("/s/a.txt", "/s/b.txt")).unwrap();
+        assert_eq!(kinds(&stream.drain()), [("renamed", "/s/b.txt")]);
+        assert!(stream.drain().is_empty());
+    }
+
+    #[test]
+    fn move_out_and_move_in_become_delete_and_create() {
+        let (tx, mut stream) = stream();
+        tx.send(RawEvent::RenameFrom("/s/gone.txt".into())).unwrap();
+        tx.send(RawEvent::RenameTo("/s/new.txt".into())).unwrap();
+
+        // The pair gets one drain to arrive; the loop is woken up for it.
+        assert!(stream.drain().is_empty());
+        assert!(stream.has_pending());
+        assert_eq!(
+            kinds(&stream.drain()),
+            [("deleted", "/s/gone.txt"), ("created", "/s/new.txt")]
+        );
     }
 }

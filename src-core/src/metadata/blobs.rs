@@ -192,6 +192,14 @@ fn blob_id_from_digest(digest: &blake3::Hash) -> BlobId {
     uuid::Uuid::from_bytes(blob_id_bytes)
 }
 
+/// Blob id of a BLAKE3 hash in hex, with or without the `blake3:` prefix.
+pub fn blob_id_from_hash(hash: &str) -> Option<BlobId> {
+    let hex = hash.strip_prefix("blake3:").unwrap_or(hash);
+    blake3::Hash::from_hex(hex)
+        .ok()
+        .map(|digest| blob_id_from_digest(&digest))
+}
+
 pub(crate) async fn hash_file_blake3(path: &Path) -> CoreResult<(blake3::Hash, String, u64)> {
     let mut file = tokio::fs::File::open(path)
         .await
@@ -227,6 +235,19 @@ pub struct BlobStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_id_from_hash_matches_the_stored_blob_id() {
+        let digest = blake3::hash(b"content");
+        let hex = digest.to_hex().to_string();
+        let expected = blob_id_from_digest(&digest);
+        assert_eq!(blob_id_from_hash(&hex), Some(expected));
+        assert_eq!(
+            blob_id_from_hash(&format!("blake3:{}", hex)),
+            Some(expected)
+        );
+        assert_eq!(blob_id_from_hash("blake3:test"), None);
+    }
 
     #[test]
     fn test_blob_key_format() {
