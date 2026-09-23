@@ -4,7 +4,6 @@
 
 | Document | Description |
 |----------|-------------|
-| [MAIN.md](../MAIN.md) | Главный план реализации (Master Plan) |
 | [spec/tech-constitution.md](spec/tech-constitution.md) | Техническая конституция проекта |
 | [spec/product-spec.md](spec/product-spec.md) | Product spec |
 | [spec/reliability-spec.md](spec/reliability-spec.md) | Reliability guarantees |
