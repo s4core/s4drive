@@ -19,6 +19,9 @@ pub fn sync_dir(dir: &Dir) -> CoreResult<()> {
         .map_err(io_error)?
         .sync_all()
         .map_err(io_error)?;
+    // Windows cannot open a directory as a file to flush it.
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 pub fn write_exclusive(dir: &Dir, name: &str, bytes: &[u8]) -> CoreResult<()> {
@@ -82,7 +85,10 @@ pub fn exchange(stage_dir: &Dir, stage: &str, parent: &Dir, name: &str) -> CoreR
         target_os = "macos",
         target_os = "ios"
     )))]
-    Err(CoreError::MutationUnavailable)
+    {
+        let _ = (stage_dir, stage, parent, name);
+        Err(CoreError::MutationUnavailable)
+    }
 }
 
 pub fn move_new(from: &Dir, name: &str, to: &Dir, target: &str) -> CoreResult<()> {
@@ -107,9 +113,12 @@ pub fn move_new(from: &Dir, name: &str, to: &Dir, target: &str) -> CoreResult<()
         target_os = "macos",
         target_os = "ios"
     )))]
-    return Err(CoreError::FileSystem(
-        "Safe folder moves are unavailable on this platform.".into(),
-    ));
+    {
+        let _ = (from, name, to, target);
+        return Err(CoreError::FileSystem(
+            "Safe folder moves are unavailable on this platform.".into(),
+        ));
+    }
     #[allow(unreachable_code)]
     {
         sync_dir(from)?;

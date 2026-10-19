@@ -496,10 +496,10 @@ impl Repository {
         {
             let _from_anchor = atomic::hold_anchor(from)?;
             let _to_anchor = atomic::hold_anchor(to)?;
-            return atomic::move_new_paths(
+            atomic::move_new_paths(
                 &self.local_path(from_relative, from_name),
                 &self.local_path(to_relative, to_name),
-            );
+            )
         }
         #[cfg(not(windows))]
         {
@@ -521,11 +521,11 @@ impl Repository {
             let _parent_anchor = atomic::hold_anchor(parent)?;
             let journal_relative = Self::journal_relative(intent.request_id);
             let parent_relative = Self::parent_relative(&intent.to_relative)?;
-            return atomic::exchange_paths(
+            atomic::exchange_paths(
                 &self.local_path(&journal_relative, "stage"),
                 &self.local_path(parent_relative, name),
                 &self.local_path(&journal_relative, "displaced"),
-            );
+            )
         }
         #[cfg(not(windows))]
         {
@@ -835,11 +835,15 @@ impl Repository {
         &self,
         journal: &Dir,
         parent: &Dir,
+        name: &str,
         intent: &mut MutationIntent,
     ) -> CoreResult<bool> {
         let Some(editor_inode) = &intent.publication_identity else {
             return Ok(false);
         };
+        // Only Windows moves the stage itself; the exchange already did it elsewhere.
+        #[cfg(not(windows))]
+        let _ = name;
         #[cfg(windows)]
         if journal.symlink_metadata("displaced").is_ok()
             && journal.symlink_metadata("stage").is_ok()
@@ -951,7 +955,7 @@ impl Repository {
         self.observe(intent.request_id, Checkpoint::BeforeReplace)?;
         self.exchange_entry(journal, parent, name, intent)?;
         self.observe(intent.request_id, Checkpoint::AfterExchange)?;
-        self.complete_exchange(journal, parent, intent)?;
+        self.complete_exchange(journal, parent, name, intent)?;
         self.observe(intent.request_id, Checkpoint::AfterReplace)?;
         self.preserve_replace_preimage(journal, parent, intent)?;
         self.observe(intent.request_id, Checkpoint::AfterPublish)?;
@@ -1290,7 +1294,7 @@ impl Repository {
         intent: &mut MutationIntent,
     ) -> CoreResult<bool> {
         if matches!(intent.kind, MutationKind::Save)
-            && self.complete_exchange(journal, parent, intent)?
+            && self.complete_exchange(journal, parent, name, intent)?
         {
             self.preserve_replace_preimage(journal, parent, intent)?;
             if self

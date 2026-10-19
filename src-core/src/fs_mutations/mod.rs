@@ -204,6 +204,9 @@ fn publish_checked_stage<T>(
         .map_err(atomic::io_error)?;
     let target_parent = Dir::open_ambient_dir(target_parent_path, cap_std::ambient_authority())
         .map_err(atomic::io_error)?;
+    // Windows moves by path; the names are for the rustix calls.
+    #[cfg(windows)]
+    let _ = target_name;
     #[cfg(windows)]
     let (_stage_anchor, _target_anchor) = (
         atomic::hold_anchor(&stage_parent)?,

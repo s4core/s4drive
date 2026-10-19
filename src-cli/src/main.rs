@@ -2085,15 +2085,15 @@ fn percent_encode(input: &str) -> String {
 fn copy_to_clipboard(text: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        return write_to_command("pbcopy", &[], text);
+        write_to_command("pbcopy", &[], text)
     }
     #[cfg(target_os = "windows")]
     {
-        return write_to_command(
+        write_to_command(
             "powershell",
             &["-NoProfile", "-Command", "Set-Clipboard"],
             text,
-        );
+        )
     }
     #[cfg(target_os = "linux")]
     {

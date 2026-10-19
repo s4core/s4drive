@@ -1040,7 +1040,6 @@ fn extract_backup_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     const INSIDE: &[u8] = b"inside-notes";
     const OUTSIDE: &[u8] = b"outside-private-data";
@@ -1061,7 +1060,9 @@ mod tests {
     }
 
     /// Run `swap` once, after the first scan.
+    #[cfg(unix)]
     fn once(swap: impl Fn()) -> impl Fn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let done = AtomicBool::new(false);
         move || {
             if !done.swap(true, Ordering::SeqCst) {

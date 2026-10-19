@@ -30,8 +30,8 @@ fn smoke_phase3_metadata_protocol() {
 
     let output = String::from_utf8_lossy(&status.stdout);
     assert!(
-        output.contains("Schema version:  1"),
-        "Expected Schema version 1, got: {}",
+        output.contains("Schema version:  2"),
+        "Expected Schema version 2, got: {}",
         output
     );
     assert!(
