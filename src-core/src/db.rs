@@ -1,8 +1,10 @@
 use crate::config::Config;
 use crate::error::{CoreError, CoreResult};
-use crate::metadata::types::FileEntry;
+use crate::metadata::types::{ContentRef, FileAttributes, FileEntry, LockState};
+use crate::notes::types::SaveToken;
 use rusqlite::types::Type;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -13,6 +15,34 @@ const LIVE_ROW: &str = "state NOT IN ('deleted_locally', 'deleted_remotely', 'ig
 /// SQL condition for rows at `?1` or inside it; `?2` is `?1` plus a separator.
 /// substr instead of LIKE: paths may contain % and _.
 const AT_OR_UNDER: &str = "(local_path = ?1 OR substr(local_path, 1, length(?2)) = ?2)";
+/// Unfinished transfers of `?1` follow it to `?2`; an upload also gets the new
+/// key `?3`, a download keeps its blob key.
+const REPOINT_TRANSFERS: &str = "UPDATE transfer_queue
+     SET local_path = ?2,
+         s3_key = CASE WHEN direction = 'upload' THEN ?3 ELSE s3_key END,
+         updated_at = datetime('now')
+     WHERE file_id = ?1 AND status IN ('queued', 'in_progress', 'paused')";
+
+#[derive(Serialize, Deserialize)]
+struct SupplementalEntryMetadata {
+    content_ref: Option<ContentRef>,
+    mime: Option<String>,
+    deleted_at: Option<String>,
+    version_history: Vec<uuid::Uuid>,
+    attributes: FileAttributes,
+    lock_state: LockState,
+}
+fn encode_entry_metadata(entry: &FileEntry) -> CoreResult<String> {
+    serde_json::to_string(&SupplementalEntryMetadata {
+        content_ref: entry.content_ref.clone(),
+        mime: entry.mime.clone(),
+        deleted_at: entry.deleted_at.clone(),
+        version_history: entry.version_history.clone(),
+        attributes: entry.attributes.clone(),
+        lock_state: entry.lock_state.clone(),
+    })
+    .map_err(|e| CoreError::Database(e.to_string()))
+}
 
 /// Local SQLite database for metadata index and transfer queue.
 #[derive(Clone)]
@@ -27,6 +57,8 @@ pub struct LocalFileSnapshot {
     pub size: u64,
     pub local_hash: Option<String>,
     pub local_mtime: Option<String>,
+    /// See [`local_file_key`]; None for entries indexed before it existed.
+    pub local_key: Option<String>,
     pub state: String,
 }
 
@@ -201,6 +233,50 @@ impl LocalDatabase {
             .map_err(|e| CoreError::Database(e.to_string()))?;
         }
 
+        if version < 7 {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.execute_batch(include_str!("../migrations/v007_notes_mutations.sql"))
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (7, datetime('now'))",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
+
+        if version < 8 {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.execute_batch(include_str!("../migrations/v008_notes_durability.sql"))
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (8, datetime('now'))",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
+
+        if version < 9 {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.execute_batch(include_str!("../migrations/v009_local_file_key.sql"))
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (9, datetime('now'))",
+                [],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -241,6 +317,668 @@ impl LocalDatabase {
 
     // ─── File Operations ───────────────────────────────────────────
 
+    pub(crate) fn notes_previous_root(&self) -> CoreResult<Option<uuid::Uuid>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.query_row(
+            "SELECT file_id FROM objects WHERE s3_key = 'Notes' AND is_folder = 1
+             AND NOT EXISTS (SELECT 1 FROM sync_checkpoints WHERE name = 'notes/retired-root/' || objects.file_id)
+             ORDER BY state IN ('deleted_locally', 'deleted_remotely', 'ignored'), id DESC
+             LIMIT 1",
+            [],
+            |row| parse_uuid_column(row.get(0)?, 0),
+        )
+        .optional()
+        .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    pub(crate) fn notes_root_binding(
+        &self,
+        workspace_id: &uuid::Uuid,
+    ) -> CoreResult<Option<uuid::Uuid>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.query_row(
+            "SELECT root_file_id FROM notes_roots WHERE workspace_id = ?1",
+            [workspace_id.to_string()],
+            |row| parse_optional_uuid_column(row.get(0)?, 0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    /// Accept the newly created local directory only after explicit recovery.
+    pub(crate) fn notes_accept_recovered_root(
+        &self,
+        root_id: uuid::Uuid,
+        retire: bool,
+    ) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM sync_checkpoints WHERE name IN
+             (SELECT 'notes/root-identity/' || workspace_id FROM notes_roots WHERE root_file_id = ?1)",
+            [root_id.to_string()],
+        ).map_err(|e| CoreError::Database(e.to_string()))?;
+        if retire {
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_checkpoints (name, value) VALUES (?1, '1')",
+                [format!("notes/retired-root/{root_id}")],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM notes_roots WHERE root_file_id = ?1",
+                [root_id.to_string()],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    pub(crate) fn notes_bind_root(
+        &self,
+        workspace_id: &uuid::Uuid,
+        root_id: uuid::Uuid,
+    ) -> CoreResult<uuid::Uuid> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO notes_roots (workspace_id, root_file_id, availability) VALUES (?1, ?2, 'ready')
+             ON CONFLICT(workspace_id) DO NOTHING",
+            rusqlite::params![workspace_id.to_string(), root_id.to_string()],
+        ).map_err(|e| CoreError::Database(e.to_string()))?;
+        let bound = tx
+            .query_row(
+                "SELECT root_file_id FROM notes_roots WHERE workspace_id = ?1",
+                [workspace_id.to_string()],
+                |row| parse_uuid_column(row.get(0)?, 0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(bound)
+    }
+
+    /// The live rows reachable from `root_id` through `parent_file_id`, root
+    /// first, each with its object key and state. Matching by id instead of by
+    /// key prefix keeps `%`, `_` and sibling names like `Notes2` out.
+    pub(crate) fn notes_root_subtree(
+        &self,
+        root_id: &uuid::Uuid,
+        max_depth: usize,
+    ) -> CoreResult<Vec<(FileEntry, String, String)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "WITH RECURSIVE subtree(file_id, depth) AS (
+                     SELECT file_id, 0 FROM objects
+                     WHERE file_id = ?1 AND is_folder = 1
+                       AND state NOT IN ('deleted_locally', 'deleted_remotely')
+                     UNION
+                     SELECT o.file_id, s.depth + 1 FROM objects o
+                     JOIN subtree s ON o.parent_file_id = s.file_id
+                     WHERE o.state NOT IN ('deleted_locally', 'deleted_remotely')
+                       AND s.depth < ?2
+                 )
+                 SELECT o.file_id, o.local_path, o.s3_key, o.size, o.state, o.is_folder,
+                        o.parent_file_id, o.current_revision_id, o.local_hash, o.created_at,
+                        o.updated_at, o.entry_metadata, o.s3_key, o.state
+                 FROM objects o JOIN subtree s ON o.file_id = s.file_id
+                 GROUP BY o.file_id
+                 ORDER BY MIN(s.depth), o.s3_key",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![root_id.to_string(), max_depth as i64],
+                |row| Ok((file_entry_from_index_row(row)?, row.get(12)?, row.get(13)?)),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    /// Point the Notes root and everything under it at the locators the intent
+    /// planned, together with their pending transfers, in one transaction.
+    /// A row that is neither at its old nor at its new locator means the index
+    /// changed since the intent was written: nothing is applied then.
+    pub(crate) fn notes_project_root_relocation(
+        &self,
+        intent: &crate::fs_mutations::journal::MutationIntent,
+        root: &Path,
+    ) -> CoreResult<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let map = |e: rusqlite::Error| CoreError::Database(e.to_string());
+        let changed = || {
+            CoreError::Conflict(
+                "The Notes index changed while its folder was being restored.".into(),
+            )
+        };
+        let local = |relative: &str| {
+            root.join(relative)
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| CoreError::FileSystem("The note path must be UTF-8".into()))
+        };
+        for identity in &intent.changes {
+            let id = identity.entry.file_id.to_string();
+            let old = intent
+                .baseline
+                .iter()
+                .find(|old| old.entry.file_id == identity.entry.file_id)
+                .ok_or_else(changed)?;
+            let (old_local, new_local) = (local(&old.relative)?, local(&identity.relative)?);
+            let is_root = identity.entry.file_id == intent.root_id;
+            let updated = tx
+                .execute(
+                    "UPDATE objects SET local_path = ?2, s3_key = ?3,
+                         parent_file_id = ?4,
+                         state = CASE WHEN ?6 THEN ?5 ELSE state END,
+                         updated_at = datetime('now')
+                     WHERE file_id = ?1 AND s3_key IN (?7, ?3)
+                       AND state NOT IN ('deleted_locally', 'deleted_remotely')",
+                    rusqlite::params![
+                        id,
+                        new_local,
+                        identity.relative,
+                        identity.entry.parent_id.map(|id| id.to_string()),
+                        identity.state,
+                        is_root,
+                        old.relative,
+                    ],
+                )
+                .map_err(map)?;
+            if updated != 1 {
+                return Err(changed());
+            }
+            // A download job keeps the blob key in s3_key; only uploads carry a path.
+            tx.execute(
+                "UPDATE transfer_queue
+                 SET local_path = ?2,
+                     s3_key = CASE WHEN direction = 'upload' THEN ?3 ELSE s3_key END,
+                     updated_at = datetime('now')
+                 WHERE file_id = ?1 AND local_path = ?4
+                   AND status IN ('queued', 'in_progress', 'paused', 'failed')",
+                rusqlite::params![id, new_local, identity.relative, old_local],
+            )
+            .map_err(map)?;
+        }
+        tx.execute(
+            "INSERT INTO notes_roots (workspace_id, root_file_id, availability) VALUES (?1, ?2, 'ready')
+             ON CONFLICT(workspace_id) DO NOTHING",
+            rusqlite::params![intent.workspace_id.to_string(), intent.root_id.to_string()],
+        )
+        .map_err(map)?;
+        let bound: Option<String> = tx
+            .query_row(
+                "SELECT root_file_id FROM notes_roots WHERE workspace_id = ?1",
+                [intent.workspace_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(map)?;
+        if bound != Some(intent.root_id.to_string()) {
+            return Err(changed());
+        }
+        tx.execute(
+            "INSERT INTO local_mutations(request_id,workspace_id,file_id,kind,stage,journal_path,created_at)
+             VALUES(?1,?2,?3,?4,'indexed',?5,?6)
+             ON CONFLICT(request_id) DO UPDATE SET stage=excluded.stage",
+            rusqlite::params![
+                intent.request_id.to_string(),
+                intent.workspace_id.to_string(),
+                intent.file_id.to_string(),
+                format!("{:?}", intent.kind),
+                format!(".s4drive/notes-state/{}/intent.json", intent.request_id),
+                intent.created_at
+            ],
+        )
+        .map_err(map)?;
+        tx.commit().map_err(map)
+    }
+
+    pub(crate) fn notes_content_token(
+        &self,
+        workspace_id: &uuid::Uuid,
+        file_id: &uuid::Uuid,
+        hash: &str,
+    ) -> CoreResult<SaveToken> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO note_local_versions (workspace_id, file_id, generation, content_hash)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(workspace_id, file_id) DO UPDATE SET
+                 generation = note_local_versions.generation + 1,
+                 content_hash = excluded.content_hash
+             WHERE note_local_versions.content_hash != excluded.content_hash",
+            rusqlite::params![workspace_id.to_string(), file_id.to_string(), hash],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        let token = tx.query_row(
+            "SELECT generation, content_hash FROM note_local_versions WHERE workspace_id = ?1 AND file_id = ?2",
+            rusqlite::params![workspace_id.to_string(), file_id.to_string()],
+            |row| Ok(SaveToken { generation: row.get(0)?, content_hash: row.get(1)? }),
+        ).map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(token)
+    }
+
+    pub(crate) fn notes_topology_generation(
+        &self,
+        workspace_id: &uuid::Uuid,
+        signature: &str,
+    ) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO notes_workspaces (workspace_id, tree_generation, topology_hash)
+             VALUES (?1, 1, ?2)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+                 tree_generation = notes_workspaces.tree_generation + 1,
+                 topology_hash = excluded.topology_hash
+             WHERE notes_workspaces.topology_hash IS NOT excluded.topology_hash",
+            rusqlite::params![workspace_id.to_string(), signature],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        let generation = tx
+            .query_row(
+                "SELECT tree_generation FROM notes_workspaces WHERE workspace_id = ?1",
+                [workspace_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(generation)
+    }
+
+    pub(crate) fn notes_indexed_entries(&self) -> CoreResult<Vec<FileEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
+                    current_revision_id, local_hash, created_at, updated_at, entry_metadata
+             FROM objects WHERE (s3_key = 'Notes' OR substr(s3_key, 1, 6) = 'Notes/')
+                 AND state NOT IN ('deleted_locally', 'deleted_remotely')
+             ORDER BY s3_key, file_id",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], file_entry_from_index_row)
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    pub fn notes_count_cloud_only_missing(&self, sync_root: &std::path::Path) -> CoreResult<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT local_path, s3_key, state FROM objects
+                 WHERE (s3_key = 'Notes' OR substr(s3_key, 1, 6) = 'Notes/')
+                   AND is_folder = 0
+                   AND state NOT IN ('deleted_locally', 'deleted_remotely')",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let local_path: String = row.get(0)?;
+                let s3_key: String = row.get(1)?;
+                let state: String = row.get(2)?;
+                Ok((local_path, s3_key, state))
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+
+        let mut missing = 0u64;
+        for row in rows {
+            let (local_path, s3_key, state) =
+                row.map_err(|e| CoreError::Database(e.to_string()))?;
+            if state == "pending_download" {
+                missing += 1;
+                continue;
+            }
+            let file_path = if !local_path.is_empty() {
+                sync_root.join(&local_path)
+            } else {
+                sync_root.join(&s3_key)
+            };
+            if !file_path.exists() {
+                missing += 1;
+            }
+        }
+        Ok(missing)
+    }
+
+    pub fn notes_has_pending_mutations(&self, workspace_id: &uuid::Uuid) -> CoreResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let ws_str = workspace_id.to_string();
+        let mutation_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_mutations WHERE workspace_id = ?1",
+                [&ws_str],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if mutation_count > 0 {
+            return Ok(true);
+        }
+        let queue_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transfer_queue WHERE (s3_key = 'Notes' OR substr(s3_key, 1, 6) = 'Notes/') AND direction = 'upload' AND status IN ('pending', 'running')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(queue_count > 0)
+    }
+
+    pub(crate) fn notes_reserve_local(
+        &self,
+        entry: &FileEntry,
+        local_path: &str,
+        relative: &str,
+    ) -> CoreResult<uuid::Uuid> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let existing = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT file_id, is_folder FROM objects
+                 WHERE (s3_key = ?1 OR (?2 != '' AND local_path = ?2))
+                     AND state NOT IN ('deleted_locally', 'deleted_remotely') LIMIT 2",
+                )
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![relative, local_path], |row| {
+                    Ok((parse_uuid_column(row.get(0)?, 0)?, row.get::<_, bool>(1)?))
+                })
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| CoreError::Database(e.to_string()))?
+        };
+        if existing.len() > 1 {
+            return Err(CoreError::NameExists(relative.to_string()));
+        }
+        if let Some((file_id, is_folder)) = existing.first() {
+            if *is_folder != matches!(entry.entry_type, crate::metadata::types::EntryType::Folder) {
+                return Err(CoreError::NameExists(relative.to_string()));
+            }
+            if let Some(parent_id) = entry.parent_id {
+                tx.execute(
+                    "UPDATE objects SET parent_file_id = ?1 WHERE file_id = ?2 AND parent_file_id IS NULL",
+                    rusqlite::params![parent_id.to_string(), file_id.to_string()],
+                ).map_err(|e| CoreError::Database(e.to_string()))?;
+            }
+            tx.commit()
+                .map_err(|e| CoreError::Database(e.to_string()))?;
+            return Ok(*file_id);
+        }
+        let occupied: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM objects WHERE file_id = ?1)",
+                [entry.file_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        if occupied {
+            return Err(CoreError::NameExists(relative.to_string()));
+        }
+        // The shared scanner owns the fingerprint for upload eligibility.
+        tx.execute(
+            "INSERT INTO objects (file_id, local_path, s3_key, size, state, is_folder,
+                                  parent_file_id, current_revision_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending_upload', ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                entry.file_id.to_string(),
+                local_path,
+                relative,
+                entry.size as i64,
+                matches!(entry.entry_type, crate::metadata::types::EntryType::Folder),
+                entry.parent_id.map(|id| id.to_string()),
+                entry.current_revision_id.map(|id| id.to_string()),
+                entry.created_at,
+                entry.updated_at,
+            ],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(entry.file_id)
+    }
+
+    pub(crate) fn entry_metadata_available(&self, id: &uuid::Uuid) -> CoreResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.query_row(
+            "SELECT entry_metadata IS NOT NULL FROM objects WHERE file_id=?1",
+            [id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    pub(crate) fn notes_token_projection(
+        &self,
+        workspace: &uuid::Uuid,
+        id: &uuid::Uuid,
+    ) -> CoreResult<Option<SaveToken>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.query_row("SELECT generation, content_hash FROM note_local_versions WHERE workspace_id=?1 AND file_id=?2", rusqlite::params![workspace.to_string(),id.to_string()], |r| Ok(SaveToken { generation: r.get(0)?, content_hash:r.get(1)? })).optional().map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    pub(crate) fn notes_mutation_stages(&self) -> CoreResult<Vec<(uuid::Uuid, String)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT request_id, stage FROM local_mutations ORDER BY created_at, request_id",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    parse_uuid_column(row.get::<_, String>(0)?, 0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    pub(crate) fn notes_mark_mutation_committed(
+        &self,
+        request_id: &uuid::Uuid,
+    ) -> CoreResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let updated = conn
+            .execute(
+                "UPDATE local_mutations SET stage='committed' WHERE request_id=?1 AND stage='indexed'",
+                [request_id.to_string()],
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(updated == 1)
+    }
+
+    pub(crate) fn notes_rebuild_intent(
+        &self,
+        intent: &crate::fs_mutations::journal::MutationIntent,
+        root: &Path,
+        apply_changes: bool,
+    ) -> CoreResult<()> {
+        self.project_notes_intent(intent, root, apply_changes, true)
+    }
+    pub(crate) fn notes_project_intent(
+        &self,
+        intent: &crate::fs_mutations::journal::MutationIntent,
+        root: &Path,
+        apply_changes: bool,
+    ) -> CoreResult<()> {
+        self.project_notes_intent(intent, root, apply_changes, false)
+    }
+    fn project_notes_intent(
+        &self,
+        intent: &crate::fs_mutations::journal::MutationIntent,
+        root: &Path,
+        apply_changes: bool,
+        rebuild: bool,
+    ) -> CoreResult<()> {
+        use crate::fs_mutations::journal::MutationKind;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let map = |e: rusqlite::Error| CoreError::Database(e.to_string());
+        for (identities, replace) in [(&intent.baseline, false), (&intent.changes, apply_changes)] {
+            if std::ptr::eq(identities, &intent.changes) && !apply_changes {
+                continue;
+            }
+            for identity in identities {
+                let entry = &identity.entry;
+                let local = root
+                    .join(&identity.relative)
+                    .to_str()
+                    .ok_or_else(|| CoreError::FileSystem("The note path must be UTF-8".into()))?
+                    .to_owned();
+                tx.execute("INSERT INTO objects(file_id,local_path,s3_key,size,state,is_folder,parent_file_id,current_revision_id,local_hash,created_at,updated_at,entry_metadata) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(file_id) DO NOTHING", rusqlite::params![entry.file_id.to_string(),local,identity.relative,entry.size,identity.state,entry.entry_type == crate::metadata::types::EntryType::Folder,entry.parent_id.map(|id|id.to_string()),entry.current_revision_id.map(|id|id.to_string()),entry.content_hash,entry.created_at,entry.updated_at,if identity.metadata_available{Some(encode_entry_metadata(entry)?)}else{None}]).map_err(map)?;
+                if rebuild {
+                    tx.execute("UPDATE objects SET local_path=?1,s3_key=?2,size=?3,state=?4,parent_file_id=?5,current_revision_id=?6,local_hash=?7,created_at=?8,updated_at=?9,entry_metadata=?10 WHERE file_id=?11",rusqlite::params![local,identity.relative,entry.size,identity.state,entry.parent_id.map(|id|id.to_string()),entry.current_revision_id.map(|id|id.to_string()),entry.content_hash,entry.created_at,entry.updated_at,if identity.metadata_available{Some(encode_entry_metadata(entry)?)}else{None},entry.file_id.to_string()]).map_err(map)?;
+                }
+                if replace {
+                    tx.execute("UPDATE objects SET local_path=?1,s3_key=?2,size=?3,state=CASE WHEN state='ignored' AND ?4!='deleted_locally' THEN state ELSE ?4 END,parent_file_id=?5,updated_at=?6,entry_metadata=COALESCE(?8,entry_metadata) WHERE file_id=?7", rusqlite::params![local,identity.relative,entry.size,identity.state,entry.parent_id.map(|id|id.to_string()),entry.updated_at,entry.file_id.to_string(),if identity.metadata_available{Some(encode_entry_metadata(entry)?)}else{None}]).map_err(map)?;
+                    match intent.kind {
+                        MutationKind::Delete => {
+                            tx.execute("UPDATE transfer_queue SET status='failed',error_message='Superseded by a local mutation' WHERE file_id=?1 AND status IN ('queued','in_progress','paused')", [entry.file_id.to_string()]).map_err(map)?;
+                        }
+                        // The bytes still have to travel, only from the new place: a
+                        // content upload not done yet must not be dropped by a rename.
+                        MutationKind::Rename | MutationKind::Move => {
+                            tx.execute(
+                                REPOINT_TRANSFERS,
+                                rusqlite::params![
+                                    entry.file_id.to_string(),
+                                    local,
+                                    identity.relative
+                                ],
+                            )
+                            .map_err(map)?;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(token) = &identity.token {
+                    {
+                        let table = "note_local_versions";
+                        let sql = format!("INSERT INTO {table}(workspace_id,file_id,generation,content_hash) VALUES(?1,?2,?3,?4) ON CONFLICT(workspace_id,file_id) {}", if replace { "DO UPDATE SET generation=excluded.generation,content_hash=excluded.content_hash" } else { "DO NOTHING" });
+                        tx.execute(
+                            &sql,
+                            rusqlite::params![
+                                intent.workspace_id.to_string(),
+                                entry.file_id.to_string(),
+                                token.generation,
+                                token.content_hash
+                            ],
+                        )
+                        .map_err(map)?;
+                    }
+                }
+            }
+        }
+        tx.execute("INSERT INTO notes_roots(workspace_id,root_file_id,availability) VALUES(?1,?2,'ready') ON CONFLICT(workspace_id) DO NOTHING",rusqlite::params![intent.workspace_id.to_string(),intent.root_id.to_string()]).map_err(map)?;
+        tx.execute(
+            "INSERT INTO sync_checkpoints(name,value) VALUES(?1,?2) ON CONFLICT(name) DO NOTHING",
+            rusqlite::params![
+                format!("notes/root-identity/{}", intent.workspace_id),
+                intent.root_identity
+            ],
+        )
+        .map_err(map)?;
+        if apply_changes {
+            let already: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM local_mutations WHERE request_id=?1 AND stage='indexed')", [intent.request_id.to_string()],|r|r.get(0)).map_err(map)?;
+            if !already
+                && !intent.no_op
+                && matches!(
+                    intent.kind,
+                    MutationKind::CreateNote | MutationKind::Save | MutationKind::Restore
+                )
+            {
+                for identity in &intent.changes {
+                    if identity.entry.entry_type == crate::metadata::types::EntryType::File
+                        && identity.state != "ignored"
+                    {
+                        tx.execute("INSERT INTO transfer_queue(direction,file_id,local_path,s3_key,blob_hash,total_bytes) VALUES('upload',?1,?2,?3,?4,?5)",rusqlite::params![identity.entry.file_id.to_string(),root.join(&identity.relative).to_string_lossy(),identity.relative,identity.token.as_ref().map(|t|t.content_hash.clone()),identity.entry.size]).map_err(map)?;
+                    }
+                }
+            }
+        }
+        tx.execute("INSERT INTO local_mutations(request_id,workspace_id,file_id,kind,stage,journal_path,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(request_id) DO UPDATE SET stage=excluded.stage",rusqlite::params![intent.request_id.to_string(),intent.workspace_id.to_string(),intent.file_id.to_string(),format!("{:?}",intent.kind),if apply_changes { "indexed" } else { &intent.stage },format!(".s4drive/notes-state/{}/intent.json",intent.request_id),intent.created_at]).map_err(map)?;
+        tx.commit().map_err(map)
+    }
+
     pub fn upsert_file(&self, entry: &FileEntry) -> CoreResult<()> {
         self.upsert_file_index(entry, "", &entry.name, "synced")
     }
@@ -261,12 +999,23 @@ impl LocalDatabase {
             .conn
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
+        Self::write_file_index(&conn, entry, local_path, indexed_s3_key, state)
+    }
+
+    fn write_file_index(
+        conn: &Connection,
+        entry: &FileEntry,
+        local_path: &str,
+        indexed_s3_key: &str,
+        state: &str,
+    ) -> CoreResult<()> {
         let local_mtime = local_file_mtime_millis(local_path);
         conn.execute(
             "INSERT OR REPLACE INTO objects 
             (file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
-             current_revision_id, local_hash, local_mtime, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             current_revision_id, local_hash, local_mtime, created_at, updated_at, entry_metadata,
+             local_file_key)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 entry.file_id.to_string(),
                 local_path,
@@ -280,10 +1029,143 @@ impl LocalDatabase {
                 local_mtime,
                 entry.created_at,
                 entry.updated_at,
+                encode_entry_metadata(entry)?,
+                local_file_key(Path::new(local_path)),
             ],
         )
         .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    /// Complete only this job, atomically protecting a newer Notes projection.
+    pub(crate) fn finish_upload(
+        &self,
+        job: &crate::transfer::TransferJob,
+        entry: &FileEntry,
+        local_content_matches: bool,
+    ) -> CoreResult<bool> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let current = match job.expected_content_hash.as_deref() {
+            None => true,
+            Some(expected) => {
+                local_content_matches && Self::upload_binding_is_current(&tx, job, expected)?
+            }
+        };
+        if current {
+            // An upload records content only. The place stays the indexed one:
+            // the job may predate a rename or move, and the uploaded entry
+            // carries the bucket's placement, which may not have it yet.
+            match Self::indexed_place(&tx, &job.file_id)? {
+                Some((local_path, s3_key, parent_id)) => {
+                    let placed = FileEntry {
+                        parent_id,
+                        ..entry.clone()
+                    };
+                    Self::write_file_index(&tx, &placed, &local_path, &s3_key, "synced")?;
+                }
+                None => Self::write_file_index(&tx, entry, &job.local_path, &job.s3_key, "synced")?,
+            }
+        }
+        tx.execute(
+            "UPDATE transfer_queue
+             SET status='completed',
+                 transferred_bytes=CASE WHEN total_bytes>0 THEN total_bytes ELSE transferred_bytes END,
+                 updated_at=datetime('now')
+             WHERE id=?1",
+            [job.id],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(current)
+    }
+
+    /// Path, key and parent of `file_id` in the index.
+    fn indexed_place(
+        conn: &Connection,
+        file_id: &str,
+    ) -> CoreResult<Option<(String, String, Option<uuid::Uuid>)>> {
+        conn.query_row(
+            "SELECT local_path, s3_key, parent_file_id FROM objects WHERE file_id = ?1",
+            [file_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    parse_optional_uuid_column(row.get::<_, Option<String>>(2)?, 2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    /// Whether the job now points elsewhere than this copy of it: a Notes
+    /// rename or move redirected it while it was being processed.
+    pub(crate) fn transfer_moved(&self, job: &crate::transfer::TransferJob) -> CoreResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT local_path FROM transfer_queue
+                 WHERE id = ?1 AND status IN ('queued', 'in_progress')",
+                [job.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(current.is_some_and(|path| path != job.local_path))
+    }
+
+    pub(crate) fn upload_binding_matches(
+        &self,
+        job: &crate::transfer::TransferJob,
+    ) -> CoreResult<bool> {
+        let Some(expected) = job.expected_content_hash.as_deref() else {
+            return Ok(true);
+        };
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        Self::upload_binding_is_current(&conn, job, expected)
+    }
+
+    fn upload_binding_is_current(
+        conn: &Connection,
+        job: &crate::transfer::TransferJob,
+        expected: &str,
+    ) -> CoreResult<bool> {
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM note_local_versions v JOIN objects o ON o.file_id=v.file_id
+                JOIN transfer_queue t ON t.id=?1 AND t.file_id=o.file_id
+                WHERE o.file_id=?2 AND o.local_path=?3 AND o.s3_key=?4
+                  AND o.state NOT IN ('deleted_locally','deleted_remotely','ignored','conflicted')
+                  AND t.status IN ('queued','in_progress')
+                  AND replace(v.content_hash,'blake3:','')=?5
+                  AND NOT EXISTS(SELECT 1 FROM transfer_queue newer
+                    WHERE newer.file_id=o.file_id AND newer.direction='upload' AND newer.id>t.id
+                      AND newer.status IN ('queued','in_progress','paused'))
+            )",
+            rusqlite::params![
+                job.id,
+                job.file_id,
+                job.local_path,
+                job.s3_key,
+                expected.trim_start_matches("blake3:")
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))
     }
 
     pub fn get_file_snapshot_by_local_path(
@@ -295,20 +1177,12 @@ impl LocalDatabase {
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         let result = conn.query_row(
-            "SELECT file_id, size, local_hash, local_mtime, state
+            "SELECT file_id, size, local_hash, local_mtime, state, local_file_key
              FROM objects WHERE local_path = ?1 AND is_folder = 0
              ORDER BY state IN ('deleted_locally', 'deleted_remotely'), id DESC
              LIMIT 1",
             rusqlite::params![local_path],
-            |row| {
-                Ok(LocalFileSnapshot {
-                    file_id: parse_uuid_column(row.get::<_, String>(0)?, 0)?,
-                    size: row.get::<_, i64>(1)?.max(0) as u64,
-                    local_hash: row.get::<_, Option<String>>(2)?,
-                    local_mtime: row.get::<_, Option<String>>(3)?,
-                    state: row.get::<_, String>(4)?,
-                })
-            },
+            local_file_snapshot_from_row,
         );
 
         match result {
@@ -318,15 +1192,46 @@ impl LocalDatabase {
         }
     }
 
+    /// The one live indexed file last seen with this file key, and its path.
+    /// None when no entry has it or several do (a hard link or stale keys).
+    pub fn live_file_with_local_key(
+        &self,
+        key: &str,
+    ) -> CoreResult<Option<(LocalFileSnapshot, String)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_id, size, local_hash, local_mtime, state, local_file_key, local_path
+                 FROM objects
+                 WHERE local_file_key = ?1 AND is_folder = 0 AND local_path != ''
+                   AND state NOT IN ('deleted_locally', 'deleted_remotely', 'ignored')
+                 LIMIT 2",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let mut found = stmt
+            .query_map(rusqlite::params![key], |row| {
+                Ok((local_file_snapshot_from_row(row)?, row.get::<_, String>(6)?))
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(if found.len() == 1 { found.pop() } else { None })
+    }
+
     pub fn update_local_mtime_by_path(&self, local_path: &str) -> CoreResult<()> {
         let local_mtime = local_file_mtime_millis(local_path);
+        let local_key = local_file_key(Path::new(local_path));
         let conn = self
             .conn
             .lock()
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         conn.execute(
-            "UPDATE objects SET local_mtime = ?1, updated_at = datetime('now') WHERE local_path = ?2",
-            rusqlite::params![local_mtime, local_path],
+            "UPDATE objects SET local_mtime = ?1, local_file_key = ?2, updated_at = datetime('now')
+             WHERE local_path = ?3",
+            rusqlite::params![local_mtime, local_key, local_path],
         )
         .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(())
@@ -340,7 +1245,7 @@ impl LocalDatabase {
         let mut stmt = conn
             .prepare(
                 "SELECT file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
-                        current_revision_id, local_hash, created_at, updated_at
+                        current_revision_id, local_hash, created_at, updated_at, entry_metadata
                  FROM objects WHERE file_id = ?1",
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
@@ -415,6 +1320,7 @@ impl LocalDatabase {
         local_path: &str,
         s3_key: &str,
         total_bytes: u64,
+        bound_to: Option<&str>,
     ) -> CoreResult<()> {
         let conn = self
             .conn
@@ -425,6 +1331,7 @@ impl LocalDatabase {
              SET local_path = ?3,
                  s3_key = ?4,
                  total_bytes = ?5,
+                 blob_hash = COALESCE(?6, blob_hash),
                  transferred_bytes = 0,
                  status = 'queued',
                  error_message = NULL,
@@ -433,7 +1340,14 @@ impl LocalDatabase {
              WHERE direction = ?1
                AND file_id = ?2
                AND status IN ('queued', 'in_progress', 'paused', 'failed')",
-            rusqlite::params![direction, file_id, local_path, s3_key, total_bytes as i64],
+            rusqlite::params![
+                direction,
+                file_id,
+                local_path,
+                s3_key,
+                total_bytes as i64,
+                bound_to
+            ],
         )
         .map_err(|e| CoreError::Database(e.to_string()))?;
 
@@ -443,9 +1357,17 @@ impl LocalDatabase {
 
         conn.execute(
             "INSERT INTO transfer_queue
-             (direction, file_id, local_path, s3_key, total_bytes, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', datetime('now'), datetime('now'))",
-            rusqlite::params![direction, file_id, local_path, s3_key, total_bytes as i64],
+             (direction, file_id, local_path, s3_key, total_bytes, blob_hash, status,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', datetime('now'), datetime('now'))",
+            rusqlite::params![
+                direction,
+                file_id,
+                local_path,
+                s3_key,
+                total_bytes as i64,
+                bound_to
+            ],
         )
         .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(())
@@ -465,7 +1387,7 @@ impl LocalDatabase {
             .prepare(
                 "SELECT id, direction, file_id, local_path, s3_key, 
                         total_bytes, transferred_bytes, status,
-                        retry_count, error_message, created_at, updated_at
+                        retry_count, error_message, created_at, updated_at, blob_hash
                  FROM transfer_queue 
                  WHERE direction = ?1 AND status = 'queued' 
                  ORDER BY priority DESC, created_at ASC LIMIT ?2",
@@ -501,7 +1423,7 @@ impl LocalDatabase {
                 .prepare(
                     "SELECT id, direction, file_id, local_path, s3_key,
                             total_bytes, transferred_bytes, status,
-                            retry_count, error_message, created_at, updated_at
+                            retry_count, error_message, created_at, updated_at, blob_hash
                      FROM transfer_queue
                      WHERE status IN ('queued', 'in_progress', 'paused', 'failed')
                      ORDER BY
@@ -530,7 +1452,7 @@ impl LocalDatabase {
                 .prepare(
                     "SELECT id, direction, file_id, local_path, s3_key,
                             total_bytes, transferred_bytes, status,
-                            retry_count, error_message, created_at, updated_at
+                            retry_count, error_message, created_at, updated_at, blob_hash
                      FROM transfer_queue
                      WHERE status = 'completed'
                      ORDER BY updated_at DESC, id DESC
@@ -1161,6 +2083,34 @@ impl LocalDatabase {
         }
     }
 
+    /// Write `value` only if the checkpoint still holds `expected`; an absent
+    /// checkpoint counts as "". Returns whether this call wrote it.
+    pub fn replace_checkpoint(&self, name: &str, expected: &str, value: &str) -> CoreResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let changed = if expected.is_empty() {
+            conn.execute(
+                "INSERT INTO sync_checkpoints (name, value, updated_at)
+                 VALUES (?1, ?2, datetime('now'))
+                 ON CONFLICT(name) DO UPDATE SET
+                     value = excluded.value,
+                     updated_at = excluded.updated_at
+                 WHERE sync_checkpoints.value = ''",
+                rusqlite::params![name, value],
+            )
+        } else {
+            conn.execute(
+                "UPDATE sync_checkpoints SET value = ?3, updated_at = datetime('now')
+                 WHERE name = ?1 AND value = ?2",
+                rusqlite::params![name, expected, value],
+            )
+        }
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(changed > 0)
+    }
+
     pub fn set_checkpoint(&self, name: &str, value: &str) -> CoreResult<()> {
         let conn = self
             .conn
@@ -1242,7 +2192,7 @@ impl LocalDatabase {
         let mut stmt = conn
             .prepare(
                 "SELECT file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
-                        current_revision_id, local_hash, created_at, updated_at
+                        current_revision_id, local_hash, created_at, updated_at, entry_metadata
                  FROM objects WHERE local_path = ?1 AND is_folder = 0
                  ORDER BY state IN ('deleted_locally', 'deleted_remotely'), id DESC
                  LIMIT 1",
@@ -1269,7 +2219,7 @@ impl LocalDatabase {
         let mut stmt = conn
             .prepare(
                 "SELECT file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
-                        current_revision_id, local_hash, created_at, updated_at
+                        current_revision_id, local_hash, created_at, updated_at, entry_metadata
                  FROM objects
                  WHERE substr(local_path, 1, length(?1)) = ?1
                    AND is_folder = 0
@@ -1288,6 +2238,33 @@ impl LocalDatabase {
             files.push(row.map_err(|e| CoreError::Database(e.to_string()))?);
         }
         Ok(files)
+    }
+
+    /// Files and folders inside `folder` that a remote delete removed here,
+    /// parents before their contents.
+    pub fn removed_remotely_under(&self, folder: &str) -> CoreResult<Vec<(FileEntry, String)>> {
+        let prefix = subtree_prefix(folder);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_id, local_path, s3_key, size, state, is_folder, parent_file_id,
+                        current_revision_id, local_hash, created_at, updated_at, entry_metadata
+                 FROM objects
+                 WHERE substr(local_path, 1, length(?1)) = ?1
+                   AND state = 'deleted_remotely'
+                 ORDER BY local_path",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix], |row| {
+                Ok((file_entry_from_index_row(row)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        rows.map(|row| row.map_err(|e| CoreError::Database(e.to_string())))
+            .collect()
     }
 
     /// The live folder with this id.
@@ -1498,6 +2475,25 @@ impl LocalDatabase {
         tx.commit()
             .map_err(|e| CoreError::Database(e.to_string()))?;
         Ok(marked as u64)
+    }
+
+    /// Point the unfinished transfers of a renamed or moved file at its new place.
+    pub fn repoint_transfers(
+        &self,
+        file_id: &uuid::Uuid,
+        local_path: &str,
+        s3_key: &str,
+    ) -> CoreResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        conn.execute(
+            REPOINT_TRANSFERS,
+            rusqlite::params![file_id.to_string(), local_path, s3_key],
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(())
     }
 
     pub fn get_local_path(&self, file_id: &uuid::Uuid) -> CoreResult<Option<String>> {
@@ -2218,7 +3214,14 @@ fn file_entry_from_index_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEn
     let parent_id = parse_optional_uuid_column(row.get::<_, Option<String>>(6)?, 6)?;
     let name = entry_name_from_paths(&local_path, &s3_key);
 
-    Ok(FileEntry {
+    let metadata = row
+        .get::<_, Option<String>>(11)?
+        .map(|json| {
+            serde_json::from_str::<SupplementalEntryMetadata>(&json)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(e)))
+        })
+        .transpose()?;
+    let mut entry = FileEntry {
         file_id,
         parent_id,
         name: name.clone(),
@@ -2239,7 +3242,16 @@ fn file_entry_from_index_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEn
         version_history: Vec::new(),
         attributes: crate::metadata::types::FileAttributes::default(),
         lock_state: crate::metadata::types::LockState::default(),
-    })
+    };
+    if let Some(metadata) = metadata {
+        entry.content_ref = metadata.content_ref;
+        entry.mime = metadata.mime;
+        entry.deleted_at = metadata.deleted_at;
+        entry.version_history = metadata.version_history;
+        entry.attributes = metadata.attributes;
+        entry.lock_state = metadata.lock_state;
+    }
+    Ok(entry)
 }
 
 fn parse_uuid_column(value: String, column: usize) -> rusqlite::Result<uuid::Uuid> {
@@ -2275,6 +3287,32 @@ fn entry_name_from_paths(local_path: &str, s3_key: &str) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+fn local_file_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalFileSnapshot> {
+    Ok(LocalFileSnapshot {
+        file_id: parse_uuid_column(row.get::<_, String>(0)?, 0)?,
+        size: row.get::<_, i64>(1)?.max(0) as u64,
+        local_hash: row.get::<_, Option<String>>(2)?,
+        local_mtime: row.get::<_, Option<String>>(3)?,
+        state: row.get::<_, String>(4)?,
+        local_key: row.get::<_, Option<String>>(5)?,
+    })
+}
+
+/// Identity of a regular file that a rename keeps and a new file does not
+/// share: device and inode, or volume serial and file index on Windows.
+pub(crate) fn local_file_key(path: &Path) -> Option<String> {
+    use cap_fs_ext::MetadataExt;
+
+    // Only regular files: opening a FIFO would block.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    // Windows reports the file index only for an open handle.
+    let file = std::fs::File::open(path).ok()?;
+    let metadata = cap_std::fs::Metadata::from_file(&file).ok()?;
+    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
 }
 
 fn local_file_mtime_millis(local_path: &str) -> Option<String> {
@@ -2326,6 +3364,7 @@ fn transfer_job_from_row(
         file_id: row.get::<_, String>(2)?,
         local_path: row.get::<_, String>(3)?,
         s3_key: row.get::<_, String>(4)?,
+        expected_content_hash: row.get::<_, Option<String>>(12)?,
         total_bytes: row.get::<_, i64>(5)?.max(0) as u64,
         transferred_bytes: row.get::<_, i64>(6)?.max(0) as u64,
         status,
@@ -2402,6 +3441,119 @@ mod tests {
         LocalDatabase::new(&config).unwrap()
     }
 
+    #[test]
+    fn n22_a_job_redirected_while_in_hand_is_seen_as_moved() {
+        let db = test_db();
+        let id = uuid::Uuid::now_v7();
+        db.enqueue_transfer(
+            "upload",
+            &id.to_string(),
+            "/s/Notes/A.md",
+            "Notes/A.md",
+            1,
+            None,
+        )
+        .unwrap();
+        let job = db.get_pending_transfers("upload", 1).unwrap().remove(0);
+        assert!(!db.transfer_moved(&job).unwrap());
+        db.repoint_transfers(&id, "/s/Notes/B.md", "Notes/B.md")
+            .unwrap();
+        assert!(db.transfer_moved(&job).unwrap());
+    }
+
+    #[test]
+    fn n23_repointed_transfers_follow_the_file_and_downloads_keep_their_blob() {
+        let db = test_db();
+        let id = uuid::Uuid::now_v7();
+        db.enqueue_transfer(
+            "upload",
+            &id.to_string(),
+            "/s/Notes/A.md",
+            "Notes/A.md",
+            1,
+            None,
+        )
+        .unwrap();
+        db.enqueue_transfer(
+            "download",
+            &id.to_string(),
+            "/s/Notes/A.md",
+            "blobs/ab/abc",
+            1,
+            None,
+        )
+        .unwrap();
+
+        db.repoint_transfers(&id, "/s/Notes/B.md", "Notes/B.md")
+            .unwrap();
+
+        let upload = &db.get_pending_transfers("upload", 10).unwrap()[0];
+        assert_eq!(
+            (upload.local_path.as_str(), upload.s3_key.as_str()),
+            ("/s/Notes/B.md", "Notes/B.md")
+        );
+        let download = &db.get_pending_transfers("download", 10).unwrap()[0];
+        assert_eq!(
+            (download.local_path.as_str(), download.s3_key.as_str()),
+            ("/s/Notes/B.md", "blobs/ab/abc")
+        );
+    }
+
+    #[test]
+    fn the_file_key_survives_a_rename_and_tells_a_new_file_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let moved = dir.path().join("b.txt");
+        std::fs::write(&path, "bytes").unwrap();
+        let key = local_file_key(&path).unwrap();
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, "bytes").unwrap();
+
+        assert_eq!(local_file_key(&moved).as_deref(), Some(key.as_str()));
+        assert_ne!(local_file_key(&path).as_deref(), Some(key.as_str()));
+        assert_eq!(local_file_key(dir.path()), None);
+        assert_eq!(local_file_key(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn the_index_records_the_file_key_and_finds_the_one_file_with_it() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let local = path.to_str().unwrap();
+        std::fs::write(&path, "bytes").unwrap();
+        let entry = file_entry("a.txt", 5);
+        db.register_file_at_path_with_state(&entry, local, "a.txt", "synced")
+            .unwrap();
+        let key = local_file_key(&path).unwrap();
+        let snapshot = db.get_file_snapshot_by_local_path(local).unwrap().unwrap();
+        assert_eq!(snapshot.local_key.as_deref(), Some(key.as_str()));
+        let (found, found_path) = db.live_file_with_local_key(&key).unwrap().unwrap();
+        assert_eq!((found.file_id, found_path.as_str()), (entry.file_id, local));
+
+        // A replacing save gives the path a new key; the index follows it.
+        let saved = dir.path().join("a.txt.saving");
+        std::fs::write(&saved, "edited").unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        db.update_local_mtime_by_path(local).unwrap();
+        let new_key = local_file_key(&path).unwrap();
+        let snapshot = db.get_file_snapshot_by_local_path(local).unwrap().unwrap();
+        assert_eq!(snapshot.local_key.as_deref(), Some(new_key.as_str()));
+        assert!(db.live_file_with_local_key(&key).unwrap().is_none());
+
+        // Two entries with one key (a hard link) identify neither.
+        let link = dir.path().join("link.txt");
+        std::fs::hard_link(&path, &link).unwrap();
+        db.register_file_at_path_with_state(
+            &file_entry("link.txt", 6),
+            link.to_str().unwrap(),
+            "link.txt",
+            "synced",
+        )
+        .unwrap();
+        assert!(db.live_file_with_local_key(&new_key).unwrap().is_none());
+    }
+
     fn file_entry(name: &str, size: u64) -> FileEntry {
         FileEntry {
             file_id: uuid::Uuid::now_v7(),
@@ -2421,6 +3573,682 @@ mod tests {
             attributes: Default::default(),
             lock_state: Default::default(),
         }
+    }
+
+    fn bound_upload(
+        db: &LocalDatabase,
+        entry: &FileEntry,
+        hash: &str,
+    ) -> crate::transfer::TransferJob {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transfer_queue(direction,file_id,local_path,s3_key,blob_hash,total_bytes) VALUES('upload',?1,'/tmp/note.md','note.md',?2,?3)",
+            rusqlite::params![entry.file_id.to_string(), hash, entry.size],
+        ).unwrap();
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        db.get_pending_transfers("upload", 100)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == id)
+            .unwrap()
+    }
+
+    fn note_upload_projection(db: &LocalDatabase, entry: &FileEntry, hash: &str) {
+        db.register_file_at_path_with_state(entry, "/tmp/note.md", "note.md", "modified_locally")
+            .unwrap();
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO note_local_versions(workspace_id,file_id,generation,content_hash) VALUES('workspace',?1,1,?2) ON CONFLICT(workspace_id,file_id) DO UPDATE SET generation=generation+1,content_hash=excluded.content_hash",
+            rusqlite::params![entry.file_id.to_string(), hash],
+        ).unwrap();
+    }
+
+    #[test]
+    fn upload_generation_binding_is_loaded_for_pending_and_recent_transfers() {
+        let db = test_db();
+        let entry = file_entry("note.md", 3);
+        let job = bound_upload(&db, &entry, "blake3:old");
+        assert_eq!(job.expected_content_hash.as_deref(), Some("blake3:old"));
+        assert_eq!(
+            db.get_recent_transfers(10, 10).unwrap()[0].expected_content_hash,
+            job.expected_content_hash
+        );
+        db.update_transfer_status(job.id, "completed").unwrap();
+        assert_eq!(
+            db.get_recent_transfers(10, 10).unwrap()[0].expected_content_hash,
+            job.expected_content_hash
+        );
+    }
+
+    #[test]
+    fn upload_generation_completion_preserves_newer_local_content_and_job() {
+        let db = test_db();
+        let mut entry = file_entry("note.md", 3);
+        note_upload_projection(&db, &entry, "blake3:old");
+        let old_job = bound_upload(&db, &entry, "blake3:old");
+        db.update_transfer_status(old_job.id, "in_progress")
+            .unwrap();
+        let committed_entry = entry.clone();
+        entry.size = 12;
+        entry.content_hash = Some("blake3:new".into());
+        note_upload_projection(&db, &entry, "blake3:new");
+        let new_job = bound_upload(&db, &entry, "blake3:new");
+
+        assert!(!db.finish_upload(&old_job, &committed_entry, true).unwrap());
+        let snapshot = db
+            .get_file_snapshot_by_local_path("/tmp/note.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.state, "modified_locally");
+        assert_eq!(snapshot.local_hash.as_deref(), Some("blake3:new"));
+        assert_eq!(db.get_file(&entry.file_id).unwrap().unwrap().size, 12);
+        let pending = db.get_pending_transfers("upload", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, new_job.id);
+    }
+
+    #[test]
+    fn upload_generation_completion_preserves_newer_job_with_same_content() {
+        let db = test_db();
+        let entry = file_entry("note.md", 3);
+        note_upload_projection(&db, &entry, "blake3:old");
+        let old_job = bound_upload(&db, &entry, "blake3:old");
+        let new_job = bound_upload(&db, &entry, "blake3:old");
+        assert!(!db.finish_upload(&old_job, &entry, true).unwrap());
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/tmp/note.md")
+                .unwrap()
+                .unwrap()
+                .state,
+            "modified_locally"
+        );
+        assert_eq!(
+            db.get_pending_transfers("upload", 10).unwrap()[0].id,
+            new_job.id
+        );
+    }
+
+    #[test]
+    fn upload_generation_completion_requires_unchanged_bytes() {
+        let db = test_db();
+        let entry = file_entry("note.md", 3);
+        note_upload_projection(&db, &entry, "blake3:old");
+        let job = bound_upload(&db, &entry, "blake3:old");
+        assert!(!db.finish_upload(&job, &entry, false).unwrap());
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/tmp/note.md")
+                .unwrap()
+                .unwrap()
+                .state,
+            "modified_locally"
+        );
+    }
+
+    #[test]
+    fn upload_generation_completion_syncs_only_current_job() {
+        let db = test_db();
+        let entry = file_entry("note.md", 3);
+        note_upload_projection(&db, &entry, "blake3:old");
+        let job = bound_upload(&db, &entry, "blake3:old");
+        assert!(db.finish_upload(&job, &entry, true).unwrap());
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/tmp/note.md")
+                .unwrap()
+                .unwrap()
+                .state,
+            "synced"
+        );
+        assert!(db.get_pending_transfers("upload", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upload_generation_binding_rejects_deleted_note() {
+        let db = test_db();
+        let entry = file_entry("note.md", 3);
+        note_upload_projection(&db, &entry, "blake3:old");
+        let job = bound_upload(&db, &entry, "blake3:old");
+        assert!(db.upload_binding_matches(&job).unwrap());
+        db.register_file_at_path_with_state(&entry, "/tmp/note.md", "note.md", "deleted_locally")
+            .unwrap();
+        assert!(!db.upload_binding_matches(&job).unwrap());
+        assert!(!db.finish_upload(&job, &entry, true).unwrap());
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/tmp/note.md")
+                .unwrap()
+                .unwrap()
+                .state,
+            "deleted_locally"
+        );
+    }
+
+    #[test]
+    fn upload_generation_binding_rejects_relocated_note() {
+        let db = test_db();
+        let entry = file_entry("note.md", 3);
+        note_upload_projection(&db, &entry, "blake3:old");
+        let job = bound_upload(&db, &entry, "blake3:old");
+        db.register_file_at_path_with_state(
+            &entry,
+            "/tmp/moved.md",
+            "moved.md",
+            "modified_locally",
+        )
+        .unwrap();
+        assert!(!db.upload_binding_matches(&job).unwrap());
+        assert!(!db.finish_upload(&job, &entry, true).unwrap());
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/tmp/moved.md")
+                .unwrap()
+                .unwrap()
+                .state,
+            "modified_locally"
+        );
+    }
+
+    #[test]
+    fn upload_generation_binding_rejects_changed_projection_without_another_job() {
+        let db = test_db();
+        let entry = file_entry("note.md", 3);
+        note_upload_projection(&db, &entry, "blake3:old");
+        let job = bound_upload(&db, &entry, "blake3:old");
+        note_upload_projection(&db, &entry, "blake3:new");
+        assert!(!db.upload_binding_matches(&job).unwrap());
+        assert!(!db.finish_upload(&job, &entry, true).unwrap());
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/tmp/note.md")
+                .unwrap()
+                .unwrap()
+                .state,
+            "modified_locally"
+        );
+    }
+
+    #[test]
+    fn finished_upload_keeps_the_place_a_rename_gave_the_file_meanwhile() {
+        let db = test_db();
+        let mut entry = file_entry("Alpha.md", 3);
+        db.register_file_at_path_with_state(&entry, "/tmp/Alpha.md", "Alpha.md", "synced")
+            .unwrap();
+        db.enqueue_transfer(
+            "upload",
+            &entry.file_id.to_string(),
+            "/tmp/Alpha.md",
+            "Alpha.md",
+            3,
+            None,
+        )
+        .unwrap();
+        let job = db.get_pending_transfers("upload", 1).unwrap().remove(0);
+        let archive = uuid::Uuid::now_v7();
+        let mut moved = entry.clone();
+        moved.name = "Beta.md".into();
+        moved.parent_id = Some(archive);
+        db.register_file_at_path_with_state(
+            &moved,
+            "/tmp/Archive/Beta.md",
+            "Archive/Beta.md",
+            "synced",
+        )
+        .unwrap();
+
+        entry.current_revision_id = Some(uuid::Uuid::now_v7());
+        db.finish_upload(&job, &entry, true).unwrap();
+
+        let indexed = db.get_file(&entry.file_id).unwrap().unwrap();
+        assert_eq!(indexed.parent_id, Some(archive));
+        assert_eq!(indexed.current_revision_id, entry.current_revision_id);
+        assert_eq!(
+            db.get_local_path(&entry.file_id).unwrap().as_deref(),
+            Some("/tmp/Archive/Beta.md")
+        );
+        assert_eq!(
+            db.get_s3_key(&entry.file_id).unwrap().as_deref(),
+            Some("Archive/Beta.md")
+        );
+        assert!(db.get_pending_transfers("upload", 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn finished_upload_keeps_the_local_parent_over_the_remote_one() {
+        // D08: a revision upload takes the bucket's placement, which does not
+        // have the move to Archive yet; the index must keep Archive.
+        let db = test_db();
+        let archive = uuid::Uuid::now_v7();
+        let mut local = file_entry("Beta.md", 3);
+        local.parent_id = Some(archive);
+        db.register_file_at_path_with_state(
+            &local,
+            "/tmp/Archive/Beta.md",
+            "Archive/Beta.md",
+            "modified_locally",
+        )
+        .unwrap();
+        db.enqueue_transfer(
+            "upload",
+            &local.file_id.to_string(),
+            "/tmp/Archive/Beta.md",
+            "Archive/Beta.md",
+            3,
+            None,
+        )
+        .unwrap();
+        let job = db.get_pending_transfers("upload", 1).unwrap().remove(0);
+        let mut uploaded = local.clone();
+        uploaded.parent_id = None;
+        uploaded.current_revision_id = Some(uuid::Uuid::now_v7());
+
+        db.finish_upload(&job, &uploaded, true).unwrap();
+
+        let indexed = db.get_file(&local.file_id).unwrap().unwrap();
+        assert_eq!(indexed.parent_id, Some(archive));
+        assert_eq!(indexed.current_revision_id, uploaded.current_revision_id);
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/tmp/Archive/Beta.md")
+                .unwrap()
+                .unwrap()
+                .state,
+            "synced"
+        );
+    }
+
+    #[test]
+    fn upload_generation_completion_preserves_generic_files_behavior() {
+        let db = test_db();
+        let entry = file_entry("file.txt", 3);
+        db.enqueue_transfer(
+            "upload",
+            &entry.file_id.to_string(),
+            "/tmp/file.txt",
+            "file.txt",
+            3,
+            None,
+        )
+        .unwrap();
+        let job = db.get_pending_transfers("upload", 1).unwrap().remove(0);
+        assert!(db.upload_binding_matches(&job).unwrap());
+        assert!(db.finish_upload(&job, &entry, false).unwrap());
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/tmp/file.txt")
+                .unwrap()
+                .unwrap()
+                .state,
+            "synced"
+        );
+        assert!(db.get_pending_transfers("upload", 1).unwrap().is_empty());
+        assert_eq!(
+            db.get_recent_transfers(1, 1).unwrap()[0].transferred_bytes,
+            3
+        );
+    }
+
+    #[test]
+    fn notes_root_binding_is_first_writer_and_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.core.db_path = temp.path().join("index.sqlite").to_str().unwrap().into();
+        let db = LocalDatabase::new(&config).unwrap();
+        let workspace = uuid::Uuid::now_v7();
+        let root = uuid::Uuid::now_v7();
+        assert_eq!(db.notes_root_binding(&workspace).unwrap(), None);
+        assert_eq!(db.notes_bind_root(&workspace, root).unwrap(), root);
+        assert_eq!(
+            db.notes_bind_root(&workspace, uuid::Uuid::now_v7())
+                .unwrap(),
+            root
+        );
+        assert_eq!(db.notes_topology_generation(&workspace, "tree").unwrap(), 1);
+        drop(db);
+        let db = LocalDatabase::new(&config).unwrap();
+        assert_eq!(db.notes_root_binding(&workspace).unwrap(), Some(root));
+        assert_eq!(db.notes_root_binding(&uuid::Uuid::now_v7()).unwrap(), None);
+    }
+
+    #[test]
+    fn notes_previous_root_includes_nonlive_folders_and_prefers_live_then_newest() {
+        let db = test_db();
+        assert_eq!(db.notes_previous_root().unwrap(), None);
+        let file = file_entry("Notes", 3);
+        db.register_file_at_path_with_state(&file, "", "Notes", "synced")
+            .unwrap();
+        let mut unrelated = file_entry("Notes", 0);
+        unrelated.entry_type = EntryType::Folder;
+        db.register_file_at_path_with_state(&unrelated, "", "Other/Notes", "synced")
+            .unwrap();
+        assert_eq!(db.notes_previous_root().unwrap(), None);
+        for state in ["deleted_locally", "deleted_remotely", "ignored"] {
+            let mut previous = file_entry("Notes", 0);
+            previous.entry_type = EntryType::Folder;
+            db.register_file_at_path_with_state(&previous, "", "Notes", state)
+                .unwrap();
+            assert_eq!(db.notes_previous_root().unwrap(), Some(previous.file_id));
+        }
+        let mut live = file_entry("Notes", 0);
+        live.entry_type = EntryType::Folder;
+        db.register_file_at_path_with_state(&live, "", "Notes", "synced")
+            .unwrap();
+        let mut newer_deleted = file_entry("Notes", 0);
+        newer_deleted.entry_type = EntryType::Folder;
+        db.register_file_at_path_with_state(&newer_deleted, "", "Notes", "deleted_remotely")
+            .unwrap();
+        assert_eq!(db.notes_previous_root().unwrap(), Some(live.file_id));
+        let mut newer_live = file_entry("Notes", 0);
+        newer_live.entry_type = EntryType::Folder;
+        db.register_local_file_at_path(&newer_live, "", "Notes")
+            .unwrap();
+        assert_eq!(db.notes_previous_root().unwrap(), Some(newer_live.file_id));
+    }
+
+    #[test]
+    fn notes_reservation_rejects_file_folder_collisions_without_repairing_parent() {
+        for relative in ["Notes", "Notes/Folder"] {
+            for existing_is_folder in [false, true] {
+                let db = test_db();
+                let mut existing = file_entry("Folder", 7);
+                if existing_is_folder {
+                    existing.entry_type = EntryType::Folder;
+                }
+                db.register_file_at_path_with_state(&existing, "/root/item", relative, "synced")
+                    .unwrap();
+                let mut incoming = file_entry("Folder", 0);
+                if !existing_is_folder {
+                    incoming.entry_type = EntryType::Folder;
+                }
+                incoming.parent_id = Some(uuid::Uuid::now_v7());
+                assert!(matches!(
+                    db.notes_reserve_local(&incoming, "/root/item", relative),
+                    Err(CoreError::NameExists(_))
+                ));
+                let preserved = db.get_file(&existing.file_id).unwrap().unwrap();
+                assert_eq!(preserved.parent_id, None);
+                assert_eq!(preserved.entry_type, existing.entry_type);
+                assert_eq!(preserved.size, existing.size);
+                assert_eq!(
+                    db.get_object_state(&existing.file_id).unwrap().as_deref(),
+                    Some("synced")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn notes_content_tokens_persist_without_changing_sync_fingerprints() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.core.db_path = temp.path().join("index.sqlite").to_str().unwrap().into();
+        let db = LocalDatabase::new(&config).unwrap();
+        let workspace = uuid::Uuid::now_v7();
+        let entry = file_entry("A.md", 17);
+        db.register_file_at_path_with_state(
+            &entry,
+            "/root/Notes/A.md",
+            "Notes/A.md",
+            "modified_locally",
+        )
+        .unwrap();
+        let snapshot = db
+            .get_file_snapshot_by_local_path("/root/Notes/A.md")
+            .unwrap();
+        let first = db
+            .notes_content_token(&workspace, &entry.file_id, "hash-a")
+            .unwrap();
+        assert_eq!(
+            first,
+            SaveToken {
+                generation: 1,
+                content_hash: "hash-a".into()
+            }
+        );
+        assert_eq!(
+            db.notes_content_token(&workspace, &entry.file_id, "hash-a")
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            db.notes_content_token(&workspace, &entry.file_id, "hash-b")
+                .unwrap()
+                .generation,
+            2
+        );
+        assert_eq!(
+            db.notes_content_token(&uuid::Uuid::now_v7(), &entry.file_id, "hash-b")
+                .unwrap()
+                .generation,
+            1
+        );
+        assert_eq!(
+            db.get_file_snapshot_by_local_path("/root/Notes/A.md")
+                .unwrap(),
+            snapshot
+        );
+        drop(db);
+        let db = LocalDatabase::new(&config).unwrap();
+        assert_eq!(
+            db.notes_content_token(&workspace, &entry.file_id, "hash-b")
+                .unwrap()
+                .generation,
+            2
+        );
+        assert_eq!(
+            db.notes_content_token(&workspace, &entry.file_id, "hash-a")
+                .unwrap()
+                .generation,
+            3
+        );
+    }
+
+    #[test]
+    fn notes_topology_generation_tracks_only_signature_changes() {
+        let db = test_db();
+        let workspace = uuid::Uuid::now_v7();
+        assert_eq!(
+            db.notes_topology_generation(&workspace, "tree-a").unwrap(),
+            1
+        );
+        assert_eq!(
+            db.notes_topology_generation(&workspace, "tree-a").unwrap(),
+            1
+        );
+        let root = uuid::Uuid::now_v7();
+        assert_eq!(db.notes_bind_root(&workspace, root).unwrap(), root);
+        assert_eq!(
+            db.notes_topology_generation(&workspace, "tree-b").unwrap(),
+            2
+        );
+        assert_eq!(
+            db.notes_topology_generation(&workspace, "tree-b").unwrap(),
+            2
+        );
+        assert_eq!(
+            db.notes_topology_generation(&uuid::Uuid::now_v7(), "tree-b")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn notes_reservation_reuses_live_entry_and_only_repairs_missing_parent() {
+        let db = test_db();
+        let original = file_entry("A.md", 17);
+        let path = "/root/Notes/A.md";
+        db.register_file_at_path_with_state(&original, path, "Notes/A.md", "modified_locally")
+            .unwrap();
+        let snapshot = db.get_file_snapshot_by_local_path(path).unwrap();
+        let mut candidate = file_entry("A.md", 0);
+        candidate.parent_id = Some(uuid::Uuid::now_v7());
+        assert_eq!(
+            db.notes_reserve_local(&candidate, path, "Notes/A.md")
+                .unwrap(),
+            original.file_id
+        );
+        assert_eq!(db.get_file_snapshot_by_local_path(path).unwrap(), snapshot);
+        let repaired = db.get_file(&original.file_id).unwrap().unwrap();
+        assert_eq!(repaired.parent_id, candidate.parent_id);
+        assert_eq!(repaired.current_revision_id, original.current_revision_id);
+        assert_eq!(repaired.created_at, original.created_at);
+        assert_eq!(repaired.updated_at, original.updated_at);
+        candidate.parent_id = Some(uuid::Uuid::now_v7());
+        assert_eq!(
+            db.notes_reserve_local(&candidate, path, "Notes/A.md")
+                .unwrap(),
+            original.file_id
+        );
+        assert_eq!(
+            db.get_file(&original.file_id).unwrap().unwrap().parent_id,
+            repaired.parent_id
+        );
+    }
+
+    #[test]
+    fn notes_reservation_creates_pending_entry_without_synced_fingerprint() {
+        let db = test_db();
+        let entry = file_entry("New.md", 13);
+        assert_eq!(
+            db.notes_reserve_local(&entry, "/root/Notes/New.md", "Notes/New.md")
+                .unwrap(),
+            entry.file_id
+        );
+        let snapshot = db
+            .get_file_snapshot_by_local_path("/root/Notes/New.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.state, "pending_upload");
+        assert_eq!(snapshot.local_hash, None);
+        assert_eq!(snapshot.local_mtime, None);
+        assert_eq!(snapshot.size, 13);
+        assert_eq!(
+            db.notes_reserve_local(
+                &file_entry("New.md", 0),
+                "/root/Notes/New.md",
+                "Notes/New.md"
+            )
+            .unwrap(),
+            entry.file_id
+        );
+    }
+
+    #[test]
+    fn notes_reservation_rejects_ambiguous_placement_and_occupied_candidate_id() {
+        let db = test_db();
+        let first = file_entry("A.md", 1);
+        let second = file_entry("A.md", 2);
+        db.register_local_file_at_path(&first, "/root/Notes/A.md", "Notes/A.md")
+            .unwrap();
+        db.register_local_file_at_path(&second, "/other/A.md", "Notes/A.md")
+            .unwrap();
+        assert!(matches!(
+            db.notes_reserve_local(&file_entry("A.md", 0), "/root/Notes/A.md", "Notes/A.md"),
+            Err(CoreError::NameExists(_))
+        ));
+        assert!(matches!(
+            db.notes_reserve_local(&first, "/root/Notes/B.md", "Notes/B.md"),
+            Err(CoreError::NameExists(_))
+        ));
+        assert_eq!(
+            db.get_s3_key(&first.file_id).unwrap().as_deref(),
+            Some("Notes/A.md")
+        );
+    }
+
+    #[test]
+    fn notes_reservation_does_not_reuse_deleted_ids() {
+        let db = test_db();
+        let deleted = file_entry("A.md", 1);
+        db.register_file_at_path_with_state(
+            &deleted,
+            "/root/Notes/A.md",
+            "Notes/A.md",
+            "deleted_remotely",
+        )
+        .unwrap();
+        let replacement = file_entry("A.md", 2);
+        assert_eq!(
+            db.notes_reserve_local(&replacement, "/root/Notes/A.md", "Notes/A.md")
+                .unwrap(),
+            replacement.file_id
+        );
+        assert_eq!(
+            db.get_object_state(&deleted.file_id).unwrap().as_deref(),
+            Some("deleted_remotely")
+        );
+        assert!(matches!(
+            db.notes_reserve_local(&deleted, "/root/Notes/B.md", "Notes/B.md"),
+            Err(CoreError::NameExists(_))
+        ));
+    }
+
+    #[test]
+    fn notes_reservation_preserves_ignored_entry_identity_and_state() {
+        let db = test_db();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("A.md");
+        std::fs::write(&path, "# A\n").unwrap();
+        let local_path = path.to_str().unwrap();
+        let original = file_entry("A.md", 4);
+        db.register_file_at_path_with_state(&original, local_path, "Notes/A.md", "ignored")
+            .unwrap();
+        let snapshot = db.get_file_snapshot_by_local_path(local_path).unwrap();
+        let candidate = file_entry("A.md", 0);
+        assert_eq!(
+            db.notes_reserve_local(&candidate, local_path, "Notes/A.md")
+                .unwrap(),
+            original.file_id
+        );
+        assert_eq!(
+            db.get_file_snapshot_by_local_path(local_path).unwrap(),
+            snapshot
+        );
+        assert_eq!(
+            db.get_object_state(&original.file_id).unwrap().as_deref(),
+            Some("ignored")
+        );
+        let entries = db.notes_indexed_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_id, original.file_id);
+        assert_eq!(db.count_live_objects().unwrap(), 0);
+        let conn = db.conn.lock().unwrap();
+        let placement_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM objects WHERE s3_key = 'Notes/A.md' OR local_path = ?1",
+                [local_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(placement_count, 1);
+    }
+
+    #[test]
+    fn notes_indexed_entries_include_remote_rows_with_exact_notes_prefix() {
+        let db = test_db();
+        let root = file_entry("Notes", 0);
+        let remote = file_entry("Remote.md", 1);
+        let child = file_entry("Local.md", 2);
+        let ignored = file_entry("Ignored.md", 3);
+        db.register_file_at_path_with_state(&root, "", "Notes", "synced")
+            .unwrap();
+        db.register_file_at_path_with_state(&remote, "", "Notes/Remote.md", "pending_download")
+            .unwrap();
+        db.register_local_file_at_path(&child, "/root/Notes/Local.md", "Notes/Local.md")
+            .unwrap();
+        db.register_file_at_path_with_state(&ignored, "", "Notes/Ignored.md", "ignored")
+            .unwrap();
+        for (key, state) in [
+            ("Notes-other/A.md", "synced"),
+            ("notes/A.md", "synced"),
+            ("Notes/Gone.md", "deleted_locally"),
+        ] {
+            db.register_file_at_path_with_state(&file_entry("A.md", 1), "", key, state)
+                .unwrap();
+        }
+        let ids: Vec<_> = db
+            .notes_indexed_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.file_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![root.file_id, ignored.file_id, child.file_id, remote.file_id]
+        );
     }
 
     fn temp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
@@ -2509,6 +4337,20 @@ mod tests {
             db.get_checkpoint("remote_head").unwrap(),
             Some("op-2".to_string())
         );
+    }
+
+    #[test]
+    fn replace_checkpoint_writes_only_over_the_expected_value() {
+        let db = test_db();
+        assert!(db.replace_checkpoint("prompt", "", "a").unwrap());
+        assert!(!db.replace_checkpoint("prompt", "", "b").unwrap());
+        assert!(!db.replace_checkpoint("prompt", "x", "b").unwrap());
+        assert_eq!(db.get_checkpoint("prompt").unwrap().as_deref(), Some("a"));
+        assert!(db.replace_checkpoint("prompt", "a", "b").unwrap());
+        db.set_checkpoint("prompt", "").unwrap();
+        assert!(db.replace_checkpoint("prompt", "", "c").unwrap());
+        assert!(!db.replace_checkpoint("missing", "a", "b").unwrap());
+        assert_eq!(db.get_checkpoint("missing").unwrap(), None);
     }
 
     #[test]
@@ -2646,6 +4488,7 @@ mod tests {
             &path.to_string_lossy(),
             "deleted.txt",
             7,
+            None,
         )
         .unwrap();
         db.update_transfer_status(1, "completed").unwrap();
@@ -2685,12 +4528,33 @@ mod tests {
     #[test]
     fn recover_interrupted_transfers_requeues_false_blob_precondition_failures() {
         let db = test_db();
-        db.enqueue_transfer("upload", "file-1", "/tmp/file-1.txt", "file-1.txt", 10)
-            .unwrap();
-        db.enqueue_transfer("upload", "file-2", "/tmp/file-2.txt", "file-2.txt", 20)
-            .unwrap();
-        db.enqueue_transfer("upload", "file-3", "/tmp/file-3.txt", "file-3.txt", 30)
-            .unwrap();
+        db.enqueue_transfer(
+            "upload",
+            "file-1",
+            "/tmp/file-1.txt",
+            "file-1.txt",
+            10,
+            None,
+        )
+        .unwrap();
+        db.enqueue_transfer(
+            "upload",
+            "file-2",
+            "/tmp/file-2.txt",
+            "file-2.txt",
+            20,
+            None,
+        )
+        .unwrap();
+        db.enqueue_transfer(
+            "upload",
+            "file-3",
+            "/tmp/file-3.txt",
+            "file-3.txt",
+            30,
+            None,
+        )
+        .unwrap();
         db.fail_transfer(
             1,
             "max retries: Conflict: 412 PreconditionFailed: .s4drive/content/blobs/aa/aabb",
@@ -2732,6 +4596,7 @@ mod tests {
             "/tmp/conflict.txt",
             "conflict.txt",
             10,
+            None,
         )
         .unwrap();
         let job_id = db.get_recent_transfers(10, 0).unwrap()[0].id;
@@ -2817,6 +4682,7 @@ mod tests {
             "/tmp/transfer.txt",
             &transfer_key,
             3,
+            None,
         )
         .unwrap();
 
@@ -3019,10 +4885,18 @@ mod tests {
             &inside_path,
             "photos/2024/one.jpg",
             1,
+            None,
         )
         .unwrap();
-        db.enqueue_transfer("download", &id(&sibling), &sibling_path, "blobs/ab/abc", 1)
-            .unwrap();
+        db.enqueue_transfer(
+            "download",
+            &id(&sibling),
+            &sibling_path,
+            "blobs/ab/abc",
+            1,
+            None,
+        )
+        .unwrap();
 
         db.move_subtree(
             &photos.local_path,
@@ -3071,8 +4945,15 @@ mod tests {
         for (entry, path) in [(&inside, &inside_path), (&outside, &outside_path)] {
             db.register_local_file_at_path(entry, path, &entry.name)
                 .unwrap();
-            db.enqueue_transfer("upload", &entry.file_id.to_string(), path, &entry.name, 1)
-                .unwrap();
+            db.enqueue_transfer(
+                "upload",
+                &entry.file_id.to_string(),
+                path,
+                &entry.name,
+                1,
+                None,
+            )
+            .unwrap();
         }
 
         let marked = db
@@ -3165,5 +5046,89 @@ mod tests {
             db.resolve_conflict("missing", "resolved_keep_local", ""),
             Err(CoreError::NotFound(_))
         ));
+    }
+    #[test]
+    fn supplemental_entry_metadata_roundtrips_without_duplicate_canonical_fields() {
+        let db = test_db();
+        let mut entry = file_entry("Draft.md", 7);
+        entry.content_ref = Some(ContentRef {
+            blob_id: uuid::Uuid::now_v7(),
+            hash: "content".into(),
+            size: 7,
+            mime: "text/markdown".into(),
+            storage_key: ".s4drive/blobs/content".into(),
+        });
+        entry.version_history = vec![uuid::Uuid::now_v7()];
+        entry.attributes.favorite = true;
+        entry.attributes.tags = vec!["keep".into()];
+        entry.lock_state.locked = true;
+        entry.lock_state.owner_device_id = Some(uuid::Uuid::now_v7());
+        entry.mime = Some("text/markdown".into());
+        db.register_file_at_path_with_state(
+            &entry,
+            "/root/Notes/Draft.md",
+            "Notes/Draft.md",
+            "synced",
+        )
+        .unwrap();
+        assert!(db.entry_metadata_available(&entry.file_id).unwrap());
+        let first = db.get_file(&entry.file_id).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&first.content_ref).unwrap(),
+            serde_json::to_value(&entry.content_ref).unwrap()
+        );
+        let parent = uuid::Uuid::now_v7();
+        db.set_parent(&entry.file_id, Some(parent)).unwrap();
+        db.update_local_path(&entry.file_id, "/root/Notes/Renamed.md", "Notes/Renamed.md")
+            .unwrap();
+        db.mark_file_synced_with_content(&entry.file_id, 9, "canonical-new-hash")
+            .unwrap();
+        let updated = db.get_file(&entry.file_id).unwrap().unwrap();
+        assert_eq!(updated.parent_id, Some(parent));
+        assert_eq!(updated.name, "Renamed.md");
+        assert_eq!(updated.content_hash.as_deref(), Some("canonical-new-hash"));
+        assert_eq!(updated.size, 9);
+        assert_eq!(updated.attributes.tags, vec!["keep"]);
+        let conn = db.conn.lock().unwrap();
+        let json: String = conn
+            .query_row(
+                "SELECT entry_metadata FROM objects WHERE file_id=?1",
+                [entry.file_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for field in [
+            "file_id",
+            "parent_id",
+            "name",
+            "size",
+            "content_hash",
+            "current_revision_id",
+        ] {
+            assert!(
+                metadata.get(field).is_none(),
+                "duplicate authority: {field}"
+            );
+        }
+    }
+    #[test]
+    fn legacy_entry_metadata_stays_unknown_and_malformed_cache_is_a_typed_error() {
+        let db = test_db();
+        let id = uuid::Uuid::now_v7();
+        db.conn.lock().unwrap().execute("INSERT INTO objects(file_id,local_path,s3_key,state) VALUES(?1,'/root/Notes/Old.md','Notes/Old.md','synced')",[id.to_string()]).unwrap();
+        assert!(!db.entry_metadata_available(&id).unwrap());
+        let legacy = db.get_file(&id).unwrap().unwrap();
+        assert!(legacy.content_ref.is_none());
+        assert!(legacy.version_history.is_empty());
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE objects SET entry_metadata='invalid json' WHERE file_id=?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(db.get_file(&id), Err(CoreError::Database(_))));
     }
 }

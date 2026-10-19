@@ -28,6 +28,15 @@ pub trait S3ObjectStore {
     async fn head_object(&self, key: &str) -> CoreResult<ObjectMeta>;
     async fn delete_object(&self, key: &str) -> CoreResult<()>;
     async fn list_objects(&self, prefix: &str) -> CoreResult<Vec<String>>;
+
+    /// Delete `key` only while its ETag is `expected_etag`. `false`: the
+    /// object changed or is gone. A store without conditional DELETE refuses
+    /// instead of deleting unconditionally.
+    async fn delete_if_match(&self, key: &str, _expected_etag: &str) -> CoreResult<bool> {
+        Err(CoreError::S3(format!(
+            "conditional delete is not supported for {key}"
+        )))
+    }
 }
 
 /// S3 adapter wrapping the aws-sdk-s3 client.
@@ -111,6 +120,16 @@ impl S3Adapter {
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub async fn create_bucket(&self) -> CoreResult<()> {
+        let _ = self
+            .client
+            .create_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await;
+        Ok(())
     }
 
     async fn with_retry<T, Fut, F>(&self, mut operation: F) -> CoreResult<T>
@@ -432,6 +451,41 @@ impl S3Adapter {
     }
 
     /// DELETE an object.
+    /// DELETE with `If-Match`. Some S3-compatible endpoints ignore the
+    /// condition; callers that rely on it must probe the endpoint first
+    /// (see `sync::maintenance::conditional_delete_supported`).
+    pub async fn delete_if_match(&self, key: &str, expected_etag: &str) -> CoreResult<bool> {
+        let expected_etag = quote_etag_for_condition(expected_etag);
+        self.with_retry(|| {
+            let expected_etag = expected_etag.clone();
+            async move {
+                let result = self
+                    .client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .if_match(expected_etag)
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(err) => {
+                        let service_err = err.into_service_error();
+                        let code = service_err.meta().code().map(ToString::to_string);
+                        if is_precondition_failed_error(code.as_deref(), &service_err) {
+                            return Ok(false);
+                        }
+                        match classify_s3_service_error(code.as_deref(), service_err, key) {
+                            CoreError::NotFound(_) => Ok(false),
+                            error => Err(error),
+                        }
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn delete_object(&self, key: &str) -> CoreResult<()> {
         self.with_retry(|| async move {
             self.client
@@ -985,6 +1039,10 @@ impl S3ObjectStore for S3Adapter {
         S3Adapter::delete_object(self, key).await
     }
 
+    async fn delete_if_match(&self, key: &str, expected_etag: &str) -> CoreResult<bool> {
+        S3Adapter::delete_if_match(self, key, expected_etag).await
+    }
+
     async fn list_objects(&self, prefix: &str) -> CoreResult<Vec<String>> {
         S3Adapter::list_objects(self, prefix).await
     }
@@ -1053,7 +1111,7 @@ fn is_precondition_failed_error(code: Option<&str>, e: impl std::fmt::Display) -
 pub(crate) fn classify_s3_error(e: impl std::fmt::Display, context: &str) -> CoreError {
     let raw = e.to_string();
     let msg = format!("s3 error ({}): {}", context, raw);
-    let msg_lower = msg.to_ascii_lowercase();
+    let msg_lower = raw.to_ascii_lowercase();
 
     if msg_lower.contains("412") || msg_lower.contains("preconditionfailed") {
         CoreError::Conflict(format!("412 PreconditionFailed: {}", context))
@@ -1168,5 +1226,43 @@ mod tests {
             classify_s3_error("dispatch failure: timeout", "k"),
             CoreError::Network(_)
         ));
+    }
+
+    #[test]
+    fn missing_tree_entry_with_412_in_its_id_is_not_a_precondition_failure() {
+        let key = ".s4drive/meta/tree/01a127b5-a486-7291-b412-d63fc70714b5.json";
+        let error = classify_s3_service_error(Some("NoSuchKey"), "service error", key);
+        assert!(matches!(error, CoreError::NotFound(_)), "{error}");
+    }
+
+    #[test]
+    fn object_key_does_not_change_error_classification() {
+        for message in [
+            "404 NoSuchKey",
+            "403 AccessDenied",
+            "409 Conflict",
+            "412 PreconditionFailed",
+            "dispatch failure: timeout",
+            "quota exhausted",
+        ] {
+            let expected = classify_s3_error(message, "neutral-key");
+            for key in [
+                "folder/403.txt",
+                "folder/404.txt",
+                "folder/409.txt",
+                "folder/412.txt",
+                "folder/not found.txt",
+                "folder/timeout.txt",
+                "folder/conflict.txt",
+            ] {
+                let actual = classify_s3_error(message, key);
+                assert_eq!(
+                    std::mem::discriminant(&actual),
+                    std::mem::discriminant(&expected),
+                    "message={message}, key={key}, actual={actual}"
+                );
+                assert!(actual.to_string().contains(key));
+            }
+        }
     }
 }

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Cross-platform file system watcher.
 /// Wraps the `notify` crate and debounces events.
@@ -61,29 +62,35 @@ enum RawEvent {
     RenameTo(String),
 }
 
+/// How long a rename half waits for its pair before it counts as a move out
+/// of (or into) the folder. The sync loop drains again as soon as a half is
+/// held, so one drain is not enough for the watcher to deliver the pair.
+const RENAME_PAIR_WAIT: Duration = Duration::from_secs(1);
+
 /// Thread-safe event stream for polling from the sync engine.
 pub struct FsEventStream {
     rx: Arc<Mutex<mpsc::Receiver<RawEvent>>>,
     pending: Vec<RawEvent>,
-    /// Rename halves without their pair in the last drain.
-    held: Vec<RawEvent>,
+    /// Rename halves without their pair yet, with when they arrived.
+    held: Vec<(RawEvent, Instant)>,
+    pair_wait: Duration,
 }
 
 impl FsEventStream {
     /// Drain all available events without blocking.
     ///
-    /// A rename half whose pair is in the same drain is dropped. A half
-    /// without a pair waits for one more drain, in case the pair was not
-    /// delivered yet, and then becomes a delete (moved out of the folder) or
-    /// a create (moved in).
+    /// A rename half whose pair has arrived is dropped. A half without a pair
+    /// is held until the pair arrives or `RENAME_PAIR_WAIT` passes; then it
+    /// becomes a delete (moved out of the folder) or a create (moved in).
     pub fn drain(&mut self) -> Vec<FsEvent> {
         self.receive();
+        let now = Instant::now();
         let held = std::mem::take(&mut self.held);
         let fresh = std::mem::take(&mut self.pending);
 
         let mut renamed_from = HashSet::new();
         let mut renamed_to = HashSet::new();
-        for raw in held.iter().chain(&fresh) {
+        for raw in held.iter().map(|(raw, _)| raw).chain(&fresh) {
             if let RawEvent::Ready(FsEvent::Renamed { from, to }) = raw {
                 renamed_from.insert(from.clone());
                 renamed_to.insert(to.clone());
@@ -91,27 +98,32 @@ impl FsEventStream {
         }
 
         let mut events = Vec::new();
-        for (raw, waited) in held
+        for (raw, since) in held
             .into_iter()
-            .map(|raw| (raw, true))
-            .chain(fresh.into_iter().map(|raw| (raw, false)))
+            .chain(fresh.into_iter().map(|raw| (raw, now)))
         {
+            let waited = now.duration_since(since) >= self.pair_wait;
             match raw {
                 RawEvent::Ready(event) => events.push(event),
                 RawEvent::RenameFrom(path) if renamed_from.contains(&path) => {}
                 RawEvent::RenameTo(path) if renamed_to.contains(&path) => {}
                 RawEvent::RenameFrom(path) if waited => events.push(FsEvent::Deleted(path)),
                 RawEvent::RenameTo(path) if waited => events.push(FsEvent::Created(path)),
-                half => self.held.push(half),
+                half => self.held.push((half, since)),
             }
         }
-        events
+        edits_follow_renames(drop_rename_round_trips(events))
     }
 
-    /// Return true if at least one event is ready without discarding it.
+    /// Return true if at least one event is ready without discarding it. A
+    /// held rename half is ready only once its wait for the pair is over.
     pub fn has_pending(&mut self) -> bool {
         self.receive();
-        !self.pending.is_empty() || !self.held.is_empty()
+        !self.pending.is_empty()
+            || self
+                .held
+                .iter()
+                .any(|(_, since)| since.elapsed() >= self.pair_wait)
     }
 
     fn receive(&mut self) {
@@ -121,6 +133,81 @@ impl FsEventStream {
             }
         }
     }
+}
+
+/// Replaying old remote placements can move an indexed file away and back
+/// before the watcher is drained. Those closed trips are not new local edits.
+fn drop_rename_round_trips(events: Vec<FsEvent>) -> Vec<FsEvent> {
+    let mut chain: Vec<usize> = Vec::new();
+    let mut dropped = HashSet::new();
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            FsEvent::Renamed { from, to } => {
+                if !chain.last().is_some_and(
+                    |prior| matches!(&events[*prior], FsEvent::Renamed { to, .. } if to == from),
+                ) {
+                    chain.clear();
+                }
+                let loop_start = chain.iter().position(
+                    |prior| matches!(&events[*prior], FsEvent::Renamed { from, .. } if from == to),
+                );
+                if let Some(start) = loop_start {
+                    dropped.extend(chain.drain(start..));
+                    dropped.insert(index);
+                } else {
+                    chain.push(index);
+                }
+            }
+            // Preserve ordering around edits and replacements at any path.
+            _ => chain.clear(),
+        }
+    }
+    events
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, event)| (!dropped.contains(&index)).then_some(event))
+        .collect()
+}
+
+/// Events are handled after the fact, against the disk as it is now. An edit
+/// reported before its file was renamed is handled at the new path; at the
+/// old one it would read whatever file has taken that name since.
+fn edits_follow_renames(events: Vec<FsEvent>) -> Vec<FsEvent> {
+    let mut ordered: Vec<FsEvent> = Vec::with_capacity(events.len());
+    for event in events {
+        let FsEvent::Renamed { from, to } = &event else {
+            ordered.push(event);
+            continue;
+        };
+        let (moved, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut ordered)
+            .into_iter()
+            .map(|earlier| match moved_edit(&earlier, from, to) {
+                Some(edit) => Err(edit),
+                None => Ok(earlier),
+            })
+            .partition(|edit| edit.is_err());
+        ordered.extend(kept.into_iter().filter_map(Result::ok));
+        ordered.push(event);
+        ordered.extend(moved.into_iter().filter_map(Result::err));
+    }
+    ordered
+}
+
+/// The created or modified `event` at or inside `from`, moved under `to`.
+fn moved_edit(event: &FsEvent, from: &str, to: &str) -> Option<FsEvent> {
+    let (FsEvent::Created(path) | FsEvent::Modified(path)) = event else {
+        return None;
+    };
+    let inside = Path::new(path).strip_prefix(from).ok()?;
+    let path = if inside.as_os_str().is_empty() {
+        to.to_string()
+    } else {
+        Path::new(to).join(inside).to_string_lossy().into_owned()
+    };
+    Some(match event {
+        FsEvent::Created(_) => FsEvent::Created(path),
+        _ => FsEvent::Modified(path),
+    })
 }
 
 impl FileWatcher {
@@ -183,6 +270,7 @@ impl FileWatcher {
                 rx,
                 pending: Vec::new(),
                 held: Vec::new(),
+                pair_wait: RENAME_PAIR_WAIT,
             },
         ))
     }
@@ -292,9 +380,21 @@ fn convert_notify_event(event: &Event) -> Option<RawEvent> {
     Some(RawEvent::Ready(fs_event))
 }
 
+fn is_internal_staging(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| {
+            let s = name.to_string_lossy();
+            s.starts_with(".s4drive_staging") || s.contains(".s4drive-restore-")
+        })
+        .unwrap_or(false)
+}
+
 fn convert_rename_event(event: &Event) -> Option<FsEvent> {
     let from = event.paths.first()?;
     let to = event.paths.get(1)?;
+    if is_internal_staging(to) {
+        return None;
+    }
     let from_ignored = should_ignore_path(from);
     let to_ignored = should_ignore_path(to);
 
@@ -418,6 +518,7 @@ mod tests {
             rx: Arc::new(Mutex::new(rx)),
             pending: Vec::new(),
             held: Vec::new(),
+            pair_wait: Duration::from_millis(50),
         };
         (tx, stream)
     }
@@ -460,6 +561,116 @@ mod tests {
     }
 
     #[test]
+    fn remote_rename_round_trip_does_not_become_a_new_local_change() {
+        let (tx, mut stream) = stream();
+        tx.send(rename("/s/final.md", "/s/old.md")).unwrap();
+        tx.send(rename("/s/old.md", "/s/final.md")).unwrap();
+        assert!(stream.drain().is_empty());
+    }
+
+    #[test]
+    fn nested_rename_round_trip_keeps_the_genuine_placement_change() {
+        let (tx, mut stream) = stream();
+        tx.send(rename("/s/a.md", "/s/b.md")).unwrap();
+        tx.send(rename("/s/b.md", "/s/c.md")).unwrap();
+        tx.send(rename("/s/c.md", "/s/b.md")).unwrap();
+        let events = stream.drain();
+        assert!(matches!(events.as_slice(), [FsEvent::Renamed { from, to }]
+            if from == "/s/a.md" && to == "/s/b.md"));
+    }
+
+    #[test]
+    fn genuine_rename_chain_and_recreated_source_are_preserved() {
+        let (tx, mut stream) = stream();
+        tx.send(rename("/s/a.md", "/s/b.md")).unwrap();
+        tx.send(rename("/s/b.md", "/s/c.md")).unwrap();
+        tx.send(RawEvent::Ready(FsEvent::Created("/s/a.md".into())))
+            .unwrap();
+        assert_eq!(
+            kinds(&stream.drain()),
+            [
+                ("renamed", "/s/b.md"),
+                ("renamed", "/s/c.md"),
+                ("created", "/s/a.md")
+            ]
+        );
+    }
+
+    #[test]
+    fn editing_at_an_intermediate_path_keeps_the_rename_events() {
+        let (tx, mut stream) = stream();
+        tx.send(rename("/s/a.md", "/s/b.md")).unwrap();
+        tx.send(RawEvent::Ready(FsEvent::Modified("/s/b.md".into())))
+            .unwrap();
+        tx.send(rename("/s/b.md", "/s/a.md")).unwrap();
+        assert_eq!(
+            kinds(&stream.drain()),
+            [
+                ("renamed", "/s/b.md"),
+                ("renamed", "/s/a.md"),
+                ("modified", "/s/a.md")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edit_before_a_rename_follows_the_file_not_the_old_path() {
+        // Regression: the edit was handled at a.md after a new file took that
+        // name, and its bytes became a revision of the renamed file.
+        let (tx, mut stream) = stream();
+        tx.send(RawEvent::Ready(FsEvent::Modified("/s/a.md".into())))
+            .unwrap();
+        tx.send(rename("/s/a.md", "/s/b.md")).unwrap();
+        tx.send(rename("/s/b.md", "/s/c.md")).unwrap();
+        tx.send(RawEvent::Ready(FsEvent::Created("/s/a.md".into())))
+            .unwrap();
+        assert_eq!(
+            kinds(&stream.drain()),
+            [
+                ("renamed", "/s/b.md"),
+                ("renamed", "/s/c.md"),
+                ("modified", "/s/c.md"),
+                ("created", "/s/a.md")
+            ]
+        );
+    }
+
+    #[test]
+    fn edits_inside_a_renamed_folder_follow_it() {
+        let (tx, mut stream) = stream();
+        tx.send(RawEvent::Ready(FsEvent::Created("/s/dir/new.md".into())))
+            .unwrap();
+        tx.send(RawEvent::Ready(FsEvent::Modified("/s/dir2/x.md".into())))
+            .unwrap();
+        tx.send(rename("/s/dir", "/s/moved")).unwrap();
+        assert_eq!(
+            kinds(&stream.drain()),
+            [
+                ("modified", "/s/dir2/x.md"),
+                ("renamed", "/s/moved"),
+                ("created", "/s/moved/new.md")
+            ]
+        );
+    }
+
+    #[test]
+    fn replacing_the_source_breaks_a_rename_round_trip() {
+        let (tx, mut stream) = stream();
+        tx.send(rename("/s/a.md", "/s/b.md")).unwrap();
+        tx.send(RawEvent::Ready(FsEvent::Created("/s/a.md".into())))
+            .unwrap();
+        tx.send(rename("/s/b.md", "/s/a.md")).unwrap();
+        assert_eq!(
+            kinds(&stream.drain()),
+            [
+                ("renamed", "/s/b.md"),
+                ("created", "/s/a.md"),
+                ("renamed", "/s/a.md")
+            ]
+        );
+    }
+
+    #[test]
     fn rename_split_across_drains_is_still_one_event() {
         let (tx, mut stream) = stream();
         tx.send(RawEvent::RenameFrom("/s/a.txt".into())).unwrap();
@@ -472,13 +683,29 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_half_survives_quick_drains_until_its_pair_arrives() {
+        // Regression: the sync loop drains again right away, and a half held
+        // for one drain became a delete before its pair was delivered.
+        let (tx, mut stream) = stream();
+        tx.send(RawEvent::RenameFrom("/s/a.txt".into())).unwrap();
+        assert!(stream.drain().is_empty());
+        assert!(stream.drain().is_empty(), "the half waits for its pair");
+
+        tx.send(RawEvent::RenameTo("/s/b.txt".into())).unwrap();
+        tx.send(rename("/s/a.txt", "/s/b.txt")).unwrap();
+        assert_eq!(kinds(&stream.drain()), [("renamed", "/s/b.txt")]);
+    }
+
+    #[test]
     fn move_out_and_move_in_become_delete_and_create() {
         let (tx, mut stream) = stream();
         tx.send(RawEvent::RenameFrom("/s/gone.txt".into())).unwrap();
         tx.send(RawEvent::RenameTo("/s/new.txt".into())).unwrap();
 
-        // The pair gets one drain to arrive; the loop is woken up for it.
+        // The halves wait for their pairs; the loop is woken up once that is over.
         assert!(stream.drain().is_empty());
+        assert!(!stream.has_pending());
+        std::thread::sleep(Duration::from_millis(60));
         assert!(stream.has_pending());
         assert_eq!(
             kinds(&stream.drain()),

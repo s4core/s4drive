@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use crate::db::{IndexedFolder, LocalDatabase};
 use crate::error::{CoreError, CoreResult};
 use crate::metadata::placement::Placement;
-use crate::metadata::types::{FileEntry, FileId, Operation};
+use crate::metadata::tree::FileTree;
+use crate::metadata::types::{EntryType, FileEntry, FileId, Operation};
+use crate::transfer::TransferQueue;
 
 use super::folders::FolderNodes;
 use super::{
@@ -23,6 +25,8 @@ pub(super) struct RemoteChanges<'a> {
     pub versions: &'a VersionApi,
     pub sync_folder: &'a str,
     pub folders: FolderNodes<'a>,
+    pub tree: &'a FileTree<'a>,
+    pub transfer: &'a TransferQueue,
 }
 
 impl RemoteChanges<'_> {
@@ -32,6 +36,133 @@ impl RemoteChanges<'_> {
             self.place_folder(folder_id, &placement, op).await?;
         }
         Ok(0)
+    }
+
+    /// A folder or file restored on another device.
+    pub async fn restored(&self, file_id: FileId, op: &Operation) -> CoreResult<u32> {
+        let Some(placement) = Placement::of_op(op) else {
+            return Ok(0);
+        };
+        let remote = match self.tree.get_entry(&file_id).await {
+            Ok(remote) if remote.deleted_at.is_none() => remote,
+            Ok(_) | Err(CoreError::NotFound(_)) => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        if remote.entry_type == EntryType::File {
+            let Some(relative) = self.folders.resolve(&placement).await? else {
+                tracing::warn!("Restored file {} is inside a deleted folder", file_id);
+                return Ok(0);
+            };
+            let local_path = safe_join_sync_path(self.sync_folder, &relative)?;
+            return self.bring_back_file(&remote, &local_path).await;
+        }
+        // Where the folder was when it was deleted: its contents are still there in the index.
+        let deleted_at = self.db.get_local_path(&file_id)?;
+        self.place_folder(file_id, &placement, op).await?;
+        if let Some(folder) = self.db.folder_by_id(&file_id)? {
+            if !Path::new(&folder.local_path).exists() {
+                let _ = std::fs::create_dir_all(&folder.local_path);
+            }
+            let _ = self.db.mark_file_synced(&file_id);
+            if let Some(deleted_at) = deleted_at {
+                self.bring_back_contents(&deleted_at, &folder.local_path)
+                    .await?;
+            }
+        }
+        Ok(0)
+    }
+
+    /// A restored folder comes back with what is still in it remotely: the
+    /// files and folders this device removed with it return at the new place.
+    /// An entry the bucket no longer has stays removed.
+    async fn bring_back_contents(&self, deleted_at: &str, restored_at: &str) -> CoreResult<()> {
+        for (entry, old_path) in self.db.removed_remotely_under(deleted_at)? {
+            let remote = match self.tree.get_entry(&entry.file_id).await {
+                Ok(remote) if remote.deleted_at.is_none() => remote,
+                Ok(_) | Err(CoreError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let inside = Path::new(&old_path)
+                .strip_prefix(deleted_at)
+                .map_err(|_| CoreError::Internal(format!("{old_path} is not in {deleted_at}")))?;
+            let local_path = Path::new(restored_at).join(inside);
+            if remote.entry_type == EntryType::File {
+                self.bring_back_file(&remote, &local_path).await?;
+                continue;
+            }
+            std::fs::create_dir_all(&local_path).map_err(|e| {
+                CoreError::FileSystem(format!("restore folder {}: {e}", local_path.display()))
+            })?;
+            let key = relative_s3_key(self.sync_folder, &local_path)?;
+            self.db.register_file_at_path_with_state(
+                &remote,
+                &local_path.to_string_lossy(),
+                &key,
+                "synced",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Put a restored file at `local_path`. Bytes already there that are the
+    /// restored ones (this device restored it) are only indexed; other bytes
+    /// are kept as a conflict copy before the restored version is downloaded.
+    /// Returns conflicts found.
+    async fn bring_back_file(&self, remote: &FileEntry, local_path: &Path) -> CoreResult<u32> {
+        let Some(content) = &remote.content_ref else {
+            return Ok(0);
+        };
+        let local_path_text = local_path.to_string_lossy().to_string();
+        let key = relative_s3_key(self.sync_folder, local_path)?;
+        let file_id = remote.file_id.to_string();
+        if local_path.is_file()
+            && !local_file_changed_since_sync(local_path, Some(&content.hash)).await?
+        {
+            self.db
+                .register_file_at_path_with_state(remote, &local_path_text, &key, "synced")?;
+            return Ok(0);
+        }
+        let mut conflicts = 0;
+        if local_path.exists() {
+            let now = chrono::Utc::now().to_rfc3339();
+            let conflict_path = ConflictEngine::create_conflict_copy(
+                &local_path_text,
+                self.sync_folder,
+                &key,
+                self.versions.device_name(),
+                &now,
+            )?;
+            let reason = ConflictEngine::explain_conflict(
+                &ConflictType::CreateCreate,
+                &local_path_text,
+                &key,
+                self.versions.device_name(),
+                "remote",
+                &now,
+                &remote.updated_at,
+            );
+            self.conflict.register(&file_id, &local_path_text, &reason);
+            self.conflict_engine.record_conflict(
+                &file_id,
+                &ConflictType::CreateCreate,
+                &local_path_text,
+                &key,
+                &conflict_path,
+                None,
+                None,
+                &reason,
+            )?;
+            conflicts = 1;
+        }
+        self.db.register_file_at_path_with_state(
+            remote,
+            &local_path_text,
+            &key,
+            "pending_download",
+        )?;
+        self.transfer
+            .enqueue_download(&file_id, &local_path_text, &content.storage_key)?;
+        Ok(conflicts)
     }
 
     /// A file or folder renamed or moved on another device. Returns
@@ -97,8 +228,12 @@ impl RemoteChanges<'_> {
             std::fs::rename(&old_path, &new_path)
                 .map_err(|e| CoreError::FileSystem(format!("remote rename apply: {}", e)))?;
         }
+        let new_path_text = new_path.to_string_lossy();
         self.db
-            .update_local_path(&file_id, &new_path.to_string_lossy(), &new_name)?;
+            .update_local_path(&file_id, &new_path_text, &new_name)?;
+        // A download queued before the rename must land at the new name.
+        self.db
+            .repoint_transfers(&file_id, &new_path_text, &new_name)?;
         self.db.set_parent(&file_id, placement.parent_id)?;
         self.activity
             .log("remote_rename", &file_id.to_string(), &op.op_id, "applied")?;
@@ -107,6 +242,12 @@ impl RemoteChanges<'_> {
 
     /// A file or folder deleted on another device. Returns conflicts found.
     pub async fn deleted(&self, file_id: FileId, op: &Operation) -> CoreResult<u32> {
+        if matches!(
+            self.db.get_object_state(&file_id)?.as_deref(),
+            Some("deleted_locally" | "deleted_remotely")
+        ) {
+            return Ok(0);
+        }
         if let Some(folder) = self.db.folder_by_id(&file_id)? {
             return self.delete_folder(&folder, op).await;
         }
@@ -119,6 +260,9 @@ impl RemoteChanges<'_> {
         placement: &Placement,
         op: &Operation,
     ) -> CoreResult<()> {
+        if super::folder_recovery::is_remotely_deleted(self.folders.store(), folder_id).await? {
+            return Ok(());
+        }
         let Some(parent_path) = self.folders.parent_path(placement.parent_id).await? else {
             tracing::warn!("Remote folder {} is inside a deleted folder", folder_id);
             return Ok(());
@@ -139,6 +283,9 @@ impl RemoteChanges<'_> {
             move_local_file_to_trash(self.sync_folder, &folder.local_path, &folder.file_id)?;
             self.db
                 .mark_subtree_deleted(&folder.local_path, "deleted_remotely")?;
+            if folder.remote_path == "Notes" {
+                self.db.notes_accept_recovered_root(folder.file_id, true)?;
+            }
             self.activity.log(
                 "remote_delete",
                 &folder.file_id.to_string(),

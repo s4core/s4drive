@@ -1,0 +1,17 @@
+{
+  "workspace_id": "11111111-1111-1111-1111-111111111111",
+  "root": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "parent_id": null,
+    "kind": "folder",
+    "name": "Notes",
+    "display_name": "Notes",
+    "relative_path": "Notes",
+    "updated_at": "2026-10-09T00:00:00Z",
+    "sync_state": "synced",
+    "is_root": true,
+    "available_locally": false
+  },
+  "availability": "blocked",
+  "session_generation": 1
+}

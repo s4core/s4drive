@@ -1,0 +1,19 @@
+{
+  "entry": {
+    "id": "01900000-0000-7000-8000-000000000001",
+    "parent_id": "00000000-0000-0000-0000-000000000001",
+    "kind": "note",
+    "name": "Untitled.md",
+    "display_name": "Untitled",
+    "relative_path": "Notes/Untitled.md",
+    "updated_at": "2026-10-09T00:00:00Z",
+    "sync_state": "local_only",
+    "is_root": false,
+    "available_locally": true
+  },
+  "body": "﻿line\r\n",
+  "token": {
+    "generation": 7,
+    "content_hash": "correct-hash"
+  }
+}

@@ -17,11 +17,15 @@ pub mod db;
 pub mod desktop;
 pub mod diagnostics;
 pub mod error;
+pub mod fs_mutations;
 pub mod metadata;
 pub mod mobile;
+pub mod notes;
 pub mod optimization;
 pub mod s3;
 pub mod sync;
+#[cfg(feature = "notes-test-hooks")]
+pub mod test_hooks;
 pub mod transfer;
 pub mod watcher;
 

@@ -10,6 +10,11 @@ Usage:
   e2e_s3.py rb BUCKET                    delete every object, then the bucket
   e2e_s3.py ls BUCKET PREFIX             print the keys under PREFIX
   e2e_s3.py get-prefix BUCKET PREFIX DIR download the keys under PREFIX into DIR
+  e2e_s3.py get BUCKET KEY FILE          download one object into FILE
+  e2e_s3.py put BUCKET KEY FILE          upload FILE as one object (test fixtures only)
+  e2e_s3.py conditional-delete BUCKET    exit 0 if DELETE honours If-Match
+  e2e_s3.py chain BUCKET                 print the ops reachable from head, newest
+                                         first, one JSON object per line
 
 Environment: S4_E2E_ENDPOINT, S4_E2E_ACCESS_KEY, S4_E2E_SECRET_KEY,
 S4_E2E_REGION (default us-east-1). Buckets are addressed path-style.
@@ -18,6 +23,7 @@ S4_E2E_REGION (default us-east-1). Buckets are addressed path-style.
 import datetime
 import hashlib
 import hmac
+import json
 import os
 import sys
 import urllib.error
@@ -49,7 +55,7 @@ def sign(key, message):
     return hmac.new(key, message.encode(), hashlib.sha256).digest()
 
 
-def request(method, bucket, key="", query=None, body=b""):
+def request(method, bucket, key="", query=None, body=b"", extra_headers=None):
     """Send one SigV4-signed request and return the response body."""
     # Each segment is encoded on its own; a trailing "/" (folder marker) stays.
     path = "/" + quote(bucket) + ("/" + "/".join(map(quote, key.split("/"))) if key else "")
@@ -86,6 +92,7 @@ def request(method, bucket, key="", query=None, body=b""):
         f"SignedHeaders={signed_headers}, Signature={signature}"
     )
     del headers["host"]  # urllib sets it from the URL
+    headers.update(extra_headers or {})
 
     url = ENDPOINT + path + (f"?{query_string}" if query_string else "")
     req = urllib.request.Request(url, data=body or None, method=method, headers=headers)
@@ -120,6 +127,38 @@ def get_prefix(bucket, prefix, dest):
             file.write(request("GET", bucket, key))
 
 
+def chain(bucket):
+    """Ops reachable from head: committed ones, unlike every op object listed."""
+    op_id = request("GET", bucket, ".s4drive/meta/heads/current").decode().strip()
+    while op_id:
+        op = json.loads(request("GET", bucket, f".s4drive/meta/ops/{op_id}.json"))
+        effects = op.get("effects") or {}
+        content = effects.get("new_content_ref") or {}
+        print(json.dumps({
+            "op_id": op["op_id"],
+            "op_type": op["op_type"],
+            "target": op.get("target_file_id"),
+            "name": effects.get("new_name"),
+            "parent": effects.get("new_parent_id"),
+            "deleted": effects.get("deleted"),
+            "blob": content.get("storage_key"),
+        }))
+        op_id = op.get("base_head") or ""
+
+
+def honours_conditional_delete(bucket):
+    """DELETE with a stale If-Match must leave the object in place."""
+    key = ".s4drive-e2e-conditional-delete-probe"
+    request("PUT", bucket, key, body=b"probe")
+    try:
+        request("DELETE", bucket, key, extra_headers={"If-Match": '"stale"'})
+    except SystemExit:
+        pass  # 412: refused, as it should be
+    honoured = key in list_keys(bucket, key)
+    request("DELETE", bucket, key)
+    return honoured
+
+
 def remove_bucket(bucket):
     for key in list_keys(bucket, ""):
         request("DELETE", bucket, key)
@@ -135,6 +174,16 @@ def main(args):
         print("\n".join(list_keys(args[1], args[2])))
     elif len(args) == 4 and args[0] == "get-prefix":
         get_prefix(args[1], args[2], args[3])
+    elif len(args) == 4 and args[0] == "get":
+        with open(args[3], "wb") as file:
+            file.write(request("GET", args[1], args[2]))
+    elif len(args) == 4 and args[0] == "put":
+        with open(args[3], "rb") as file:
+            request("PUT", args[1], args[2], body=file.read())
+    elif len(args) == 2 and args[0] == "conditional-delete":
+        sys.exit(0 if honours_conditional_delete(args[1]) else 1)
+    elif len(args) == 2 and args[0] == "chain":
+        chain(args[1])
     else:
         sys.exit(__doc__)
 

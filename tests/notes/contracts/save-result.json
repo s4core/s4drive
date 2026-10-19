@@ -1,0 +1,10 @@
+{
+  "note_id": "01900000-0000-7000-8000-000000000001",
+  "request_id": "01900000-0000-7000-8000-0000000000aa",
+  "token": {
+    "generation": 8,
+    "content_hash": "next-hash"
+  },
+  "saved_at": "2026-10-09T00:00:01Z",
+  "sync_state": "pending"
+}

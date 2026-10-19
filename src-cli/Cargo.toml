@@ -18,3 +18,8 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+# Test-only checkpoints for scripts/ci_notes.sh; never in releases.
+notes-test-hooks = ["s4drive-core/notes-test-hooks"]

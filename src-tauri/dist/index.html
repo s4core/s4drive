@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>S4Drive</title>
   <link rel="stylesheet" href="css/main.css" />
+  <link rel="stylesheet" href="css/notes.css" />
   <style>
     /* Critical path — flash prevention */
     body { opacity: 0; }
@@ -31,6 +32,7 @@
         <nav class="app-nav" id="appNav" role="tablist">
           <button class="nav-btn active" data-route="overview" role="tab" aria-selected="true"><span class="nav-icon">⌘</span><span>Dashboard</span></button>
           <button class="nav-btn" data-route="files" role="tab" aria-selected="false"><span class="nav-icon">▦</span><span>Files</span></button>
+          <button class="nav-btn" data-route="notes" role="tab" aria-selected="false"><span class="nav-icon">📝</span><span>Notes</span></button>
           <button class="nav-btn" data-route="transfers" role="tab" aria-selected="false"><span class="nav-icon">⇅</span><span>Transfers</span></button>
           <button class="nav-btn" data-route="conflicts" role="tab" aria-selected="false"><span class="nav-icon">!</span><span>Conflicts</span></button>
           <button class="nav-btn" data-route="versions" role="tab" aria-selected="false"><span class="nav-icon">↺</span><span>Versions</span></button>
@@ -132,6 +134,9 @@
           </aside>
         </div>
       </section>
+
+      <!-- ===== NOTES ===== -->
+      <section class="screen" id="screen-notes" role="tabpanel"></section>
 
       <!-- ===== VERSION HISTORY ===== -->
       <section class="screen" id="screen-versions" role="tabpanel">
@@ -383,7 +388,7 @@
           <div class="setting-row">
             <div class="setting-label">
               <div class="setting-name">Visible Lines</div>
-              <div class="setting-desc">The log file keeps up to the last 10000 lines on disk</div>
+              <div class="setting-desc">Up to 150 MB on disk: three rotating files of 50 MB each</div>
             </div>
             <div class="setting-inline-inputs">
               <select class="setting-input setting-input-sm" id="inputLogLimit">
@@ -392,6 +397,14 @@
               </select>
               <button class="btn btn-outline" id="btnRefreshLogs">Refresh</button>
             </div>
+          </div>
+        </div>
+        <div class="card log-location">
+          <div class="setting-name">Log file</div>
+          <code id="logFilePath"></code>
+          <div class="log-location-actions">
+            <button class="btn btn-outline" id="btnOpenLogFolder">Open folder</button>
+            <button class="btn btn-outline" id="btnCopyLogPath">Copy path</button>
           </div>
         </div>
         <div class="card log-list" id="logList">
@@ -443,6 +456,28 @@
     <div class="toast-container" id="toastContainer" aria-live="polite"></div>
   </div>
 
+  <script src="vendor/markdown-it.min.js"></script>
+  <script src="vendor/purify.min.js"></script>
+  <dialog id="folderRecoveryDialog" class="folder-recovery-dialog" aria-labelledby="folderRecoveryTitle" aria-describedby="folderRecoveryDescription">
+    <h2 id="folderRecoveryTitle">Warning! Local folder is missing</h2>
+    <p id="folderRecoveryDescription">The local folder was deleted or moved. Sync is waiting for your decision.</p>
+    <code id="folderRecoveryPath"></code>
+    <p>Restore downloads the saved server data. Changes that were never uploaded cannot be recovered from the server.</p>
+    <p>Delete removes the data from the server and other devices too.</p>
+    <p id="folderRecoveryError" aria-live="assertive" hidden></p>
+    <p id="folderRecoveryProgress" role="status" hidden>Working… Keep S4Drive running.</p>
+    <div class="folder-recovery-actions">
+      <button class="btn btn-primary" id="btnRestoreFolder">Restore data from server</button>
+      <button class="btn btn-danger" id="btnDeleteFolder">Удалить локально и с сервера</button>
+    </div>
+  </dialog>
   <script src="js/main.js"></script>
+  <script type="module">
+    import { initNotesApp } from './js/notes/notes-controller.js';
+    const notesScreen = document.getElementById('screen-notes');
+    if (notesScreen) {
+      window.__NOTES_APP__ = initNotesApp(notesScreen);
+    }
+  </script>
 </body>
 </html>

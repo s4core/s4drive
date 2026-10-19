@@ -24,6 +24,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+mod notes;
+
 /// Deepest folder chain printed; a longer one can only be a cycle.
 const MAX_PRINTED_FOLDER_DEPTH: usize = 256;
 
@@ -121,6 +123,8 @@ enum Commands {
         #[command(subcommand)]
         action: FmAction,
     },
+    /// Работа с заметками (Markdown notes в папке Notes)
+    Notes(notes::NotesCliArgs),
     /// s4drive:// deep links delegated by the desktop file.
     #[command(external_subcommand)]
     External(Vec<String>),
@@ -253,6 +257,9 @@ enum SyncAction {
         /// Seconds between remote polls while syncing; grows up to 10x when idle
         #[arg(long, default_value_t = 10)]
         poll_interval: u64,
+        /// State directory containing SQLite database and journal
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
     Status {
         #[arg(short, long)]
@@ -267,6 +274,9 @@ enum SyncAction {
         region: String,
         #[arg(short, long)]
         local_path: String,
+        /// State directory containing SQLite database and journal
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -425,6 +435,7 @@ async fn main() {
                 local_path,
                 device_name,
                 poll_interval,
+                state_dir,
             } => {
                 run_sync_start(
                     &endpoint,
@@ -435,6 +446,7 @@ async fn main() {
                     &local_path,
                     &device_name,
                     poll_interval,
+                    state_dir.as_deref(),
                 )
                 .await;
             }
@@ -445,6 +457,7 @@ async fn main() {
                 secret_key,
                 region,
                 local_path,
+                state_dir,
             } => {
                 run_sync_status(
                     &endpoint,
@@ -453,10 +466,14 @@ async fn main() {
                     &secret_key,
                     &region,
                     &local_path,
+                    state_dir.as_deref(),
                 )
                 .await;
             }
         },
+        Commands::Notes(notes_args) => {
+            notes::run_notes(notes_args).await;
+        }
         Commands::Desktop { action } => match action {
             DesktopAction::InstallContextMenu => run_desktop_install_context_menu(),
             DesktopAction::InstallDesktop => run_desktop_install_desktop(),
@@ -1573,6 +1590,7 @@ async fn run_sync_start(
     local_path: &str,
     device_name: &str,
     poll_interval: u64,
+    state_dir: Option<&Path>,
 ) {
     println!();
     println!("╔══════════════════════════════════════════════╗");
@@ -1589,6 +1607,9 @@ async fn run_sync_start(
     config.sync_folder.local_path = local_path.to_string();
     config.sync_folder.polling_interval_sec = poll_interval;
     config.core.device_name = Some(device_name.to_string());
+    if let Some(dir) = state_dir {
+        config.core.db_path = dir.join("db.sqlite").to_string_lossy().to_string();
+    }
 
     let mut core = s4drive_core::core::S4DriveCore::new(config);
 
@@ -1642,6 +1663,7 @@ async fn run_sync_status(
     secret_key: &str,
     region: &str,
     local_path: &str,
+    state_dir: Option<&Path>,
 ) {
     println!();
     println!("╔══════════════════════════════════════════════╗");
@@ -1651,6 +1673,9 @@ async fn run_sync_status(
 
     let mut config = build_config(endpoint, bucket, access_key, secret_key, region);
     config.sync_folder.local_path = local_path.to_string();
+    if let Some(dir) = state_dir {
+        config.core.db_path = dir.join("db.sqlite").to_string_lossy().to_string();
+    }
 
     let mut core = s4drive_core::core::S4DriveCore::new(config);
 

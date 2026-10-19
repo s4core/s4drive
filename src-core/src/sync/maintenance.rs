@@ -11,8 +11,8 @@ use crate::metadata::ops::OperationLog;
 use crate::metadata::serializer::Serializer;
 use crate::metadata::snapshots::SnapshotManager;
 use crate::metadata::tree::{FileTree, TombstoneManager};
-use crate::metadata::types::{ContentRef, FileEntry, Operation};
-use crate::s3::S3Adapter;
+use crate::metadata::types::{ContentRef, FileEntry, FileId, Operation};
+use crate::s3::{S3Adapter, S3ObjectStore};
 use serde::Deserialize;
 use std::path::Path;
 use uuid::Uuid;
@@ -26,6 +26,113 @@ const BLOB_DISCOVERY_MAX_PAGES_PER_PASS: usize = 2;
 const REMOTE_SNAPSHOT_PAGE_SIZE: i32 = 1000;
 const SNAPSHOT_PREFIX: &str = ".s4drive/meta/snapshots/";
 const OPS_PREFIX: &str = ".s4drive/meta/ops/";
+const CONDITIONAL_DELETE_PROBE_PREFIX: &str = ".s4drive/meta/probes/conditional-delete/";
+/// An ETag no stored object has: the probe's first DELETE must fail.
+const STALE_ETAG: &str = "00000000000000000000000000000000";
+
+/// What happened to one deletion record during cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TombstoneCleanup {
+    Missing,
+    NotExpired,
+    Retired,
+    /// Kept because removing it could hide or destroy live data.
+    Kept(&'static str),
+}
+
+/// Retire one expired deletion record, never the entry it described.
+///
+/// Expiry only ends the record's retention: the delete itself was applied to
+/// the tree when it was committed. A record is retired only when the tree
+/// agrees with the newest retained op on the id, and only with `If-Match` on
+/// the observed version, so a newer deletion of another device survives.
+pub(crate) async fn collect_expired_tombstone_at<S: S3ObjectStore + ?Sized>(
+    store: &S,
+    file_id: FileId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> CoreResult<TombstoneCleanup> {
+    let version = match TombstoneManager::new(store)
+        .get_tombstone_version(&file_id)
+        .await
+    {
+        Ok(version) => version,
+        Err(CoreError::NotFound(_)) => return Ok(TombstoneCleanup::Missing),
+        Err(CoreError::Protocol(_) | CoreError::Conflict(_)) => {
+            return Ok(TombstoneCleanup::Kept("the deletion record cannot be read"))
+        }
+        Err(error) => return Err(error),
+    };
+    let Ok(retention_until) =
+        chrono::DateTime::parse_from_rfc3339(&version.tombstone.retention_until)
+    else {
+        return Ok(TombstoneCleanup::Kept("the retention time cannot be read"));
+    };
+    if retention_until > now {
+        return Ok(TombstoneCleanup::NotExpired);
+    }
+
+    let live = match FileTree::new(store).get_entry(&file_id).await {
+        Ok(_) => true,
+        Err(CoreError::NotFound(_)) => false,
+        Err(error) => return Err(error),
+    };
+    let mut clock = 0;
+    let latest = OperationLog::new(store, Uuid::nil(), &mut clock)
+        .latest_on_target(file_id)
+        .await?;
+    match latest.map(|op| op.effects.deleted) {
+        Some(true) if live => {
+            return Ok(TombstoneCleanup::Kept(
+                "the tree still lists an entry the log deleted",
+            ))
+        }
+        Some(false) if !live => {
+            return Ok(TombstoneCleanup::Kept(
+                "a later change of the entry is not in the tree yet",
+            ))
+        }
+        // The deletion is in effect, or a later change brought the entry back
+        // (a restore before records were retired on restore).
+        _ => {}
+    }
+
+    let key = Serializer::tombstone_key(&file_id.to_string());
+    if store.delete_if_match(&key, &version.etag).await? {
+        Ok(TombstoneCleanup::Retired)
+    } else {
+        Ok(TombstoneCleanup::Kept(
+            "a newer deletion replaced the record",
+        ))
+    }
+}
+
+/// Whether the endpoint honours `If-Match` on DELETE. Some S3-compatible
+/// stores ignore it; destructive cleanup must not run on those.
+pub async fn conditional_delete_supported<S: S3ObjectStore + ?Sized>(
+    store: &S,
+) -> CoreResult<bool> {
+    let key = format!("{CONDITIONAL_DELETE_PROBE_PREFIX}{}", Uuid::now_v7());
+    if !store.put_if_not_exists(&key, b"probe".to_vec()).await? {
+        return Ok(false);
+    }
+    let etag = store.head_object(&key).await?.etag;
+    let supported = match store.delete_if_match(&key, STALE_ETAG).await {
+        Ok(false) => match store.head_object(&key).await {
+            Ok(_) => store.delete_if_match(&key, &etag).await?,
+            Err(CoreError::NotFound(_)) => false,
+            Err(error) => return Err(error),
+        },
+        Ok(true) | Err(_) => false,
+    };
+    if !supported {
+        // Our own unique probe object; nothing else can be named like it.
+        match store.delete_object(&key).await {
+            Ok(()) | Err(CoreError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(supported)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceReport {
@@ -85,6 +192,7 @@ impl SyncMaintenance {
         activity: &ActivityLog,
         sync_folder: &str,
     ) -> CoreResult<MaintenanceReport> {
+        super::folder_recovery::ensure_available(db, sync_folder)?;
         if !self.config.enabled {
             return Ok(MaintenanceReport::default());
         }
@@ -348,8 +456,13 @@ impl SyncMaintenance {
         s3: &S3Adapter,
         db: &LocalDatabase,
     ) -> CoreResult<u64> {
+        if !conditional_delete_supported(s3).await? {
+            tracing::warn!(
+                "Expired deletion records are kept: the endpoint ignores conditional DELETE"
+            );
+            return Ok(0);
+        }
         let manager = TombstoneManager::new(s3);
-        let tree = FileTree::new(s3);
         let now = chrono::Utc::now();
         let batch_limit = self.config.remote_tombstone_batch_size.max(1) as u64;
         let mut deleted = 0u64;
@@ -366,23 +479,17 @@ impl SyncMaintenance {
                 if deleted >= batch_limit {
                     break;
                 }
-
-                let Ok(tombstone) = manager.get_tombstone(file_id).await else {
-                    continue;
-                };
-                let Ok(retention_until) =
-                    chrono::DateTime::parse_from_rfc3339(&tombstone.retention_until)
-                else {
-                    continue;
-                };
-                if retention_until > now {
-                    continue;
+                // A kept record is listed again once the cursor wraps around.
+                match collect_expired_tombstone_at(s3, *file_id, now).await {
+                    Ok(TombstoneCleanup::Retired) => deleted += 1,
+                    Ok(TombstoneCleanup::Kept(reason)) => {
+                        tracing::debug!("Deletion record {} kept: {}", file_id, reason)
+                    }
+                    Ok(TombstoneCleanup::NotExpired | TombstoneCleanup::Missing) => {}
+                    Err(error) => {
+                        tracing::warn!("Deletion record {} kept: {}", file_id, error)
+                    }
                 }
-
-                s3.delete_object(&Serializer::tombstone_key(&file_id.to_string()))
-                    .await?;
-                let _ = tree.delete_entry(file_id).await;
-                deleted += 1;
             }
 
             if deleted >= batch_limit {

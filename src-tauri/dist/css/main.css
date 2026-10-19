@@ -1214,3 +1214,25 @@ select.setting-input option {
   .explorer-layout { grid-template-columns: 1fr; }
   .details-panel { position: static; }
 }
+/* A native modal stays above Notes dialogs and every application screen. */
+.folder-recovery-dialog {
+  margin: auto;
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-card);
+  color: var(--text);
+}
+.folder-recovery-dialog::backdrop { background: rgba(0, 0, 0, .65); }
+.folder-recovery-dialog h2 { margin: 0 0 12px; font-size: 19px; }
+.folder-recovery-dialog p { margin: 12px 0; line-height: 1.5; }
+.folder-recovery-dialog code, .log-location code { display: block; overflow-wrap: anywhere; white-space: normal; }
+.folder-recovery-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+#folderRecoveryError { color: var(--error, #ff7777); }
+.log-location { margin-bottom: 12px; padding: 16px; }
+.log-location code { margin: 10px 0; user-select: text; }
+.log-location-actions { display: flex; gap: 8px; flex-wrap: wrap; }

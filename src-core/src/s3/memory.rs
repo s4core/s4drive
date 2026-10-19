@@ -108,4 +108,35 @@ impl S3ObjectStore for MemoryStore {
     async fn list_objects(&self, prefix: &str) -> CoreResult<Vec<String>> {
         Ok(self.keys(prefix))
     }
+
+    async fn delete_if_match(&self, key: &str, expected_etag: &str) -> CoreResult<bool> {
+        let mut objects = self.objects.lock().unwrap();
+        match objects.get(key) {
+            Some((_, etag)) if etag == expected_etag.trim_matches('"') => {
+                objects.remove(key);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delete_if_match_removes_only_the_observed_version() {
+        let store = MemoryStore::default();
+        let old = store.put_object("key", b"old".to_vec()).await.unwrap();
+        store.put_object("key", b"new".to_vec()).await.unwrap();
+
+        assert!(!store.delete_if_match("key", &old).await.unwrap());
+        assert_eq!(store.get_object("key").await.unwrap(), b"new");
+
+        let current = store.head_object("key").await.unwrap().etag;
+        assert!(store.delete_if_match("key", &current).await.unwrap());
+        assert!(!store.delete_if_match("key", &current).await.unwrap());
+        assert!(store.keys("key").is_empty());
+    }
 }

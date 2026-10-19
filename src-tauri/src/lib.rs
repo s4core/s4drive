@@ -1,5 +1,10 @@
 //! S4Drive Tauri desktop shell: tray-first window lifecycle and IPC bridge.
 
+pub mod notes;
+#[cfg(feature = "notes-e2e")]
+mod notes_e2e;
+pub mod notes_lifecycle;
+
 use s4drive_core::{
     config::{default_device_name, default_exclude_patterns, Config},
     credentials::{resolve_secret, CredentialStore},
@@ -10,8 +15,10 @@ use s4drive_core::{
     },
     s3::S3Adapter,
     sync::{
-        folders::FolderNodes, scan_folder_recursive_bounded, ActivityLog, ConflictEngine,
-        ConflictResolution, SyncEngine, SyncState, VersionApi,
+        folder_recovery::{self, FolderRecoveryStatus, RecoveryDecision},
+        folders::FolderNodes,
+        scan_folder_recursive_bounded, ActivityLog, ConflictEngine, ConflictResolution, SyncEngine,
+        SyncState, VersionApi,
     },
     transfer::TransferQueue,
     watcher::FileWatcher,
@@ -22,10 +29,10 @@ use std::{
     collections::VecDeque,
     f64::consts::PI,
     fs::{File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -50,13 +57,17 @@ const TRAY_ID: &str = "s4drive-main";
 const LOCAL_AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TRAY_ANIMATION_INTERVAL: Duration = Duration::from_millis(350);
+/// How long an action the user asked for waits for a running sync pass.
+const USER_ACTION_SYNC_WAIT: Duration = Duration::from_secs(30);
 const DESKTOP_FILE_LIST_LIMIT: usize = 5_000;
 const DESKTOP_SYNC_SCAN_LIMIT: usize = 100_000;
+/// The local SQLite index shared by the sync engine and Notes.
+const LOCAL_INDEX_FILE: &str = "local-index.sqlite";
 const DESKTOP_VERSION_LIST_LIMIT: usize = 100;
 const LARGE_SYNC_CONFIRM_THRESHOLD: usize = 50_000;
 const LOG_FILE_NAME: &str = "s4drive.log";
-const LOG_MAX_LINES: usize = 10_000;
-const LOG_ROTATION_RETAIN_LINES: usize = 5_000;
+const LOG_MAX_BYTES: usize = 50_000_000;
+const LOG_FILE_COUNT: usize = 3;
 const LOG_DEFAULT_VISIBLE_LINES: usize = 1_000;
 const LOG_MAX_VISIBLE_LINES: usize = 2_000;
 const LOG_DEFAULT_LEVEL: &str = "warn";
@@ -150,11 +161,16 @@ impl DesktopSettings {
 
 /// Shared app state for tray actions and IPC commands.
 pub struct AppState {
+    sync_execution: tokio::sync::Mutex<()>,
+    folder_attention: AtomicBool,
+    folder_recovery: Mutex<Option<FolderRecoveryStatus>>,
     sync_running: AtomicBool,
     sync_paused: AtomicBool,
     large_sync_attention: AtomicBool,
     auto_sync_started: AtomicBool,
     tray_animation_started: AtomicBool,
+    /// The icon the tray shows now, whoever drew it (`TrayIcon as u8`).
+    tray_icon: AtomicU8,
     conflict_count: AtomicU32,
     allow_exit: AtomicBool,
     exit_started: AtomicBool,
@@ -172,11 +188,15 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            sync_execution: tokio::sync::Mutex::new(()),
+            folder_attention: AtomicBool::new(false),
+            folder_recovery: Mutex::new(None),
             sync_running: AtomicBool::new(false),
             sync_paused: AtomicBool::new(false),
             large_sync_attention: AtomicBool::new(false),
             auto_sync_started: AtomicBool::new(false),
             tray_animation_started: AtomicBool::new(false),
+            tray_icon: AtomicU8::new(TrayIcon::Idle as u8),
             conflict_count: AtomicU32::new(0),
             allow_exit: AtomicBool::new(false),
             exit_started: AtomicBool::new(false),
@@ -197,6 +217,7 @@ impl Default for AppState {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncStatus {
+    pub folder_recovery: Option<FolderRecoveryStatus>,
     pub running: bool,
     pub paused: bool,
     pub state: String,
@@ -372,9 +393,9 @@ struct BoundedLogWriter {
 struct BoundedLogState {
     file: Option<File>,
     path: PathBuf,
-    max_lines: usize,
-    retain_lines: usize,
-    line_count: usize,
+    max_bytes: usize,
+    file_count: usize,
+    byte_count: usize,
 }
 
 struct BoundedLogGuard {
@@ -382,21 +403,24 @@ struct BoundedLogGuard {
 }
 
 impl BoundedLogWriter {
-    fn new(path: PathBuf, max_lines: usize, retain_lines: usize) -> io::Result<Self> {
+    fn new(path: PathBuf, max_bytes: usize, file_count: usize) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let max_lines = max_lines.max(1);
-        let retain_lines = retain_lines.clamp(1, max_lines);
-        let line_count = rotate_log_file_if_needed(&path, max_lines, retain_lines)?;
+        let max_bytes = max_bytes.max(1);
+        let file_count = file_count.max(1);
+        for index in 0..file_count {
+            bound_existing_log(&numbered_log_path(&path, index), max_bytes)?;
+        }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let byte_count = file.metadata()?.len() as usize;
         Ok(Self {
             inner: Arc::new(Mutex::new(BoundedLogState {
                 file: Some(file),
                 path,
-                max_lines,
-                retain_lines,
-                line_count,
+                max_bytes,
+                file_count,
+                byte_count,
             })),
         })
     }
@@ -418,38 +442,43 @@ impl Write for BoundedLogGuard {
             .inner
             .lock()
             .map_err(|_| io::Error::other("log writer mutex poisoned"))?;
-        state
-            .file
-            .as_mut()
-            .ok_or_else(|| io::Error::other("log file is not open"))?
-            .write_all(buf)?;
-        let new_lines = buf.iter().filter(|byte| **byte == b'\n').count();
-        if new_lines > 0 {
-            state.line_count = state.line_count.saturating_add(new_lines);
-            if state.line_count > state.max_lines {
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            if state.byte_count == state.max_bytes {
                 if let Some(mut file) = state.file.take() {
                     file.flush()?;
                 }
-                let rotation =
-                    rotate_log_file_if_needed(&state.path, state.max_lines, state.retain_lines);
+                let rotation = rotate_log_files(&state.path, state.file_count);
                 state.file = Some(
                     OpenOptions::new()
                         .create(true)
                         .append(true)
                         .open(&state.path)?,
                 );
-                state.line_count = rotation?;
+                state.byte_count = state
+                    .file
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("log file is not open"))?
+                    .metadata()?
+                    .len() as usize;
+                rotation?;
             }
+            let count = remaining.len().min(state.max_bytes - state.byte_count);
+            state
+                .file
+                .as_mut()
+                .ok_or_else(|| io::Error::other("log file is not open"))?
+                .write_all(&remaining[..count])?;
+            state.byte_count += count;
+            remaining = &remaining[count..];
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut state = self
-            .inner
+        self.inner
             .lock()
-            .map_err(|_| io::Error::other("log writer mutex poisoned"))?;
-        state
+            .map_err(|_| io::Error::other("log writer mutex poisoned"))?
             .file
             .as_mut()
             .ok_or_else(|| io::Error::other("log file is not open"))?
@@ -457,44 +486,48 @@ impl Write for BoundedLogGuard {
     }
 }
 
-fn rotate_log_file_if_needed(
-    path: &Path,
-    max_lines: usize,
-    retain_lines: usize,
-) -> io::Result<usize> {
-    if !path.exists() {
-        return Ok(0);
+fn numbered_log_path(path: &Path, index: usize) -> PathBuf {
+    if index == 0 {
+        path.to_owned()
+    } else {
+        path.with_extension(format!("log.{index}"))
     }
+}
 
-    let max_lines = max_lines.max(1);
-    let retain_lines = retain_lines.clamp(1, max_lines);
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut line_count = 0usize;
-    let mut recent = VecDeque::with_capacity(retain_lines.min(1024));
-    for line in reader.lines() {
-        let line = line?;
-        line_count = line_count.saturating_add(1);
-        if recent.len() == retain_lines {
-            recent.pop_front();
+fn bound_existing_log(path: &Path, max_bytes: usize) -> io::Result<()> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() <= max_bytes as u64 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-(max_bytes as i64)))?;
+    let mut tail = Vec::with_capacity(max_bytes);
+    file.read_to_end(&mut tail)?;
+    drop(file);
+    File::create(path)?.write_all(&tail)
+}
+
+fn rotate_log_files(path: &Path, file_count: usize) -> io::Result<()> {
+    let oldest = numbered_log_path(path, file_count - 1);
+    match std::fs::remove_file(oldest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    for index in (1..file_count).rev() {
+        match std::fs::rename(
+            numbered_log_path(path, index - 1),
+            numbered_log_path(path, index),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        recent.push_back(line);
     }
-
-    if line_count <= max_lines {
-        return Ok(line_count);
-    }
-
-    let temp_path = path.with_extension("log.tmp");
-    {
-        let mut temp = File::create(&temp_path)?;
-        for line in &recent {
-            writeln!(temp, "{}", line)?;
-        }
-        temp.flush()?;
-    }
-    std::fs::rename(temp_path, path)?;
-    Ok(recent.len())
+    Ok(())
 }
 
 fn normalize_log_level(level: &str) -> &'static str {
@@ -539,10 +572,36 @@ fn log_level_rank(level: &str) -> u8 {
 }
 
 fn log_path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
+    #[cfg(target_os = "linux")]
+    let directory = {
+        let state_home = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
+        state_home
+            .map(Ok)
+            .unwrap_or_else(|| app.path().home_dir().map(|home| home.join(".local/state")))
+            .map_err(|e| e.to_string())?
+            .join("s4drive/logs")
+    };
+    #[cfg(target_os = "windows")]
+    let directory = app
+        .path()
+        .local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("S4Drive/logs");
+    #[cfg(target_os = "macos")]
+    let directory = app
+        .path()
+        .home_dir()
+        .map_err(|e| e.to_string())?
+        .join("Library/Logs/S4Drive");
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let directory = app
+        .path()
         .app_config_dir()
-        .map(|dir| dir.join("logs").join(LOG_FILE_NAME))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
+        .join("logs");
+    Ok(directory.join(LOG_FILE_NAME))
 }
 
 fn init_desktop_logging(app: &AppHandle, settings: &DesktopSettings) {
@@ -553,8 +612,7 @@ fn init_desktop_logging(app: &AppHandle, settings: &DesktopSettings) {
             return;
         }
     };
-    let writer = match BoundedLogWriter::new(path.clone(), LOG_MAX_LINES, LOG_ROTATION_RETAIN_LINES)
-    {
+    let writer = match BoundedLogWriter::new(path.clone(), LOG_MAX_BYTES, LOG_FILE_COUNT) {
         Ok(writer) => writer,
         Err(error) => {
             eprintln!(
@@ -613,8 +671,9 @@ fn read_log_entries(path: &Path, level: &str, limit: usize) -> Result<Vec<LogEnt
 
     let reader = BufReader::new(file);
     let mut recent = VecDeque::with_capacity(limit);
-    for line in reader.lines() {
-        let raw = line.map_err(|e| e.to_string())?;
+    for line in reader.split(b'\n') {
+        let bytes = line.map_err(|e| e.to_string())?;
+        let raw = String::from_utf8_lossy(&bytes);
         let entry = parse_log_entry(&raw);
         if log_level_rank(&entry.level) > max_rank {
             continue;
@@ -665,6 +724,8 @@ fn parse_log_level_token(token: Option<&str>) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(feature = "notes-e2e")]
+    notes_e2e::apply_env_args();
     configure_linux_appimage_env();
 
     let app = tauri::Builder::default()
@@ -672,7 +733,9 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_share::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .manage(notes::NotesState::default())
         .setup(|app| {
             let logging_settings = load_settings_from_disk(app.handle()).unwrap_or_default();
             init_desktop_logging(app.handle(), &logging_settings);
@@ -691,6 +754,12 @@ pub fn run() {
             ensure_auto_sync(app.handle());
             if needs_setup {
                 show_main_window(app.handle(), Some("account")).map_err(std::io::Error::other)?;
+            }
+            #[cfg(feature = "notes-e2e")]
+            {
+                let test_route =
+                    std::env::var("S4_E2E_STARTUP_ROUTE").unwrap_or_else(|_| "notes".to_string());
+                let _ = show_main_window(app.handle(), Some(&test_route));
             }
             Ok(())
         })
@@ -714,6 +783,7 @@ pub fn run() {
             toggle_pause,
             inspect_sync_folder,
             sync_now,
+            resolve_folder_recovery,
             open_window,
             take_pending_route,
             get_files,
@@ -726,8 +796,39 @@ pub fn run() {
             resolve_conflict,
             run_diagnostics,
             get_logs,
+            get_log_path,
+            open_log_folder,
             set_log_level,
             check_for_updates,
+            notes::notes_open_workspace,
+            notes::notes_list_children,
+            notes::notes_search_names,
+            notes::notes_read,
+            notes::notes_create_note,
+            notes::notes_create_folder,
+            notes::notes_save,
+            notes::notes_rename,
+            notes::notes_move,
+            notes::notes_delete,
+            notes::notes_list_deleted,
+            notes::notes_restore,
+            notes::notes_sync,
+            notes::notes_backup,
+            notes::notes_cancel_backup,
+            notes::notes_job_status,
+            notes::notes_open_folder,
+            notes::notes_reveal_archive,
+            notes::notes_restore_root_location,
+            notes::notes_open_link,
+            notes::notes_flush_ack,
+            #[cfg(feature = "notes-e2e")]
+            notes_e2e::notes_e2e_process_info,
+            #[cfg(feature = "notes-e2e")]
+            notes_e2e::notes_e2e_window,
+            #[cfg(feature = "notes-e2e")]
+            notes_e2e::notes_e2e_request_exit,
+            #[cfg(feature = "notes-e2e")]
+            notes_e2e::notes_e2e_tray_icon,
         ])
         .build(tauri::generate_context!());
 
@@ -863,7 +964,13 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     .large_sync_attention
                     .load(Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    let result = if requires_confirmation {
+                    let result = if app
+                        .state::<AppState>()
+                        .folder_attention
+                        .load(Ordering::Relaxed)
+                    {
+                        show_main_window(&app, None)
+                    } else if requires_confirmation {
                         show_large_sync_confirmation(&app)
                     } else {
                         toggle_main_window(&app)
@@ -899,12 +1006,6 @@ fn ensure_auto_sync(app: &AppHandle) {
             if state.exit_started.load(Ordering::SeqCst) {
                 break;
             }
-            if state.sync_paused.load(Ordering::Relaxed)
-                || state.sync_running.load(Ordering::Relaxed)
-            {
-                continue;
-            }
-
             let settings = match state.settings.lock() {
                 Ok(settings) => settings.clone(),
                 Err(error) => {
@@ -912,11 +1013,24 @@ fn ensure_auto_sync(app: &AppHandle) {
                     continue;
                 }
             };
+            match refresh_folder_recovery(&app, &settings) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!("could not inspect local folder: {}", error);
+                    continue;
+                }
+            }
+            if state.sync_paused.load(Ordering::Relaxed)
+                || state.sync_running.load(Ordering::Relaxed)
+            {
+                continue;
+            }
             if !settings.account_is_complete() {
                 continue;
             }
 
-            let sync_folder = match ensure_sync_folder(&settings) {
+            let sync_folder = match prepare_sync_folder(&app, &settings) {
                 Ok(path) => path,
                 Err(error) => {
                     tracing::warn!("auto sync could not prepare sync folder: {}", error);
@@ -998,6 +1112,55 @@ fn ensure_auto_sync(app: &AppHandle) {
     });
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum TrayIcon {
+    Idle,
+    Sync,
+    Warning,
+}
+
+impl TrayIcon {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Sync,
+            2 => Self::Warning,
+            _ => Self::Idle,
+        }
+    }
+}
+
+/// The icon the animation loop draws next. Warning and sync animate, so they
+/// are drawn on every tick; idle only when the tray shows something else,
+/// which may have been drawn outside the loop (a warning drawn by a thread
+/// that read the attention flag just before it was cleared).
+fn tray_icon_to_draw(attention: bool, running: bool, shown: TrayIcon) -> Option<TrayIcon> {
+    if attention {
+        Some(TrayIcon::Warning)
+    } else if running {
+        Some(TrayIcon::Sync)
+    } else if shown != TrayIcon::Idle {
+        Some(TrayIcon::Idle)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "notes-e2e")]
+pub(crate) fn tray_icon_name(app: &AppHandle) -> &'static str {
+    match TrayIcon::from_u8(app.state::<AppState>().tray_icon.load(Ordering::SeqCst)) {
+        TrayIcon::Idle => "idle",
+        TrayIcon::Sync => "sync",
+        TrayIcon::Warning => "warning",
+    }
+}
+
+fn record_tray_icon(app: &AppHandle, icon: TrayIcon) {
+    app.state::<AppState>()
+        .tray_icon
+        .store(icon as u8, Ordering::SeqCst);
+}
+
 fn ensure_tray_sync_animation(app: &AppHandle) {
     let state = app.state::<AppState>();
     if state.tray_animation_started.swap(true, Ordering::SeqCst) {
@@ -1007,7 +1170,6 @@ fn ensure_tray_sync_animation(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut frame = 0usize;
-        let mut showing_animated_icon = false;
 
         loop {
             tokio::time::sleep(TRAY_ANIMATION_INTERVAL).await;
@@ -1017,24 +1179,34 @@ fn ensure_tray_sync_animation(app: &AppHandle) {
                 break;
             }
 
-            if state.large_sync_attention.load(Ordering::Relaxed) {
-                set_tray_warning_icon(&app, frame);
-                frame = frame.wrapping_add(1);
-                showing_animated_icon = true;
-            } else if state.sync_running.load(Ordering::Relaxed) {
-                set_tray_sync_icon(&app, frame);
-                frame = frame.wrapping_add(1);
-                showing_animated_icon = true;
-            } else if showing_animated_icon {
-                set_tray_idle_icon(&app);
-                frame = 0;
-                showing_animated_icon = false;
+            let attention = state.large_sync_attention.load(Ordering::Relaxed)
+                || state.folder_attention.load(Ordering::Relaxed);
+            let running = state.sync_running.load(Ordering::Relaxed);
+            let shown = TrayIcon::from_u8(state.tray_icon.load(Ordering::SeqCst));
+            match tray_icon_to_draw(attention, running, shown) {
+                Some(TrayIcon::Warning) => set_tray_warning_icon(&app, frame),
+                Some(TrayIcon::Sync) => set_tray_sync_icon(&app, frame),
+                Some(TrayIcon::Idle) => set_tray_idle_icon(&app),
+                None => {}
             }
+            frame = if attention || running {
+                frame.wrapping_add(1)
+            } else {
+                0
+            };
         }
     });
 }
 
 fn spawn_sync_now(app: &AppHandle) {
+    if app
+        .state::<AppState>()
+        .folder_attention
+        .load(Ordering::Relaxed)
+    {
+        spawn_show_main_window(app, None);
+        return;
+    }
     if app
         .state::<AppState>()
         .large_sync_attention
@@ -1140,7 +1312,7 @@ fn set_pending_route(state: &AppState, route: Option<String>) -> Result<(), Stri
 fn load_settings_into_state(app: &AppHandle) {
     match load_settings_from_disk(app) {
         Ok(settings) => {
-            if let Err(error) = ensure_sync_folder(&settings) {
+            if let Err(error) = prepare_sync_folder(app, &settings) {
                 tracing::warn!("failed to prepare sync folder: {}", error);
             }
             let state = app.state::<AppState>();
@@ -1208,8 +1380,53 @@ fn ensure_sync_folder(settings: &DesktopSettings) -> Result<PathBuf, String> {
     }
 
     let path = expand_user_path(&settings.sync_folder);
-    std::fs::create_dir_all(&path)
-        .map_err(|e| format!("create sync folder {}: {}", path.to_string_lossy(), e))?;
+    if !path.is_dir() {
+        return Err(
+            "Local sync folder is missing. Open S4Drive to choose how to recover it.".into(),
+        );
+    }
+    Ok(path)
+}
+
+fn refresh_folder_recovery(
+    app: &AppHandle,
+    settings: &DesktopSettings,
+) -> Result<Option<FolderRecoveryStatus>, String> {
+    let config = app_local_config(app, settings);
+    let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
+    let root = expand_user_path(&settings.sync_folder);
+    let recovery = folder_recovery::inspect(&db, &root.to_string_lossy())
+        .map_err(|e| e.to_string())?
+        .map(|recovery| recovery.status());
+    let state = app.state::<AppState>();
+    let newly_missing = !state
+        .folder_attention
+        .swap(recovery.is_some(), Ordering::SeqCst)
+        && recovery.is_some();
+    *state.folder_recovery.lock().map_err(|e| e.to_string())? = recovery.clone();
+    if newly_missing {
+        set_sync_detail(
+            app,
+            state.inner(),
+            "Local folder is missing; choose restore or delete in S4Drive",
+        );
+        send_sync_notification(
+            app,
+            "action_required",
+            "Your local folder is missing. Sync is waiting for your decision.",
+        );
+        spawn_show_main_window(app, None);
+    }
+    Ok(recovery)
+}
+
+fn prepare_sync_folder(app: &AppHandle, settings: &DesktopSettings) -> Result<PathBuf, String> {
+    if refresh_folder_recovery(app, settings)?.is_some() {
+        return Err("Local folder recovery requires your decision in S4Drive.".into());
+    }
+    let path = expand_user_path(&settings.sync_folder);
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    refresh_folder_recovery(app, settings)?;
     Ok(path)
 }
 
@@ -1302,19 +1519,43 @@ fn resolve_desktop_secret(
 }
 
 fn app_core_config(app: &AppHandle, settings: &DesktopSettings, secret_key: String) -> Config {
-    let mut config = app_local_config(app, settings);
-    config.s3.secret_key_fallback = Some(secret_key);
-    config
+    desktop_core_config(settings, app_config_dir(app).as_deref(), secret_key)
 }
 
-fn app_local_config(app: &AppHandle, settings: &DesktopSettings) -> Config {
+/// The config of everything local: Notes and the sync engine both use it,
+/// so they open the same index.
+pub(crate) fn app_local_config<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    settings: &DesktopSettings,
+) -> Config {
+    desktop_local_config(settings, app_config_dir(app).as_deref())
+}
+
+fn app_config_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    app.path().app_config_dir().ok()
+}
+
+/// Settings as a core config without credentials. Without a config dir the
+/// core default index is used, the same one for every caller.
+fn desktop_local_config(settings: &DesktopSettings, config_dir: Option<&Path>) -> Config {
     let mut config = settings.to_core_config(None);
-    if let Ok(config_dir) = app.path().app_config_dir() {
+    if let Some(config_dir) = config_dir {
         config.core.db_path = config_dir
-            .join("local-index.sqlite")
+            .join(LOCAL_INDEX_FILE)
             .to_string_lossy()
             .to_string();
     }
+    config
+}
+
+/// `desktop_local_config` plus the secret needed to reach the bucket.
+fn desktop_core_config(
+    settings: &DesktopSettings,
+    config_dir: Option<&Path>,
+    secret_key: String,
+) -> Config {
+    let mut config = desktop_local_config(settings, config_dir);
+    config.s3.secret_key_fallback = Some(secret_key);
     config
 }
 
@@ -1873,7 +2114,7 @@ fn conflict_remote_path(
     file_id: &uuid::Uuid,
     local_path: Option<&Path>,
 ) -> Result<String, String> {
-    let sync_folder = ensure_sync_folder(settings)?;
+    let sync_folder = expand_user_path(&settings.sync_folder);
     for candidate in [
         db.get_s3_key(file_id)
             .ok()
@@ -2227,7 +2468,8 @@ fn conflict_copy_s3_key(settings: &DesktopSettings, copy_path: &Path) -> Result<
 fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
     let running = state.sync_running.load(Ordering::Relaxed);
     let paused = state.sync_paused.load(Ordering::Relaxed);
-    let attention = state.large_sync_attention.load(Ordering::Relaxed);
+    let attention = state.large_sync_attention.load(Ordering::Relaxed)
+        || state.folder_attention.load(Ordering::Relaxed);
     let conflicts = state.conflict_count.load(Ordering::Relaxed);
     let last_sync = state.last_sync.lock().map_err(|e| e.to_string())?.clone();
     let last_summary = state
@@ -2238,6 +2480,11 @@ fn current_sync_status(state: &AppState) -> Result<SyncStatus, String> {
     let detail = state.sync_detail.lock().map_err(|e| e.to_string())?.clone();
 
     Ok(SyncStatus {
+        folder_recovery: state
+            .folder_recovery
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone(),
         running,
         paused,
         state: if attention {
@@ -2421,9 +2668,12 @@ fn request_safe_exit(app: &AppHandle) {
         let _ = window.emit("app-exiting", ());
     }
 
-    state.allow_exit.store(true, Ordering::SeqCst);
-    tracing::info!("S4Drive exiting via tray menu");
-    app.exit(0);
+    let notes_state = app.state::<notes::NotesState>();
+    let generation = notes_state.session_generation();
+    let triggered = notes_state.exit_coordinator.trigger_exit(app, generation);
+    if !triggered {
+        state.exit_started.store(false, Ordering::SeqCst);
+    }
 }
 
 // Notifications
@@ -2456,14 +2706,23 @@ pub fn send_sync_notification(app: &AppHandle, kind: &str, body: &str) {
 }
 
 fn set_tray_idle_icon(app: &AppHandle) {
+    if app
+        .state::<AppState>()
+        .folder_attention
+        .load(Ordering::Relaxed)
+    {
+        set_tray_warning_icon(app, 0);
+        return;
+    }
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
     let Some(icon) = app.default_window_icon().cloned() else {
         return;
     };
-    if let Err(error) = tray.set_icon(Some(icon)) {
-        tracing::warn!("failed to restore idle tray icon: {}", error);
+    match tray.set_icon(Some(icon)) {
+        Ok(()) => record_tray_icon(app, TrayIcon::Idle),
+        Err(error) => tracing::warn!("failed to restore idle tray icon: {}", error),
     }
 }
 
@@ -2474,8 +2733,9 @@ fn set_tray_sync_icon(app: &AppHandle, frame: usize) {
     let Some(base_icon) = app.default_window_icon() else {
         return;
     };
-    if let Err(error) = tray.set_icon(Some(sync_tray_icon(base_icon, frame))) {
-        tracing::warn!("failed to update sync tray icon: {}", error);
+    match tray.set_icon(Some(sync_tray_icon(base_icon, frame))) {
+        Ok(()) => record_tray_icon(app, TrayIcon::Sync),
+        Err(error) => tracing::warn!("failed to update sync tray icon: {}", error),
     }
 }
 
@@ -2486,8 +2746,9 @@ fn set_tray_warning_icon(app: &AppHandle, frame: usize) {
     let Some(base_icon) = app.default_window_icon() else {
         return;
     };
-    if let Err(error) = tray.set_icon(Some(warning_tray_icon(base_icon, frame))) {
-        tracing::warn!("failed to update warning tray icon: {}", error);
+    match tray.set_icon(Some(warning_tray_icon(base_icon, frame))) {
+        Ok(()) => record_tray_icon(app, TrayIcon::Warning),
+        Err(error) => tracing::warn!("failed to update warning tray icon: {}", error),
     }
 }
 
@@ -2758,8 +3019,9 @@ fn get_sync_status(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<SyncStatus, String> {
-    let mut status = current_sync_status(state.inner())?;
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    refresh_folder_recovery(&app, &settings)?;
+    let mut status = current_sync_status(state.inner())?;
     status.total_files = local_live_file_count(&app, &settings);
     Ok(status)
 }
@@ -2793,17 +3055,36 @@ fn save_settings(
     mut settings: DesktopSettings,
     secret_key: Option<String>,
 ) -> Result<DesktopSettings, String> {
+    let _execution = state
+        .sync_execution
+        .try_lock()
+        .map_err(|_| "Sync or folder recovery is running. Retry shortly.".to_string())?;
     settings.log_level = normalize_log_level(&settings.log_level).to_string();
     if let Some(secret) = secret_key.as_deref() {
         save_secret_for_settings(&app, &settings, secret)?;
     }
 
-    ensure_sync_folder(&settings)?;
+    if refresh_folder_recovery(&app, &settings)?.is_none() {
+        prepare_sync_folder(&app, &settings)?;
+    }
     save_settings_to_disk(&app, &settings)?;
     let mut current = state.settings.lock().map_err(|e| e.to_string())?;
     let sync_folder_changed = current.sync_folder != settings.sync_folder;
+    // Every setting that names the Notes workspace (see `workspace_id` in core).
+    let account_changed = current.endpoint != settings.endpoint
+        || current.bucket != settings.bucket
+        || current.bucket_prefix != settings.bucket_prefix;
     *current = settings.clone();
     drop(current);
+    if sync_folder_changed || account_changed {
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            app_handle
+                .state::<notes::NotesState>()
+                .reset_workspace()
+                .await;
+        });
+    }
     if settings.large_sync_confirmed {
         clear_large_sync_attention(
             &app,
@@ -2911,9 +3192,12 @@ fn toggle_pause(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<boo
 }
 
 #[tauri::command]
-fn inspect_sync_folder(state: tauri::State<'_, AppState>) -> Result<FolderInspection, String> {
+fn inspect_sync_folder(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<FolderInspection, String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
-    let root = ensure_sync_folder(&settings)?;
+    let root = prepare_sync_folder(&app, &settings)?;
     inspect_sync_folder_inner(&settings, &root)
 }
 
@@ -2925,21 +3209,61 @@ async fn sync_now(
     run_sync_now(app, state.inner()).await
 }
 
+/// The sync slot for an action the user asked for. A running pass is waited
+/// for, not reported: it ends soon, and early while a folder recovery is
+/// pending, so the click is not lost to a background pass.
+async fn user_sync_slot(state: &AppState) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    tokio::time::timeout(USER_ACTION_SYNC_WAIT, state.sync_execution.lock())
+        .await
+        .map_err(|_| "Sync or folder recovery is running. Retry shortly.".to_string())
+}
+
+#[tauri::command]
+async fn resolve_folder_recovery(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    recovery_id: uuid::Uuid,
+    decision: RecoveryDecision,
+) -> Result<(), String> {
+    let _execution = user_sync_slot(state.inner()).await?;
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let local = app_local_config(&app, &settings);
+    let db = LocalDatabase::new(&local).map_err(|e| e.to_string())?;
+    let secret = resolve_desktop_secret(&app, &settings, None)?;
+    let config = app_core_config(&app, &settings, secret);
+    let s3 = S3Adapter::new(&config).await.map_err(|e| e.to_string())?;
+    let device = stable_device_id_from_db(&db, state.inner())?;
+    let result = folder_recovery::resolve(&config, &db, &s3, device, recovery_id, decision).await;
+    refresh_folder_recovery(&app, &settings)?;
+    result.map_err(|e| e.to_string())?;
+    app.state::<notes::NotesState>().reset_workspace().await;
+    set_sync_detail(&app, state.inner(), "Idle");
+    set_tray_idle_icon(&app);
+    app.emit("notes:folder-recovered", ())
+        .map_err(|e| e.to_string())?;
+    app.emit("files-changed", ()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 async fn run_sync_now(app: AppHandle, state: &AppState) -> Result<SyncRunResult, String> {
     run_sync_now_with_options(app, state, true).await
 }
 
-async fn run_sync_now_with_options(
+pub(crate) async fn run_sync_now_with_options(
     app: AppHandle,
     state: &AppState,
     notify_user: bool,
 ) -> Result<SyncRunResult, String> {
+    let _execution = state
+        .sync_execution
+        .try_lock()
+        .map_err(|_| "Sync is already running".to_string())?;
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
     if !settings.account_is_complete() {
         return Err("Connect a storage account before syncing".to_string());
     }
 
-    let sync_folder = ensure_sync_folder(&settings)?;
+    let sync_folder = prepare_sync_folder(&app, &settings)?;
     set_sync_detail(&app, state, "Inspecting sync folder");
     let inspection = inspect_sync_folder_inner(&settings, &sync_folder)?;
     if inspection.requires_confirmation && !settings.large_sync_confirmed {
@@ -3120,6 +3444,12 @@ async fn run_sync_now_with_options(
         let _ = window.emit("sync-status-changed", current_sync_status(state)?);
         let _ = window.emit("sync-completed", sync_result.clone());
         let _ = window.emit("files-changed", ());
+        // Bytes from another device may belong to the open note. Notes
+        // re-renders on this event, so a pass that changed nothing locally
+        // must not send it while the user types.
+        if result.files_downloaded > 0 || result.conflicts_detected > 0 {
+            let _ = window.emit("notes:changed", ());
+        }
     }
 
     if notify_user {
@@ -3284,6 +3614,8 @@ async fn restore_version(
         return Err("connect storage before restoring versions".to_string());
     }
 
+    let _execution = user_sync_slot(state.inner()).await?;
+    prepare_sync_folder(&app, &settings)?;
     let secret = resolve_desktop_secret(&app, &settings, None)?;
     let config = app_core_config(&app, &settings, secret);
     let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
@@ -3370,6 +3702,8 @@ async fn resolve_conflict(
         return Err("connect storage before resolving conflicts".to_string());
     }
 
+    let _execution = user_sync_slot(state.inner()).await?;
+    prepare_sync_folder(&app, &settings)?;
     let secret = resolve_desktop_secret(&app, &settings, None)?;
     let config = app_core_config(&app, &settings, secret);
     let db = LocalDatabase::new(&config).map_err(|e| e.to_string())?;
@@ -3634,9 +3968,9 @@ async fn run_diagnostics(
             detail: log_path(&app)
                 .map(|path| {
                     format!(
-                        "{} (up to {} lines retained, current level={})",
+                        "{} (up to {} MB across rotated files, current level={})",
                         path.display(),
-                        LOG_MAX_LINES,
+                        LOG_MAX_BYTES * LOG_FILE_COUNT / 1_000_000,
                         normalize_log_level(&settings.log_level)
                     )
                 })
@@ -3780,6 +4114,35 @@ fn get_logs(
 }
 
 #[tauri::command]
+fn get_log_path(app: AppHandle) -> Result<String, String> {
+    Ok(log_path(&app)?.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_log_folder(app: AppHandle) -> Result<(), String> {
+    let path = log_path(&app)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Log directory is unavailable".to_string())?;
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    let opener = Some("xdg-open");
+    #[cfg(target_os = "windows")]
+    let opener = Some("explorer");
+    #[cfg(target_os = "macos")]
+    let opener = Some("open");
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let opener: Option<&str> = None;
+    let opener =
+        opener.ok_or_else(|| "Open the displayed log path in your file manager.".to_string())?;
+    std::process::Command::new(opener)
+        .arg(directory)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn set_log_level(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
@@ -3815,6 +4178,56 @@ mod tests {
         let mut config = Config::default();
         config.core.db_path = ":memory:".to_string();
         LocalDatabase::new(&config).unwrap()
+    }
+
+    fn account_settings(sync_folder: &Path) -> DesktopSettings {
+        DesktopSettings {
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "notes".into(),
+            access_key_id: "access".into(),
+            sync_folder: sync_folder.to_string_lossy().into_owned(),
+            ..DesktopSettings::default()
+        }
+    }
+
+    #[test]
+    fn desktop_local_config_uses_the_local_index_in_the_config_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = account_settings(&temp.path().join("sync"));
+
+        let local = desktop_local_config(&settings, Some(temp.path()));
+        let engine = desktop_core_config(&settings, Some(temp.path()), "secret".into());
+
+        let expected = temp.path().join("local-index.sqlite");
+        assert_eq!(local.core.db_path, expected.to_string_lossy());
+        assert_eq!(engine.core.db_path, local.core.db_path);
+        assert_eq!(engine.sync_folder.local_path, local.sync_folder.local_path);
+        assert_eq!(engine.s3.endpoint, local.s3.endpoint);
+        assert_eq!(engine.s3.bucket, local.s3.bucket);
+        assert_eq!(
+            engine.sync_folder.bucket_prefix,
+            local.sync_folder.bucket_prefix
+        );
+        assert_eq!(local.s3.secret_key_fallback, None);
+        assert_eq!(engine.s3.secret_key_fallback.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn desktop_index_path_does_not_depend_on_the_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = account_settings(&temp.path().join("sync"));
+        let first = desktop_core_config(&settings, Some(temp.path()), "one".into());
+        let second = desktop_core_config(&settings, Some(temp.path()), "two".into());
+        assert_eq!(first.core.db_path, second.core.db_path);
+    }
+
+    #[test]
+    fn desktop_configs_share_one_fallback_without_a_config_dir() {
+        let settings = DesktopSettings::default();
+        let local = desktop_local_config(&settings, None);
+        let engine = desktop_core_config(&settings, None, "secret".into());
+        assert_eq!(local.core.db_path, Config::default().core.db_path);
+        assert_eq!(engine.core.db_path, local.core.db_path);
     }
 
     #[test]
@@ -3941,7 +4354,7 @@ mod tests {
 
     #[test]
     fn sync_tray_icon_adds_overlay_without_resizing() {
-        let base = Image::new_owned(vec![220, 50, 40, 255].repeat(64 * 64), 64, 64);
+        let base = Image::new_owned([220, 50, 40, 255].repeat(64 * 64), 64, 64);
         let frame = sync_tray_icon(&base, 2);
 
         assert_eq!(frame.width(), 64);
@@ -3951,7 +4364,7 @@ mod tests {
 
     #[test]
     fn warning_tray_icon_adds_animated_overlay_without_resizing() {
-        let base = Image::new_owned(vec![220, 50, 40, 255].repeat(64 * 64), 64, 64);
+        let base = Image::new_owned([220, 50, 40, 255].repeat(64 * 64), 64, 64);
         let first = warning_tray_icon(&base, 0);
         let second = warning_tray_icon(&base, 1);
 
@@ -4005,6 +4418,36 @@ mod tests {
 
         assert!(safe_join_desktop_sync_path(&root, "../escape.txt").is_err());
         assert!(safe_join_desktop_sync_path(&root, "/tmp/escape.txt").is_err());
+    }
+
+    #[test]
+    fn a_warning_drawn_after_attention_is_cleared_goes_back_to_idle() {
+        // Drawn by a thread that read the attention flag just before it was
+        // cleared, after the loop had already restored the idle icon.
+        assert_eq!(
+            tray_icon_to_draw(false, false, TrayIcon::Warning),
+            Some(TrayIcon::Idle)
+        );
+        assert_eq!(tray_icon_to_draw(false, false, TrayIcon::Idle), None);
+        assert_eq!(
+            tray_icon_to_draw(true, true, TrayIcon::Idle),
+            Some(TrayIcon::Warning)
+        );
+        assert_eq!(
+            tray_icon_to_draw(false, true, TrayIcon::Warning),
+            Some(TrayIcon::Sync)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_action_waits_for_the_running_sync_pass() {
+        let state = std::sync::Arc::new(AppState::default());
+        let pass = state.sync_execution.lock().await;
+        let held = std::sync::Arc::clone(&state);
+        let action = tokio::spawn(async move { user_sync_slot(&held).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(pass);
+        assert_eq!(action.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]
@@ -4098,29 +4541,56 @@ mod tests {
     }
 
     #[test]
-    fn log_rotation_trims_in_chunks_instead_of_every_line() {
-        let root = std::env::temp_dir().join(format!("s4drive-log-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("s4drive.log");
+    fn log_rotation_keeps_recent_files_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("s4drive.log");
+        {
+            let writer = BoundedLogWriter::new(path.clone(), 5, 3).unwrap();
+            writer.make_writer().write_all(b"111112222233333").unwrap();
+        }
         let writer = BoundedLogWriter::new(path.clone(), 5, 3).unwrap();
-        let mut guard = writer.make_writer();
-        guard
-            .write_all(b"one\ntwo\nthree\nfour\nfive\nsix\n")
-            .unwrap();
-        guard.flush().unwrap();
-
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "four\nfive\nsix\n");
-
-        guard.write_all(b"seven\n").unwrap();
-        guard.flush().unwrap();
+        writer.make_writer().write_all(b"44444").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"44444");
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "four\nfive\nsix\nseven\n"
+            std::fs::read(path.with_extension("log.1")).unwrap(),
+            b"33333"
         );
+        assert_eq!(
+            std::fs::read(path.with_extension("log.2")).unwrap(),
+            b"22222"
+        );
+    }
 
-        drop(guard);
-        drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+    #[test]
+    fn log_rotation_bounds_bytes_even_without_newlines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("s4drive.log");
+        let writer = BoundedLogWriter::new(path.clone(), 10, 3).unwrap();
+        let mut guard = writer.make_writer();
+        for _ in 0..8 {
+            guard.write_all(b"0123456789").unwrap();
+        }
+        guard.flush().unwrap();
+        let files: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert_eq!(files.len(), 3);
+        for file in files {
+            assert!(
+                file.metadata().unwrap().len() <= 10,
+                "log files must be byte-bounded"
+            );
+        }
+    }
+
+    #[test]
+    fn rotated_unicode_log_remains_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("s4drive.log");
+        let writer = BoundedLogWriter::new(path.clone(), 3, 3).unwrap();
+        writer.make_writer().write_all("яяя".as_bytes()).unwrap();
+        assert!(!read_log_entries(&path, "trace", 100).unwrap().is_empty());
     }
 
     #[test]

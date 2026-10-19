@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crate::db::{IndexedFolder, LocalDatabase};
+use crate::db::{local_file_key, IndexedFolder, LocalDatabase, LocalFileSnapshot};
 use crate::error::CoreResult;
 use crate::metadata::blobs::blob_id_from_hash;
 use crate::metadata::engine::MetadataEngine;
@@ -13,7 +13,11 @@ use crate::metadata::types::{FileEntry, FileId, OpType};
 use crate::s3::S3Adapter;
 
 use super::folders::FolderNodes;
-use super::{commit_sync_operation, is_conflict_error, relative_s3_key, ActivityLog};
+use super::notes_intake::notes_mutation_pending;
+use super::{
+    blake3_file_hash, commit_sync_operation, content_hash_matches, is_conflict_error,
+    relative_s3_key, scan_folder_recursive_bounded, ActivityLog, MAX_SYNC_SCAN_FILES,
+};
 
 /// How long deleted entries can be restored.
 const TOMBSTONE_RETENTION_DAYS: u32 = 90;
@@ -49,6 +53,22 @@ impl<'a> LocalChanges<'a> {
 
     /// A file or folder disappeared from `local_path`.
     pub async fn deleted(&self, local_path: &str) -> CoreResult<()> {
+        super::folder_recovery::ensure_available(self.db, self.sync_folder)?;
+        if self.notes_mutation_pending(&[local_path])? {
+            return Ok(());
+        }
+        if self.protects_notes_root(local_path)? {
+            self.activity.log(
+                "notes_root_missing",
+                "notes-root",
+                local_path,
+                "protected from automatic delete",
+            )?;
+            return Ok(());
+        }
+        if Path::new(local_path).symlink_metadata().is_ok() {
+            return Ok(());
+        }
         if let Some(entry) = self.db.get_file_by_local_path(local_path)? {
             // A second delete event must not tombstone the file again.
             let state = self.db.get_object_state(&entry.file_id)?;
@@ -86,6 +106,18 @@ impl<'a> LocalChanges<'a> {
 
     /// A file or folder moved from `from` to `to` inside the sync folder.
     pub async fn renamed(&self, from: &str, to: &str) -> CoreResult<()> {
+        if self.notes_mutation_pending(&[from, to])? {
+            return Ok(());
+        }
+        if self.protects_notes_root(from)? {
+            self.activity.log(
+                "notes_root_moved",
+                "notes-root",
+                &format!("{} -> {}", from, to),
+                "protected from automatic rename",
+            )?;
+            return Ok(());
+        }
         if let Some(entry) = self.db.get_file_by_local_path(from)? {
             return self.rename_file(&entry, from, to).await;
         }
@@ -107,6 +139,83 @@ impl<'a> LocalChanges<'a> {
         }
     }
 
+    /// The file `file_id` indexed at `local_path` may have been renamed and a
+    /// new file created at its old path before anything reported the rename.
+    /// A rename keeps the file key and the content, so the indexed file is
+    /// looked up by both; when found, its move is committed and true returned:
+    /// `local_path` now holds a different file. An editor that saves by
+    /// replacing the file changes the key too, but the old file is gone then.
+    pub async fn moved_away(
+        &self,
+        file_id: FileId,
+        local_path: &str,
+        exclude_patterns: &[String],
+    ) -> CoreResult<bool> {
+        let Some(snapshot) = self.db.get_file_snapshot_by_local_path(local_path)? else {
+            return Ok(false);
+        };
+        let Some(indexed_key) = snapshot.local_key.as_deref() else {
+            return Ok(false);
+        };
+        let path = Path::new(local_path);
+        if snapshot.file_id != file_id || local_file_key(path).is_none_or(|key| key == indexed_key)
+        {
+            return Ok(false);
+        }
+        let root = Path::new(self.sync_folder);
+        let scan = scan_folder_recursive_bounded(root, exclude_patterns, MAX_SYNC_SCAN_FILES)?;
+        let candidates = scan
+            .files
+            .into_iter()
+            .filter(|(_, size)| *size == snapshot.size)
+            .map(|(relative, _)| root.join(relative))
+            .filter(|candidate| candidate != path);
+        for candidate in candidates {
+            if local_file_key(&candidate).as_deref() != Some(indexed_key) {
+                continue;
+            }
+            if !holds_indexed_content(&candidate, &snapshot).await {
+                return Ok(false);
+            }
+            return self
+                .commit_unreported_rename(file_id, local_path, &candidate.to_string_lossy())
+                .await;
+        }
+        Ok(false)
+    }
+
+    /// The file at `local_path` has no index entry but the key and content
+    /// of an indexed file whose own path is empty or holds another file now:
+    /// it was renamed while nothing watched. The rename is committed and true
+    /// returned.
+    pub async fn moved_here(&self, local_path: &str) -> CoreResult<bool> {
+        let Some(key) = local_file_key(Path::new(local_path)) else {
+            return Ok(false);
+        };
+        let Some((snapshot, indexed_path)) = self.db.live_file_with_local_key(&key)? else {
+            return Ok(false);
+        };
+        if indexed_path == local_path
+            || local_file_key(Path::new(&indexed_path)).as_deref() == Some(key.as_str())
+            || !holds_indexed_content(Path::new(local_path), &snapshot).await
+        {
+            return Ok(false);
+        }
+        self.commit_unreported_rename(snapshot.file_id, &indexed_path, local_path)
+            .await
+    }
+
+    /// Whether the rename went through: a pending Notes mutation keeps it.
+    async fn commit_unreported_rename(
+        &self,
+        file_id: FileId,
+        from: &str,
+        to: &str,
+    ) -> CoreResult<bool> {
+        self.renamed(from, to).await?;
+        Ok(self.db.get_local_path(&file_id)?.as_deref() == Some(to))
+    }
+
     /// A folder appeared at `local_path`.
     pub async fn created_folder(&self, local_path: &str) -> CoreResult<()> {
         self.folders
@@ -122,6 +231,9 @@ impl<'a> LocalChanges<'a> {
         self.commit_file_placement(entry, op_type, &placement)
             .await?;
         self.db.update_local_path(&entry.file_id, to, &new_path)?;
+        // A queued upload must read the moved file, not whatever is
+        // created at the old path before the queue runs.
+        self.db.repoint_transfers(&entry.file_id, to, &new_path)?;
         self.db.set_parent(&entry.file_id, placement.parent_id)?;
         self.activity.log(
             "rename",
@@ -352,9 +464,37 @@ impl<'a> LocalChanges<'a> {
     fn remote_path(&self, local_path: &str) -> CoreResult<String> {
         relative_s3_key(self.sync_folder, Path::new(local_path))
     }
+
+    fn protects_notes_root(&self, local_path: &str) -> CoreResult<bool> {
+        is_protected_notes_root(self.db, self.sync_folder, Path::new(local_path))
+    }
+
+    /// Whether Notes is still applying a change to any of these paths; it
+    /// indexes the result itself, so the event is not ours to act on.
+    fn notes_mutation_pending(&self, local_paths: &[&str]) -> CoreResult<bool> {
+        for local_path in local_paths {
+            let Ok(relative) = relative_s3_key(self.sync_folder, Path::new(local_path)) else {
+                continue;
+            };
+            if notes_mutation_pending(self.sync_folder, &relative)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// A file uploaded before folders had nodes: no parent, whole path as name.
+/// Whether `path` holds exactly the content last indexed for `snapshot`.
+async fn holds_indexed_content(path: &Path, snapshot: &LocalFileSnapshot) -> bool {
+    match blake3_file_hash(path).await {
+        Ok((hash, size)) => {
+            size == snapshot.size && content_hash_matches(snapshot.local_hash.as_deref(), &hash)
+        }
+        Err(_) => false,
+    }
+}
+
 fn is_placed_by_path(entry: &FileEntry) -> bool {
     entry.parent_id.is_none() && entry.current_revision_id.is_some()
 }
@@ -365,6 +505,22 @@ fn move_or_rename(old_parent: Option<FileId>, placement: &Placement) -> OpType {
     } else {
         OpType::Move
     }
+}
+
+fn is_protected_notes_root(
+    db: &LocalDatabase,
+    sync_folder: &str,
+    local_path: &Path,
+) -> CoreResult<bool> {
+    if !matches!(
+        relative_s3_key(sync_folder, local_path).as_deref(),
+        Ok("Notes")
+    ) {
+        return Ok(false);
+    }
+    Ok(db
+        .folder_at("Notes")?
+        .is_some_and(|folder| folder.parent_id.is_none()))
 }
 
 async fn delete_tree_entries(s3: &S3Adapter, entry_ids: Vec<FileId>) {
@@ -381,4 +537,41 @@ async fn delete_tree_entries(s3: &S3Adapter, entry_ids: Vec<FileId>) {
         });
     }
     while tasks.join_next().await.is_some() {}
+}
+
+#[cfg(test)]
+mod root_guard_tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn only_the_indexed_system_notes_root_is_protected() {
+        let mut config = Config::default();
+        config.core.db_path = ":memory:".into();
+        let db = LocalDatabase::new(&config).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("s4drive-root-guard-{}", uuid::Uuid::now_v7()));
+        let notes = root.join("Notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let folder = IndexedFolder {
+            file_id: uuid::Uuid::now_v7(),
+            parent_id: None,
+            local_path: notes.to_string_lossy().into_owned(),
+            remote_path: "Notes".into(),
+        };
+        db.register_folder(&folder).unwrap();
+
+        assert!(is_protected_notes_root(&db, &root.to_string_lossy(), &notes).unwrap());
+        assert!(!is_protected_notes_root(
+            &db,
+            &root.to_string_lossy(),
+            &notes.join("Work").join("A.md")
+        )
+        .unwrap());
+        assert!(
+            !is_protected_notes_root(&db, &root.to_string_lossy(), &root.join("Documents"))
+                .unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

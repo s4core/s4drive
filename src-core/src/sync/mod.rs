@@ -11,9 +11,11 @@ pub mod activity;
 pub mod conflict;
 pub mod conflict_engine;
 pub mod download;
+pub mod folder_recovery;
 pub mod folders;
 mod local_changes;
 pub mod maintenance;
+mod notes_intake;
 mod remote_changes;
 pub mod versions;
 
@@ -23,9 +25,12 @@ pub use conflict_engine::{ConflictDetector, ConflictEngine, ConflictResolution, 
 pub use download::DownloadEngine;
 pub use versions::{VersionApi, VersionHistory, VersionInfo};
 
+use std::collections::HashMap;
+
 use crate::config::MaintenanceConfig;
 use crate::db::{LocalDatabase, LocalFileSnapshot};
 use crate::error::{CoreError, CoreResult};
+use crate::fs_mutations::{LocalContentToken, MutationCoordinator};
 use crate::metadata::blobs::{hash_file_blake3, BlobStore};
 use crate::metadata::engine::MetadataEngine;
 use crate::metadata::ops::OperationLog;
@@ -43,6 +48,7 @@ use crate::watcher::{FsEvent, FsEventStream};
 use folders::FolderNodes;
 use local_changes::LocalChanges;
 use maintenance::SyncMaintenance;
+use notes_intake::{notes_change_pending, notes_mutation_pending, NotesIntentReplay};
 use remote_changes::RemoteChanges;
 
 use std::path::{Component, Path, PathBuf};
@@ -700,10 +706,16 @@ async fn run_initial_sync(
     let mut result = SyncResult::empty();
     let sync_path = Path::new(sync_folder);
 
+    folder_recovery::ensure_available(db, sync_folder)?;
+
     if !sync_path.exists() {
         tracing::info!("Sync folder does not exist yet: {}", sync_folder);
         return Ok(result);
     }
+
+    // Boxed: Notes replay is a large future; keep it off the sync stack.
+    Box::pin(NotesIntentReplay::new(download.s3(), db, metadata.device_id(), sync_folder).replay())
+        .await?;
 
     let had_local_index = db.count_objects()? > 0;
     let (pending_uploads, pending_downloads) = transfer.pending_count()?;
@@ -725,10 +737,13 @@ async fn run_initial_sync(
             blob_lease_ttl_minutes,
         )
         .await?;
-        result.files_uploaded = up;
-        result.bytes_uploaded = bytes;
+        result.files_uploaded += up;
+        result.bytes_uploaded += bytes;
         result.conflicts_detected += conf;
-        return Ok(result);
+        let (remaining_uploads, _) = transfer.pending_count()?;
+        if remaining_uploads > 0 {
+            return Ok(result);
+        }
     }
 
     if pending_downloads > 0 {
@@ -738,21 +753,39 @@ async fn run_initial_sync(
             download,
             db,
             activity,
+            &LocalKeeper {
+                db,
+                sync_folder,
+                versions,
+                conflict,
+                conflict_engine,
+            },
             max_retries,
             max_concurrent_downloads,
         )
         .await?;
-        result.files_downloaded = down;
-        result.bytes_downloaded = bytes;
-        return Ok(result);
+        result.files_downloaded += down;
+        result.bytes_downloaded += bytes;
+        let (_, remaining_downloads) = transfer.pending_count()?;
+        if remaining_downloads > 0 {
+            return Ok(result);
+        }
     }
 
     // ── Phase A: Scan local folder ──
     set_state(state, SyncState::ScanningLocal);
     tracing::info!("Initial sync: scanning local folder: {}", sync_folder);
-    let local_scan =
-        queue_local_uploads_from_scan(sync_path, transfer, db, activity, paused, exclude_patterns)
-            .await?;
+    let local = LocalChanges::new(download.s3(), metadata, db, activity, sync_folder);
+    let local_scan = queue_local_uploads_from_scan(
+        sync_path,
+        transfer,
+        db,
+        &local,
+        activity,
+        paused,
+        exclude_patterns,
+    )
+    .await?;
     result.files_uploaded += local_scan.queued;
     result.bytes_uploaded += local_scan.bytes;
     if local_scan.truncated {
@@ -854,6 +887,13 @@ async fn run_initial_sync(
             download,
             db,
             activity,
+            &LocalKeeper {
+                db,
+                sync_folder,
+                versions,
+                conflict,
+                conflict_engine,
+            },
             max_retries,
             max_concurrent_downloads,
         )
@@ -879,6 +919,7 @@ async fn queue_local_uploads_from_scan(
     sync_path: &Path,
     transfer: &TransferQueue,
     db: &LocalDatabase,
+    local: &LocalChanges<'_>,
     activity: &ActivityLog,
     paused: &AtomicBool,
     exclude_patterns: &[String],
@@ -945,6 +986,10 @@ async fn queue_local_uploads_from_scan(
                     && snapshot.local_mtime.as_deref() == local_mtime.as_deref()
                     && matches!(snapshot.state.as_str(), "synced" | "pending_upload");
                 if unchanged_mtime {
+                    // Entries indexed before file keys existed get theirs once.
+                    if snapshot.local_key.is_none() {
+                        db.update_local_mtime_by_path(&local_path)?;
+                    }
                     continue;
                 }
             }
@@ -958,14 +1003,36 @@ async fn queue_local_uploads_from_scan(
             };
             let local_hash = blake3_local_hash(&hash_hex);
 
-            let existing = db.get_file_by_local_path(&local_path)?;
-            let (file_id, entry) = if let Some(mut entry) = existing {
-                if entry.size == file_size
+            let mut existing = db.get_file_by_local_path(&local_path)?;
+            if existing.as_ref().is_some_and(|entry| {
+                entry.size == file_size
                     && content_hash_matches(entry.content_hash.as_deref(), &hash_hex)
-                {
-                    db.update_local_mtime_by_path(&local_path)?;
-                    continue;
+            }) {
+                db.update_local_mtime_by_path(&local_path)?;
+                continue;
+            }
+            // No watcher saw what happened while the app was not running.
+            match &existing {
+                Some(entry) => {
+                    if local
+                        .moved_away(entry.file_id, &local_path, exclude_patterns)
+                        .await?
+                    {
+                        existing = None;
+                    }
                 }
+                None => {
+                    if local.moved_here(&local_path).await? {
+                        continue;
+                    }
+                }
+            }
+            if existing.is_none()
+                && left_to_notes(db, &sync_path.to_string_lossy(), &local_path, &s3_key).await?
+            {
+                continue;
+            }
+            let (file_id, entry) = if let Some(mut entry) = existing {
                 entry.name = s3_key.clone();
                 entry.normalized_name = Validator::normalize_name(&s3_key).to_lowercase();
                 entry.size = file_size;
@@ -1217,6 +1284,11 @@ async fn queue_remote_tree_entry(
     entry: &FileEntry,
     reconcile_existing: bool,
 ) -> CoreResult<RemoteTreeEntryResult> {
+    if entry.deleted_at.is_some()
+        || folder_recovery::is_remotely_deleted(folders.store(), entry.file_id).await?
+    {
+        return Ok(RemoteTreeEntryResult::checkpoint_safe());
+    }
     let placement = Placement::of(entry);
     if entry.entry_type == EntryType::Folder {
         if let Some(parent_path) = folders.parent_path(placement.parent_id).await? {
@@ -1356,6 +1428,14 @@ async fn run_sync_cycle(
 ) -> CoreResult<SyncResult> {
     let mut result = SyncResult::empty();
 
+    folder_recovery::ensure_available(db, _sync_folder)?;
+
+    // Boxed: Notes replay is a large future; keep it off the sync stack.
+    Box::pin(
+        NotesIntentReplay::new(download.s3(), db, metadata.device_id(), _sync_folder).replay(),
+    )
+    .await?;
+
     // ── 1. Collect local changes from file watcher ──
     set_state(state, SyncState::ScanningLocal);
     let events = {
@@ -1414,13 +1494,22 @@ async fn run_sync_cycle(
                 };
                 let local_hash = blake3_local_hash(&hash_hex);
 
-                let existing = db.get_file_by_local_path(p)?;
-                if let Some(mut entry) = existing {
-                    if entry.size == file_size
+                let mut existing = db.get_file_by_local_path(p)?;
+                if existing.as_ref().is_some_and(|entry| {
+                    entry.size == file_size
                         && content_hash_matches(entry.content_hash.as_deref(), &hash_hex)
-                    {
-                        continue;
+                }) {
+                    continue;
+                }
+                if let Some(entry) = &existing {
+                    if local.moved_away(entry.file_id, p, exclude_patterns).await? {
+                        existing = None;
                     }
+                }
+                if existing.is_none() && left_to_notes(db, _sync_folder, p, &s3_key).await? {
+                    continue;
+                }
+                if let Some(mut entry) = existing {
                     entry.size = file_size;
                     entry.name = s3_key.clone();
                     entry.normalized_name = Validator::normalize_name(&s3_key).to_lowercase();
@@ -1552,6 +1641,13 @@ async fn run_sync_cycle(
             download,
             db,
             activity,
+            &LocalKeeper {
+                db,
+                sync_folder: _sync_folder,
+                versions,
+                conflict,
+                conflict_engine,
+            },
             max_retries,
             max_concurrent_downloads,
         )
@@ -1563,7 +1659,99 @@ async fn run_sync_cycle(
     Ok(result)
 }
 
+/// Whether a file the scan found without an index entry belongs to Notes:
+/// Notes is creating or moving it, or indexed it after the scan looked. The
+/// lookup is repeated after the intent check because Notes indexes an entry
+/// before it marks the intent done, so one of the two always sees it; in the
+/// other order the file could get a second id.
+async fn left_to_notes(
+    db: &LocalDatabase,
+    sync_folder: &str,
+    local_path: &str,
+    s3_key: &str,
+) -> CoreResult<bool> {
+    #[cfg(feature = "notes-test-hooks")]
+    crate::test_hooks::checkpoint(
+        crate::test_hooks::SCAN_BEFORE_NOTES_CHECK,
+        Some(s3_key),
+        None,
+    )
+    .await?;
+    Ok(notes_mutation_pending(sync_folder, s3_key)?
+        || db.get_file_by_local_path(local_path)?.is_some())
+}
+
 // ─── Upload Processing ──────────────────────────────────────────
+
+/// An upload whose binding no longer holds is done, unless a Notes rename or
+/// move is taking the file elsewhere: it already pointed the job at the new
+/// place, or will once it indexes the change. Then the job goes again.
+fn finish_stale_upload(
+    transfer: &TransferQueue,
+    db: &LocalDatabase,
+    job: &crate::transfer::TransferJob,
+    sync_folder: &str,
+) -> CoreResult<()> {
+    if upload_follows_notes(db, job, sync_folder)? {
+        transfer.mark_queued(job.id)
+    } else {
+        transfer.mark_completed(job.id)
+    }
+}
+
+fn upload_follows_notes(
+    db: &LocalDatabase,
+    job: &crate::transfer::TransferJob,
+    sync_folder: &str,
+) -> CoreResult<bool> {
+    Ok(db.transfer_moved(job)? || notes_mutation_pending(sync_folder, &job.s3_key)?)
+}
+
+async fn upload_generation_matches(job: &crate::transfer::TransferJob) -> CoreResult<bool> {
+    let Some(expected) = job.expected_content_hash.as_deref() else {
+        return Ok(true);
+    };
+    let path = Path::new(&job.local_path);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let (current, _) = blake3_file_hash(path).await?;
+    Ok(content_hash_matches(Some(expected), &current))
+}
+
+fn upload_parent_revision(
+    db: &LocalDatabase,
+    job: &crate::transfer::TransferJob,
+    indexed_parent: Option<uuid::Uuid>,
+    remote_entry: &FileEntry,
+    device_id: &str,
+) -> CoreResult<Option<uuid::Uuid>> {
+    if job.expected_content_hash.is_none() {
+        return Ok(indexed_parent);
+    }
+    let Some(remote_revision) = remote_entry.current_revision_id else {
+        return Ok(indexed_parent);
+    };
+    let Some(record) = db.get_revision(&remote_revision.to_string())? else {
+        return Ok(indexed_parent);
+    };
+    let remote_hash = remote_entry.content_hash.as_deref().or_else(|| {
+        remote_entry
+            .content_ref
+            .as_ref()
+            .map(|content| content.hash.as_str())
+    });
+    // A successful older upload can be recorded without replacing newer local bytes.
+    if record.file_id == job.file_id
+        && record.author_device_id == device_id
+        && remote_hash
+            .is_some_and(|hash| content_hash_matches(record.content_hash.as_deref(), hash))
+    {
+        Ok(Some(remote_revision))
+    } else {
+        Ok(indexed_parent)
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn process_upload_queue(
@@ -1589,6 +1777,7 @@ async fn process_upload_queue(
     let folders = FolderNodes::new(s3, db, metadata.device_id(), sync_folder);
 
     while processed_jobs < MAX_UPLOAD_JOBS_PER_PASS {
+        folder_recovery::ensure_available(db, sync_folder)?;
         let remaining = MAX_UPLOAD_JOBS_PER_PASS - processed_jobs;
         let jobs = transfer.pending_uploads(concurrency.current().min(remaining).max(1))?;
         if jobs.is_empty() {
@@ -1596,12 +1785,18 @@ async fn process_upload_queue(
         }
 
         for job in &jobs {
+            folder_recovery::ensure_available(db, sync_folder)?;
             processed_jobs += 1;
             let started = Instant::now();
             let file_id = job.file_id.clone();
             let local_path = job.local_path.clone();
             let s3_key = job.s3_key.clone();
             let local_path_ref = Path::new(&local_path);
+
+            if !db.upload_binding_matches(job)? || !upload_generation_matches(job).await? {
+                finish_stale_upload(transfer, db, job, sync_folder)?;
+                continue;
+            }
 
             if should_ignore_sync_path(local_path_ref, Path::new(sync_folder), exclude_patterns) {
                 transfer.mark_failed(job.id, "excluded by sync settings")?;
@@ -1610,9 +1805,27 @@ async fn process_upload_queue(
             }
 
             if !local_path_ref.is_file() {
+                if upload_follows_notes(db, job, sync_folder)? {
+                    transfer.mark_queued(job.id)?;
+                    continue;
+                }
                 transfer.mark_failed(job.id, "local file missing before upload")?;
                 activity.log("upload_skipped", &file_id, &s3_key, "missing local file")?;
                 continue;
+            }
+
+            // Notes jobs are bound to their content and skip stale bytes anyway.
+            if job.expected_content_hash.is_none() {
+                if let Ok(id) = uuid::Uuid::parse_str(&file_id) {
+                    if LocalChanges::new(s3, metadata, db, activity, sync_folder)
+                        .moved_away(id, &local_path, exclude_patterns)
+                        .await?
+                    {
+                        // The job now follows the file to where it moved.
+                        transfer.mark_queued(job.id)?;
+                        continue;
+                    }
+                }
             }
 
             transfer.mark_in_progress(job.id)?;
@@ -1633,6 +1846,14 @@ async fn process_upload_queue(
                     continue;
                 }
             };
+            if job
+                .expected_content_hash
+                .as_deref()
+                .is_some_and(|expected| !content_hash_matches(Some(expected), &content_ref.hash))
+            {
+                transfer.mark_completed(job.id)?;
+                continue;
+            }
             let data_len = content_ref.size;
             let lease_key = match create_blob_lease(
                 s3,
@@ -1671,7 +1892,7 @@ async fn process_upload_queue(
                 }
             };
             let previous_entry = db.get_file(&parsed_file_id)?;
-            let parent_revision_id = previous_entry
+            let mut parent_revision_id = previous_entry
                 .as_ref()
                 .and_then(|entry| entry.current_revision_id);
 
@@ -1681,7 +1902,7 @@ async fn process_upload_queue(
                 .into_iter()
                 .chain(std::iter::once(revision_id))
                 .collect();
-            let entry = FileEntry {
+            let mut entry = FileEntry {
                 file_id: parsed_file_id,
                 parent_id: placement.parent_id,
                 name: placement.name.clone(),
@@ -1700,10 +1921,26 @@ async fn process_upload_queue(
                 lock_state: Default::default(),
             };
 
+            // The tree is written after an op commits and can miss another
+            // device's newest revision; the op chain has it. The commit below
+            // builds on the head read here, so an op committed later on this
+            // file fails it instead of being overwritten.
+            let mut clock = logical_clock_seed();
+            let mut ops = OperationLog::new(s3, metadata.device_id(), &mut clock);
+            let latest_revision = match ops.latest_revision_on_target(parsed_file_id).await {
+                Ok(op) => op,
+                Err(e) => {
+                    tracing::warn!("Could not read the operation log before upload: {}", e);
+                    let _ = release_blob_lease(s3, &lease_key).await;
+                    concurrency.record_failure();
+                    retry_later(transfer, job.id, max_retries, &e).await?;
+                    continue;
+                }
+            };
             let tree = FileTree::new(s3);
             let mut remote_lookup_failed = false;
             let remote_entry = match tree.get_entry(&parsed_file_id).await {
-                Ok(entry) => Some(entry),
+                Ok(entry) => Some(with_latest_revision(entry, latest_revision.as_ref())),
                 Err(CoreError::NotFound(_)) => None,
                 Err(e) => {
                     tracing::debug!("Could not read remote tree before upload commit: {}", e);
@@ -1712,7 +1949,31 @@ async fn process_upload_queue(
                 }
             };
 
+            #[cfg(feature = "notes-test-hooks")]
+            crate::test_hooks::checkpoint(
+                crate::test_hooks::UPLOAD_AFTER_BLOB,
+                Some(&file_id),
+                None,
+            )
+            .await?;
+            if !db.upload_binding_matches(job)? || !upload_generation_matches(job).await? {
+                let _ = release_blob_lease(s3, &lease_key).await;
+                finish_stale_upload(transfer, db, job, sync_folder)?;
+                continue;
+            }
+
             if let Some(remote_entry) = remote_entry.as_ref() {
+                parent_revision_id = upload_parent_revision(
+                    db,
+                    job,
+                    parent_revision_id,
+                    remote_entry,
+                    &metadata.device_id().to_string(),
+                )?;
+                entry.version_history = parent_revision_id
+                    .into_iter()
+                    .chain(std::iter::once(revision_id))
+                    .collect();
                 if remote_revision_diverged(parent_revision_id, remote_entry, &local_hash) {
                     if has_open_conflict(db, &parsed_file_id, ConflictType::EditEdit.as_str())? {
                         let _ = release_blob_lease(s3, &lease_key).await;
@@ -1760,6 +2021,44 @@ async fn process_upload_queue(
                 }
             }
 
+            if remote_entry.is_none() && !remote_lookup_failed && parent_revision_id.is_some() {
+                let now = chrono::Utc::now().to_rfc3339();
+                let conflict_path = ConflictEngine::create_conflict_copy(
+                    &local_path,
+                    sync_folder,
+                    &s3_key,
+                    versions.device_name(),
+                    &now,
+                )?;
+                let local_rev = parent_revision_id.map(|id| id.to_string());
+                let reason = ConflictEngine::explain_conflict(
+                    &ConflictType::DeleteEdit,
+                    &local_path,
+                    &s3_key,
+                    versions.device_name(),
+                    "remote",
+                    &now,
+                    &now,
+                );
+                conflict.register(&file_id, &local_path, &reason);
+                conflict_engine.record_conflict(
+                    &file_id,
+                    &ConflictType::DeleteEdit,
+                    &local_path,
+                    &s3_key,
+                    &conflict_path,
+                    local_rev.as_deref(),
+                    None,
+                    &reason,
+                )?;
+                let _ = release_blob_lease(s3, &lease_key).await;
+                transfer.mark_failed(job.id, "conflict: remote file was deleted")?;
+                activity.log("upload_conflict", &file_id, &s3_key, &reason)?;
+                conflicts += 1;
+                concurrency.record_failure();
+                continue;
+            }
+
             let op_type = if remote_entry.is_some() || remote_lookup_failed {
                 OpType::UploadNewRevision
             } else {
@@ -1767,16 +2066,29 @@ async fn process_upload_queue(
             };
             let remote_exists = matches!(op_type, OpType::UploadNewRevision);
 
-            let commit_result = commit_sync_operation(
-                s3,
-                metadata,
+            if let Some(remote) = remote_entry.as_ref() {
+                entry.name = remote.name.clone();
+                entry.normalized_name = remote.normalized_name.clone();
+                entry.parent_id = remote.parent_id;
+            }
+
+            let (commit_name, commit_parent) = if matches!(op_type, OpType::CreateFile) {
+                (Some(placement.name.clone()), placement.parent_id)
+            } else {
+                (None, None)
+            };
+
+            let commit_result = commit_on(
+                &mut ops,
                 Some(parsed_file_id),
                 op_type,
-                Some(content_ref.clone()),
-                Some(revision_id),
-                Some(placement.name.clone()),
-                placement.parent_id,
-                false,
+                Effects {
+                    new_revision_id: Some(revision_id),
+                    new_content_ref: Some(content_ref.clone()),
+                    new_name: commit_name,
+                    new_parent_id: commit_parent,
+                    deleted: false,
+                },
                 remote_exists,
                 true,
             )
@@ -1800,8 +2112,8 @@ async fn process_upload_queue(
                         "clean",
                         None,
                     )?;
-                    db.register_file_at_path_with_state(&entry, &local_path, &s3_key, "synced")?;
-                    transfer.mark_completed(job.id)?;
+                    let current_content_matches = upload_generation_matches(job).await?;
+                    db.finish_upload(job, &entry, current_content_matches)?;
                     uploaded += 1;
                     concurrency.record_success(started.elapsed());
                     activity.log("upload_complete", &file_id, &s3_key, "success")?;
@@ -1860,11 +2172,88 @@ async fn release_blob_lease(s3: &S3Adapter, lease_key: &str) -> CoreResult<()> {
 
 // ─── Download Processing ────────────────────────────────────────
 
+/// Where a download keeps local bytes it must not replace.
+struct LocalKeeper<'a> {
+    db: &'a LocalDatabase,
+    sync_folder: &'a str,
+    versions: &'a VersionApi,
+    conflict: &'a ConflictHandler,
+    conflict_engine: &'a ConflictEngine,
+}
+
+/// Download one job over the local content it was decided against; a save
+/// made since is kept as a conflict copy and recorded as an edit conflict.
+async fn download_job(
+    download: &DownloadEngine,
+    job: &crate::transfer::TransferJob,
+    keeper: &LocalKeeper<'_>,
+) -> CoreResult<u64> {
+    folder_recovery::ensure_available(keeper.db, keeper.sync_folder)?;
+    let file_id = uuid::Uuid::parse_str(&job.file_id).unwrap_or_default();
+    let decided = job
+        .expected_content_hash
+        .as_deref()
+        .map(LocalContentToken::from_stored);
+    let staged = download
+        .stage_file(&job.s3_key, &job.local_path, decided)
+        .await?;
+    #[cfg(feature = "notes-test-hooks")]
+    crate::test_hooks::checkpoint(
+        crate::test_hooks::DOWNLOAD_AFTER_STAGE,
+        Some(&job.file_id),
+        None,
+    )
+    .await?;
+    folder_recovery::ensure_available(keeper.db, keeper.sync_folder)?;
+    let relative_path = Path::new(&job.local_path)
+        .strip_prefix(keeper.sync_folder)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .map_err(|_| {
+            CoreError::Protocol(format!("{} is outside the sync folder", job.local_path))
+        })?;
+    let published = staged.publish_keeping_local(
+        &MutationCoordinator::default(),
+        uuid::Uuid::nil(),
+        file_id,
+        keeper.sync_folder,
+        &relative_path,
+        keeper.versions.device_name(),
+    )?;
+    if let Some(copy) = &published.conflict_copy {
+        let now = chrono::Utc::now().to_rfc3339();
+        let reason = ConflictEngine::explain_conflict(
+            &ConflictType::EditEdit,
+            &job.local_path,
+            &relative_path,
+            keeper.versions.device_name(),
+            "remote",
+            &now,
+            &now,
+        );
+        keeper
+            .conflict
+            .register(&job.file_id, &job.local_path, &reason);
+        keeper.conflict_engine.record_conflict(
+            &job.file_id,
+            &ConflictType::EditEdit,
+            &job.local_path,
+            &relative_path,
+            copy,
+            None,
+            None,
+            &reason,
+        )?;
+    }
+    Ok(published.size)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn process_download_queue(
     transfer: &TransferQueue,
     download: &DownloadEngine,
     db: &LocalDatabase,
     activity: &ActivityLog,
+    keeper: &LocalKeeper<'_>,
     max_retries: u32,
     max_concurrent_downloads: u32,
 ) -> CoreResult<(u32, u64)> {
@@ -1874,6 +2263,7 @@ async fn process_download_queue(
     let mut processed_jobs = 0u32;
 
     while processed_jobs < MAX_DOWNLOAD_JOBS_PER_PASS {
+        folder_recovery::ensure_available(db, keeper.sync_folder)?;
         let remaining = MAX_DOWNLOAD_JOBS_PER_PASS - processed_jobs;
         let jobs = transfer.pending_downloads(concurrency.current().min(remaining).max(1))?;
         if jobs.is_empty() {
@@ -1881,11 +2271,12 @@ async fn process_download_queue(
         }
 
         for job in &jobs {
+            folder_recovery::ensure_available(db, keeper.sync_folder)?;
             processed_jobs += 1;
             let started = Instant::now();
             transfer.mark_in_progress(job.id)?;
 
-            match download.download_file(&job.s3_key, &job.local_path).await {
+            match download_job(download, job, keeper).await {
                 Ok(bytes) => {
                     if let Ok(file_id) = uuid::Uuid::parse_str(&job.file_id) {
                         if let Some(hash) = hash_from_blob_key(&job.s3_key) {
@@ -1906,6 +2297,7 @@ async fn process_download_queue(
                     activity.log("download_complete", &job.file_id, &job.s3_key, "success")?;
                 }
                 Err(e) => {
+                    folder_recovery::ensure_available(db, keeper.sync_folder)?;
                     tracing::warn!("Download failed: {}", e);
                     concurrency.record_failure();
                     retry_later(transfer, job.id, max_retries, &e).await?;
@@ -2012,16 +2404,50 @@ async fn poll_remote_changes(
         versions,
         sync_folder: _sync_folder,
         folders: FolderNodes::new(s3, db, metadata.device_id(), _sync_folder),
+        tree: &tree,
+        transfer,
     };
 
-    for op in &ops {
+    // Only the last rename or move of a file in this batch places it; an
+    // earlier one would move the file back and forth while the user acts.
+    let last_placement: HashMap<uuid::Uuid, usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| matches!(op.op_type, OpType::Rename | OpType::Move))
+        .filter_map(|(index, op)| op.target_file_id.map(|id| (id, index)))
+        .collect();
+    let places = |index: usize, op: &Operation, file_id: &uuid::Uuid| -> CoreResult<bool> {
+        if last_placement
+            .get(file_id)
+            .is_some_and(|last| *last > index)
+        {
+            return Ok(false);
+        }
+        // This device's own op is older than a Notes change it has not
+        // committed yet (checked per op: the user may act during the pass).
+        Ok(op.device_id != metadata.device_id()
+            || !notes_change_pending(db, _sync_folder, file_id)?)
+    };
+
+    for (index, op) in ops.iter().enumerate() {
+        folder_recovery::ensure_available(db, _sync_folder)?;
         let file_id = match op.target_file_id {
             Some(id) => id,
             None => continue,
         };
+        #[cfg(feature = "notes-test-hooks")]
+        crate::test_hooks::checkpoint(
+            crate::test_hooks::REMOTE_POLL_BEFORE_OP,
+            Some(&file_id.to_string()),
+            Some(&op.op_id),
+        )
+        .await?;
 
         match op.op_type {
             OpType::UploadNewRevision | OpType::CreateFile => {
+                if superseded_locally(db, &file_id, op)? {
+                    continue;
+                }
                 let (entry, content_ref, placement) =
                     match remote_file_state(&tree, op, &file_id).await {
                         Ok(Some(value)) => value,
@@ -2049,7 +2475,9 @@ async fn poll_remote_changes(
                 if let Some(local_entry) = db.get_file(&file_id)? {
                     if content_hash_matches(local_entry.content_hash.as_deref(), &content_ref.hash)
                     {
-                        db.set_parent(&file_id, placement.parent_id)?;
+                        if places(index, op, &file_id)? {
+                            db.set_parent(&file_id, placement.parent_id)?;
+                        }
                         continue;
                     }
 
@@ -2247,8 +2675,13 @@ async fn poll_remote_changes(
                 activity.log("remote_change", &file_id.to_string(), &op.op_id, "queued")?;
             }
             OpType::CreateFolder => conflicts += remote.created_folder(file_id, op).await?,
-            OpType::Rename | OpType::Move => conflicts += remote.renamed(file_id, op).await?,
+            OpType::Rename | OpType::Move => {
+                if places(index, op, &file_id)? {
+                    conflicts += remote.renamed(file_id, op).await?;
+                }
+            }
             OpType::Delete => conflicts += remote.deleted(file_id, op).await?,
+            OpType::Restore => conflicts += remote.restored(file_id, op).await?,
             _ => {}
         }
     }
@@ -2400,6 +2833,31 @@ async fn remote_file_state(
     Ok(Some((entry, content_ref, placement)))
 }
 
+/// An op whose revision this device already authored or applied, while the
+/// file has moved on since. A process that stopped before it advanced its
+/// remote checkpoint replays such ops; applying one again would roll the file
+/// back to old bytes, or record the revision a second time with another
+/// parent and fail every later pass.
+fn superseded_locally(
+    db: &LocalDatabase,
+    file_id: &uuid::Uuid,
+    op: &Operation,
+) -> CoreResult<bool> {
+    let Some(revision) = op.effects.new_revision_id else {
+        return Ok(false);
+    };
+    let known = db
+        .get_revision(&revision.to_string())?
+        .is_some_and(|record| record.file_id == file_id.to_string());
+    if !known {
+        return Ok(false);
+    }
+    let current = db
+        .get_file(file_id)?
+        .and_then(|entry| entry.current_revision_id);
+    Ok(current != Some(revision))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_entry_revision(
     versions: &VersionApi,
@@ -2453,6 +2911,19 @@ fn has_open_conflict(
         .get_conflicts_for_file(&file_id.to_string())?
         .iter()
         .any(|record| record.conflict_type == conflict_type))
+}
+
+/// The tree entry with the revision of `latest`, the newest op that gave the
+/// file one, when the tree does not have it yet.
+fn with_latest_revision(mut entry: FileEntry, latest: Option<&Operation>) -> FileEntry {
+    if let Some(revision) = latest.and_then(|op| op.effects.new_revision_id) {
+        if entry.current_revision_id != Some(revision) {
+            entry.current_revision_id = Some(revision);
+            entry.content_ref = latest.and_then(|op| op.effects.new_content_ref.clone());
+            entry.content_hash = None;
+        }
+    }
+    entry
 }
 
 fn remote_revision_diverged(
@@ -2608,6 +3079,33 @@ async fn commit_sync_operation(
 ) -> CoreResult<()> {
     let mut clock = logical_clock_seed();
     let mut ops = OperationLog::new(s3, metadata.device_id(), &mut clock);
+    commit_on(
+        &mut ops,
+        target_file_id,
+        op_type,
+        Effects {
+            new_revision_id,
+            new_content_ref,
+            new_name,
+            new_parent_id,
+            deleted,
+        },
+        file_exists,
+        parent_exists,
+    )
+    .await
+}
+
+/// Commit on the head `ops` has loaded (or loads now): an op another device
+/// committed on the same file after that head fails the commit as a conflict.
+async fn commit_on(
+    ops: &mut OperationLog<'_, S3Adapter>,
+    target_file_id: Option<uuid::Uuid>,
+    op_type: OpType,
+    effects: Effects,
+    file_exists: bool,
+    parent_exists: bool,
+) -> CoreResult<()> {
     ops.commit(
         target_file_id,
         op_type,
@@ -2617,13 +3115,7 @@ async fn commit_sync_operation(
             file_exists,
             parent_exists,
         },
-        Effects {
-            new_revision_id,
-            new_content_ref,
-            new_name,
-            new_parent_id,
-            deleted,
-        },
+        effects,
     )
     .await?;
     Ok(())
@@ -2887,7 +3379,27 @@ pub fn should_ignore_sync_with_excludes(path: &str, exclude_patterns: &[String])
 }
 
 fn should_ignore_sync_path(path: &Path, root: &Path, exclude_patterns: &[String]) -> bool {
-    if path.components().any(|component| {
+    if !root.as_os_str().is_empty() {
+        if let Ok(rel) = path.strip_prefix(root) {
+            return check_relative_path(rel, path, root, exclude_patterns);
+        }
+        if let (Ok(p), Ok(r)) = (path.canonicalize(), root.canonicalize()) {
+            if let Ok(rel) = p.strip_prefix(&r) {
+                return check_relative_path(rel, path, root, exclude_patterns);
+            }
+        }
+    }
+
+    check_relative_path(path, path, root, exclude_patterns)
+}
+
+fn check_relative_path(
+    relative: &Path,
+    path: &Path,
+    root: &Path,
+    exclude_patterns: &[String],
+) -> bool {
+    if relative.components().any(|component| {
         matches!(
             component,
             Component::Normal(name) if name.to_string_lossy().starts_with('.')
@@ -2968,6 +3480,112 @@ fn is_conflict_error(err: &CoreError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upload_generation_checks_current_bytes_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, b"old").unwrap();
+        let mut config = crate::config::Config::default();
+        config.core.db_path = ":memory:".into();
+        let db = LocalDatabase::new(&config).unwrap();
+        let queue = TransferQueue::new(&db);
+        queue
+            .enqueue_upload("note", path.to_str().unwrap(), "note.md")
+            .unwrap();
+        let mut job = queue.pending_uploads(1).unwrap().remove(0);
+        job.expected_content_hash = Some(blake3_local_hash(
+            &blake3::hash(b"old").to_hex().to_string(),
+        ));
+        assert!(upload_generation_matches(&job).await.unwrap());
+        std::fs::write(&path, b"new").unwrap();
+        assert!(!upload_generation_matches(&job).await.unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert!(!upload_generation_matches(&job).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn upload_generation_does_not_bind_generic_files_jobs() {
+        let mut config = crate::config::Config::default();
+        config.core.db_path = ":memory:".into();
+        let db = LocalDatabase::new(&config).unwrap();
+        let queue = TransferQueue::new(&db);
+        queue
+            .enqueue_upload("file", "/missing/file", "file.txt")
+            .unwrap();
+        let job = queue.pending_uploads(1).unwrap().remove(0);
+        assert_eq!(job.expected_content_hash, None);
+        assert!(upload_generation_matches(&job).await.unwrap());
+    }
+
+    #[test]
+    fn upload_generation_continues_after_a_committed_older_generation() {
+        let mut config = crate::config::Config::default();
+        config.core.db_path = ":memory:".into();
+        let db = LocalDatabase::new(&config).unwrap();
+        let queue = TransferQueue::new(&db);
+        let file_id = uuid::Uuid::now_v7();
+        let base_revision = uuid::Uuid::now_v7();
+        let committed_revision = uuid::Uuid::now_v7();
+        let remote = FileEntry {
+            file_id,
+            parent_id: None,
+            name: "note.md".into(),
+            normalized_name: "note.md".into(),
+            entry_type: EntryType::File,
+            current_revision_id: Some(committed_revision),
+            content_ref: None,
+            content_hash: Some("blake3:old".into()),
+            size: 3,
+            mime: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            deleted_at: None,
+            version_history: vec![base_revision, committed_revision],
+            attributes: Default::default(),
+            lock_state: Default::default(),
+        };
+        db.register_file_at_path_with_state(&remote, "/tmp/note.md", "note.md", "modified_locally")
+            .unwrap();
+        queue
+            .enqueue_upload(&file_id.to_string(), "/tmp/note.md", "note.md")
+            .unwrap();
+        let mut job = queue.pending_uploads(1).unwrap().remove(0);
+        job.expected_content_hash = Some("blake3:new".into());
+        assert_eq!(
+            upload_parent_revision(&db, &job, Some(base_revision), &remote, "this-device").unwrap(),
+            Some(base_revision)
+        );
+        let versions = VersionApi::new(Some(db.clone()), "this-device", "This device");
+        versions
+            .record_revision(
+                &committed_revision.to_string(),
+                &file_id,
+                Some(&base_revision.to_string()),
+                Some("blake3:old"),
+                3,
+                None,
+                "this-device",
+                "This device",
+                "clean",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            upload_parent_revision(&db, &job, Some(base_revision), &remote, "this-device").unwrap(),
+            Some(committed_revision)
+        );
+        assert_eq!(
+            upload_parent_revision(&db, &job, Some(base_revision), &remote, "another-device")
+                .unwrap(),
+            Some(base_revision)
+        );
+        job.expected_content_hash = None;
+        assert_eq!(
+            upload_parent_revision(&db, &job, Some(base_revision), &remote, "this-device").unwrap(),
+            Some(base_revision)
+        );
+    }
 
     #[test]
     fn test_sync_result_empty() {

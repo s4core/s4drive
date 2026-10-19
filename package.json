@@ -1,0 +1,22 @@
+{
+  "name": "s4drive-notes-tests",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Development-only Notes tests; the application frontend has no build step.",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "test:notes:unit": "node --test tests/notes/unit/*.test.mjs",
+    "test:notes:ui": "playwright test --config tests/notes/playwright.config.mjs",
+    "test:notes:desktop": "wdio run tests/notes/desktop/wdio.conf.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@wdio/cli": "10.0.0",
+    "@wdio/local-runner": "10.0.0",
+    "@wdio/mocha-framework": "10.0.0",
+    "@wdio/spec-reporter": "10.0.0",
+    "dompurify": "3.4.16",
+    "markdown-it": "15.0.2"
+  }
+}

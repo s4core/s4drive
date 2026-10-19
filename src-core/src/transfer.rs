@@ -1,5 +1,7 @@
 use crate::db::LocalDatabase;
 use crate::error::CoreResult;
+use crate::fs_mutations::LocalContentToken;
+use std::path::Path;
 
 /// A job in the transfer queue.
 #[derive(Debug, Clone)]
@@ -9,6 +11,10 @@ pub struct TransferJob {
     pub file_id: String,
     pub local_path: String,
     pub s3_key: String,
+    /// Notes uploads are bound to these bytes; ordinary Files uploads are unbound.
+    /// A download holds the local content it was decided against
+    /// (`LocalContentToken::to_stored`); it may replace only that.
+    pub expected_content_hash: Option<String>,
     pub total_bytes: u64,
     pub transferred_bytes: u64,
     pub status: TransferStatus,
@@ -73,14 +79,26 @@ impl TransferQueue {
         self.enqueue(TransferDirection::Upload, file_id, local_path, s3_key)
     }
 
-    /// Add a download job to the queue.
+    /// Add a download job to the queue. It is called right after sync decided
+    /// to download, so the local content now is what the download may replace.
     pub fn enqueue_download(
         &self,
         file_id: &str,
         local_path: &str,
         s3_key: &str,
     ) -> CoreResult<()> {
-        self.enqueue(TransferDirection::Download, file_id, local_path, s3_key)
+        // An item that cannot be read stays unbound; publishing it fails anyway.
+        let decided = LocalContentToken::capture(Path::new(local_path))
+            .ok()
+            .map(|token| token.to_stored());
+        self.db.enqueue_transfer(
+            TransferDirection::Download.as_str(),
+            file_id,
+            local_path,
+            s3_key,
+            0,
+            decided.as_deref(),
+        )
     }
 
     /// Internal: enqueue a job.
@@ -91,13 +109,15 @@ impl TransferQueue {
         local_path: &str,
         s3_key: &str,
     ) -> CoreResult<()> {
-        let total_bytes = if direction == TransferDirection::Upload {
-            std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        self.db
-            .enqueue_transfer(direction.as_str(), file_id, local_path, s3_key, total_bytes)
+        let total_bytes = std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
+        self.db.enqueue_transfer(
+            direction.as_str(),
+            file_id,
+            local_path,
+            s3_key,
+            total_bytes,
+            None,
+        )
     }
 
     /// Get pending upload jobs (up to `limit`).
@@ -209,6 +229,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].file_id, "file-1");
         assert_eq!(pending[0].local_path, "/tmp/test.txt");
+        assert_eq!(pending[0].expected_content_hash, None);
         assert_eq!(pending[0].s3_key, "test.txt");
         assert_eq!(pending[0].status, TransferStatus::Queued);
     }
@@ -263,6 +284,35 @@ mod tests {
         let pending = queue.pending_downloads(10).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].direction.as_str(), "download");
+    }
+
+    #[test]
+    fn n19_download_job_remembers_the_local_content_it_was_decided_against() {
+        let db = test_db();
+        let queue = TransferQueue::new(&db);
+        let local = temp_file("decided.md", b"base");
+        let path = local.to_string_lossy();
+        queue.enqueue_download("note", &path, "blobs/r").unwrap();
+        let decided = queue.pending_downloads(1).unwrap()[0]
+            .expected_content_hash
+            .clone();
+        assert_eq!(
+            decided,
+            Some(LocalContentToken::capture(&local).unwrap().to_stored())
+        );
+
+        // A later decision replaces the bound content of the same job.
+        std::fs::remove_file(&local).unwrap();
+        queue.enqueue_download("note", &path, "blobs/r2").unwrap();
+        let pending = queue.pending_downloads(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0]
+                .expected_content_hash
+                .as_deref()
+                .map(LocalContentToken::from_stored),
+            Some(LocalContentToken::Missing)
+        );
     }
 
     #[test]

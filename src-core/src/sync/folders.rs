@@ -24,7 +24,7 @@ use super::{logical_clock_seed, safe_join_sync_path, same_path};
 /// Deterministic ids tried for a new folder before a random one.
 const FOLDER_ID_GENERATIONS: u32 = 16;
 /// Longest parent chain followed; a longer one can only be a cycle.
-const MAX_FOLDER_DEPTH: usize = 256;
+pub(super) const MAX_FOLDER_DEPTH: usize = 256;
 /// Suffixes tried for a folder whose name is taken: "name (2)", "name (3)"…
 const MAX_NAME_SUFFIX: u32 = 1_000;
 
@@ -36,6 +36,9 @@ pub struct FolderNodes<'a, S: S3ObjectStore + ?Sized = S3Adapter> {
 }
 
 impl<'a, S: S3ObjectStore + ?Sized> FolderNodes<'a, S> {
+    pub(super) fn store(&self) -> &S {
+        self.s3
+    }
     pub fn new(
         s3: &'a S,
         db: &'a LocalDatabase,
@@ -61,11 +64,14 @@ impl<'a, S: S3ObjectStore + ?Sized> FolderNodes<'a, S> {
     /// The node of the folder at `path` (`None` for the root). The folder
     /// and its missing parents are created in the bucket when needed.
     pub async fn ensure_folder(&self, path: &str) -> CoreResult<Option<FileId>> {
+        super::folder_recovery::ensure_available(self.db, self.sync_folder)?;
         let mut parent_id = None;
         let mut current = String::new();
         for name in path.split('/').filter(|name| !name.is_empty()) {
             current = join_path(&current, name);
             if let Some(folder) = self.db.folder_at(&current)? {
+                self.publish_reserved_folder(&folder, &Placement::new(parent_id, name))
+                    .await?;
                 parent_id = Some(folder.file_id);
                 continue;
             }
@@ -75,6 +81,67 @@ impl<'a, S: S3ObjectStore + ?Sized> FolderNodes<'a, S> {
             parent_id = Some(folder_id);
         }
         Ok(parent_id)
+    }
+
+    /// A Notes folder may be durably reserved while offline. Its SQLite row
+    /// is only a local claim until the matching tree entry and CreateFolder
+    /// operation exist in the bucket.
+    async fn publish_reserved_folder(
+        &self,
+        folder: &IndexedFolder,
+        placement: &Placement,
+    ) -> CoreResult<()> {
+        if self.db.get_object_state(&folder.file_id)?.as_deref() != Some("pending_upload") {
+            return Ok(());
+        }
+        self.publish_folder_at(folder.file_id, placement).await?;
+        self.db.mark_file_synced(&folder.file_id)
+    }
+
+    /// Create the folder `folder_id` at `placement` in the bucket, or accept
+    /// it when it is already there. Remote only: the local index is left as
+    /// it is, because it may already hold a later placement of the same id.
+    pub async fn publish_folder_at(
+        &self,
+        folder_id: FileId,
+        placement: &Placement,
+    ) -> CoreResult<()> {
+        let tree = FileTree::new(self.s3);
+        match tree.get_entry(&folder_id).await {
+            Ok(entry) if is_folder_at(&entry, placement) => return Ok(()),
+            Ok(_) => {
+                return Err(CoreError::Conflict(format!(
+                    "folder {folder_id} is already committed at another location"
+                )))
+            }
+            Err(CoreError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        match TombstoneManager::new(self.s3)
+            .get_tombstone(&folder_id)
+            .await
+        {
+            Ok(_) => {
+                return Err(CoreError::Conflict(format!(
+                    "folder {folder_id} was deleted on another device"
+                )))
+            }
+            Err(CoreError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        match self.create_remote(folder_id, placement).await {
+            Ok(()) => Ok(()),
+            Err(CoreError::Conflict(_)) => match tree.get_entry(&folder_id).await {
+                Ok(entry) if is_folder_at(&entry, placement) => Ok(()),
+                Ok(_) | Err(CoreError::NotFound(_)) => Err(CoreError::Conflict(format!(
+                    "folder {folder_id} was committed concurrently"
+                ))),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
     }
 
     async fn claim_folder_id(&self, placement: &Placement) -> CoreResult<FileId> {
@@ -224,6 +291,9 @@ impl<'a, S: S3ObjectStore + ?Sized> FolderNodes<'a, S> {
             let Some(current) = cursor else {
                 break String::new();
             };
+            if super::folder_recovery::is_remotely_deleted(self.s3, current).await? {
+                return Ok(None);
+            }
             if let Some(folder) = self.db.folder_by_id(&current)? {
                 break folder.remote_path;
             }
@@ -231,7 +301,11 @@ impl<'a, S: S3ObjectStore + ?Sized> FolderNodes<'a, S> {
                 return Ok(None);
             }
             let entry = match tree.get_entry(&current).await {
-                Ok(entry) if entry.entry_type == EntryType::Folder => entry,
+                Ok(entry)
+                    if entry.entry_type == EntryType::Folder && entry.deleted_at.is_none() =>
+                {
+                    entry
+                }
                 Ok(_) | Err(CoreError::NotFound(_)) => return Ok(None),
                 Err(e) => return Err(e),
             };
@@ -254,9 +328,14 @@ impl<'a, S: S3ObjectStore + ?Sized> FolderNodes<'a, S> {
         placement: &Placement,
         parent_path: &str,
     ) -> CoreResult<String> {
+        super::folder_recovery::ensure_available(self.db, self.sync_folder)?;
         let known = self.db.folder_by_id(&folder_id)?;
         if let Some(folder) = &known {
             if folder.remote_path == join_path(parent_path, &placement.name) {
+                if !Path::new(&folder.local_path).exists() {
+                    let _ = std::fs::create_dir_all(&folder.local_path);
+                    let _ = self.db.mark_file_synced(&folder_id);
+                }
                 self.db.set_parent(&folder_id, placement.parent_id)?;
                 return Ok(folder.remote_path.clone());
             }
@@ -270,6 +349,7 @@ impl<'a, S: S3ObjectStore + ?Sized> FolderNodes<'a, S> {
             .free_place(folder_id, placement, parent_path, current_local)
             .await?;
         let target = self.local_path(&path)?;
+        super::folder_recovery::ensure_available(self.db, self.sync_folder)?;
         match &known {
             Some(folder) => {
                 move_local_folder(&folder.local_path, &target)?;
@@ -374,7 +454,7 @@ impl<'a, S: S3ObjectStore + ?Sized> FolderNodes<'a, S> {
     }
 }
 
-fn is_folder_at(entry: &FileEntry, placement: &Placement) -> bool {
+pub(super) fn is_folder_at(entry: &FileEntry, placement: &Placement) -> bool {
     entry.entry_type == EntryType::Folder && Placement::of(entry) == *placement
 }
 
@@ -468,6 +548,35 @@ mod tests {
             Some(year)
         );
         assert_eq!(store.keys(OPS).len(), 2, "a known folder costs no op");
+    }
+
+    #[tokio::test]
+    async fn ensure_folder_publishes_a_locally_reserved_folder_with_the_same_id() {
+        let store = MemoryStore::default();
+        let device = Device::new();
+        let notes_path = device.root.join("Notes");
+        std::fs::create_dir_all(&notes_path).unwrap();
+        let reserved_id = uuid::Uuid::now_v7();
+        let entry = folder_entry(
+            reserved_id,
+            &Placement::new(None, "Notes"),
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        device
+            .db
+            .notes_reserve_local(&entry, &notes_path.to_string_lossy(), "Notes")
+            .unwrap();
+
+        let published = device.nodes(&store).ensure_folder("Notes").await.unwrap();
+
+        assert_eq!(published, Some(reserved_id));
+        let remote = FileTree::new(&store).get_entry(&reserved_id).await.unwrap();
+        assert_eq!(Placement::of(&remote), Placement::new(None, "Notes"));
+        assert_eq!(
+            device.db.get_object_state(&reserved_id).unwrap().as_deref(),
+            Some("synced")
+        );
+        assert_eq!(store.keys(OPS).len(), 1);
     }
 
     #[tokio::test]

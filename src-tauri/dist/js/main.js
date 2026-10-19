@@ -46,6 +46,9 @@
     conflicts: [],
     activities: [],
     logs: [],
+    folderRecovery: null,
+    folderRecoveryBusy: false,
+    resolvedRecoveryId: null,
     largeSyncPromptOpen: false,
     largeSyncPromptPending: false,
     syncRequestInFlight: false,
@@ -112,7 +115,29 @@
   }
 
   // ─── Navigation / Routing ────────────────────────────────────
+  // Navigations run one after another, so a quick second click cannot pass
+  // the Notes save barrier of the first one.
+  let navigation = Promise.resolve();
   function navigate(route) {
+    navigation = navigation
+      .then(() => switchScreen(route))
+      .catch((e) => {
+        console.error('Navigation failed:', e);
+        return false;
+      });
+    return navigation;
+  }
+
+  async function switchScreen(route) {
+    if (route !== 'notes' && window.__NOTES_APP__) {
+      try {
+        await window.__NOTES_APP__.onDeactivated();
+      } catch (e) {
+        // Leaving now would drop the unsaved note; Notes stays on screen.
+        showToast('Your note is not saved yet. Retry, or copy the text, before leaving Notes.', 'error', 7000);
+        return false;
+      }
+    }
     document.querySelectorAll('.nav-btn').forEach(b => {
       b.classList.toggle('active', b.dataset.route === route);
       b.setAttribute('aria-selected', b.dataset.route === route ? 'true' : 'false');
@@ -125,6 +150,10 @@
     if (route === 'account') refreshDevices();
     if (route === 'diagnostics') runDiagnostics();
     if (route === 'logs') refreshLogs();
+    if (route === 'notes' && window.__NOTES_APP__) {
+      window.__NOTES_APP__.onActivated();
+    }
+    return true;
   }
 
   // ─── Toast ───────────────────────────────────────────────────
@@ -173,6 +202,7 @@
     try {
       const sync = await invoke('get_sync_status');
       state.sync = sync;
+      renderFolderRecovery(sync.folder_recovery);
       const syncState = document.getElementById('syncState');
       syncState.textContent = sync.state ? syncStateLabel(sync.state) : '—';
       syncState.title = sync.detail || sync.state || '';
@@ -730,6 +760,10 @@
   }
 
   async function startSyncNow() {
+    if (state.folderRecovery) {
+      renderFolderRecovery(state.folderRecovery);
+      return;
+    }
     if (state.syncRequestInFlight) return;
     state.syncRequestInFlight = true;
     const button = document.getElementById('btnSyncNow');
@@ -768,8 +802,57 @@
       const limit = parseInt(document.getElementById('inputLogLimit')?.value, 10) || 1000;
       state.logs = await invoke('get_logs', { level, limit }) || [];
       renderLogs();
+      const path = await invoke('get_log_path');
+      document.getElementById('logFilePath').textContent = path || '';
     } catch(e) {
       renderLogError(humanizeError(e));
+    }
+  }
+
+  function renderFolderRecovery(recovery) {
+    const dialog = document.getElementById('folderRecoveryDialog');
+    if (!dialog) return;
+    if (recovery?.id === state.resolvedRecoveryId) return;
+    if (!recovery) {
+      if (!state.folderRecoveryBusy) {
+        state.folderRecovery = null;
+        dialog.close();
+      }
+      return;
+    }
+    state.folderRecovery = recovery;
+    document.getElementById('folderRecoveryPath').textContent = recovery.path;
+    document.getElementById('btnRestoreFolder').disabled = state.folderRecoveryBusy || recovery.decision === 'delete';
+    document.getElementById('btnDeleteFolder').disabled = state.folderRecoveryBusy || recovery.decision === 'restore';
+    if (!dialog.open) dialog.showModal();
+  }
+
+  async function resolveFolderRecovery(decision) {
+    if (state.folderRecoveryBusy || !state.folderRecovery) return;
+    const recovery = state.folderRecovery;
+    const error = document.getElementById('folderRecoveryError');
+    const progress = document.getElementById('folderRecoveryProgress');
+    error.hidden = true;
+    state.folderRecoveryBusy = true;
+    progress.hidden = false;
+    renderFolderRecovery(recovery);
+    try {
+      await invoke('resolve_folder_recovery', { recoveryId: recovery.id, decision });
+      state.resolvedRecoveryId = recovery.id;
+      state.folderRecovery = null;
+      document.getElementById('folderRecoveryDialog').close();
+      showToast(decision === 'restore' ? 'Server data restored' : 'Deletion synchronized with the server', 'success');
+      await Promise.all([refreshFiles(), refreshActivity(), refreshTransfers()]);
+    } catch (e) {
+      error.textContent = humanizeError(e);
+      error.setAttribute('role', 'alert');
+      error.hidden = false;
+      // The backend durably keeps the first choice before network work.
+      await refreshDashboard();
+    } finally {
+      state.folderRecoveryBusy = false;
+      progress.hidden = true;
+      if (state.folderRecovery) renderFolderRecovery(state.folderRecovery);
     }
   }
 
@@ -949,6 +1032,15 @@
   // ─── Init ────────────────────────────────────────────────────
   async function init() {
     if (!invoke || !listen) {
+      const message = document.createElement('p');
+      message.className = 'card';
+      message.setAttribute('role', 'alert');
+      message.textContent = 'Open the S4Drive desktop app to use your files.';
+      document.getElementById('appContent').replaceChildren(message);
+      document.getElementById('statusBadge').textContent = 'Unavailable';
+      document.querySelectorAll('button, input, textarea, select').forEach(control => {
+        control.disabled = true;
+      });
       document.body.classList.add('ready');
       return;
     }
@@ -986,6 +1078,19 @@
       runDiagnostics();
     });
     document.getElementById('btnRefreshLogs').addEventListener('click', refreshLogs);
+    document.getElementById('folderRecoveryDialog').addEventListener('cancel', (event) => event.preventDefault());
+    document.getElementById('btnRestoreFolder').addEventListener('click', () => resolveFolderRecovery('restore'));
+    document.getElementById('btnDeleteFolder').addEventListener('click', () => resolveFolderRecovery('delete'));
+    document.getElementById('btnOpenLogFolder').addEventListener('click', async () => {
+      try { await invoke('open_log_folder'); }
+      catch (e) { showToast(`Could not open log folder: ${humanizeError(e)}`, 'error'); }
+    });
+    document.getElementById('btnCopyLogPath').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(document.getElementById('logFilePath').textContent);
+        showToast('Log path copied', 'success');
+      } catch (e) { showToast('Could not copy the path. Select the displayed path and copy it manually.', 'error'); }
+    });
     document.getElementById('inputLogLimit').addEventListener('change', refreshLogs);
     document.getElementById('inputLogLevel').addEventListener('change', changeLogLevel);
     document.getElementById('btnCheckUpdates').addEventListener('click', checkUpdates);
@@ -1097,6 +1202,7 @@
     await listen('sync-status-changed', (event) => {
       const previousTotal = state.sync?.total_files;
       state.sync = event.payload || {};
+      renderFolderRecovery(state.sync.folder_recovery);
       if (!Number.isFinite(state.sync.total_files)) {
         state.sync.total_files = previousTotal;
       }
@@ -1143,7 +1249,7 @@
       }
     }
     state.initialized = true;
-    if (state.largeSyncPromptPending || state.sync?.state === 'attention') {
+    if (!state.folderRecovery && (state.largeSyncPromptPending || state.sync?.state === 'attention')) {
       state.largeSyncPromptPending = false;
       startSyncNow();
     }
